@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+openai
+pdfplumber
+bse
+httpx
+openpyxl
+dotenv
+python-dotenv
+pymongo

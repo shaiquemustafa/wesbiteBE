@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Financial Report Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        .card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            padding: 1.5rem;
+            transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+        }
+        .metric-label {
+            color: #6b7280;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        .metric-value {
+            color: #111827;
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+        .positive { color: #10b981; }
+        .negative { color: #ef4444; }
+        .neutral { color: #3b82f6; }
+        .strongly-positive {
+            background-color: #d1fae5;
+            color: #065f46;
+        }
+        .strongly-negative {
+            background-color: #fee2e2;
+            color: #991b1b;
+        }
+        .impact-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-weight: 600;
+            font-size: 0.875rem;
+            text-transform: uppercase;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-6 md:p-8">
+
+    <div id="dashboard-container" class="max-w-7xl mx-auto">
+        <!-- Data will be dynamically inserted here -->
+    </div>
+
+    <script>
+        const jsonData = [
+          {
+            "target_price_mean": 861,
+            "number_of_estimate": 3,
+            "pdf_link": "https://www.bseindia.com/xml-data/corpfiling/AttachLive/(500307)_aa8d8968-2c7f-4a2b-b645-94d313b8da3a.pdf",
+            "company_name": "NIRLON LIMITED",
+            "scrip_id": "500307",
+            "price_range": "+5% to +10%",
+            "imapct": "STRONGLY POSITIVE",
+            "impact_score": 5,
+            "mid_percentage": 7.5,
+            "sales": { "Dec 2023": 126, "Mar 2024": 124, "Jun 2024": 115, "Sep 2024": 258, "Dec 2024": 534, "Mar 2025": 698, "Jun 2025": 507 },
+            "operating_profit": { "Dec 2023": 74, "Mar 2024": 76, "Jun 2024": 68, "Sep 2024": 87, "Dec 2024": 238, "Mar 2025": 352, "Jun 2025": 208 },
+            "profit_before_tax": { "Dec 2023": 57, "Mar 2024": 56, "Jun 2024": 51, "Sep 2024": -24, "Dec 2024": 73, "Mar 2025": 193, "Jun 2025": 80 },
+            "net_profit": { "Dec 2023": 43, "Mar 2024": 47, "Jun 2024": 26, "Sep 2024": -47, "Dec 2024": 35, "Mar 2025": 151, "Jun 2025": 38 },
+            "current_price_bse": "764.90",
+            "current_price_nse": "765.75",
+            "percentageChange": "1.26",
+            "year_high": "844.75",
+            "year_low": "522.65"
+          }
+        ];
+
+        function getImpactClass(impact) {
+            const lowerImpact = impact.toLowerCase();
+            if (lowerImpact.includes('positive')) return 'strongly-positive';
+            if (lowerImpact.includes('negative')) return 'strongly-negative';
+            return 'bg-gray-200 text-gray-800';
+        }
+        
+        function formatNumber(num) {
+            return new Intl.NumberFormat('en-IN').format(num);
+        }
+
+        function createDashboard(data) {
+            const container = document.getElementById('dashboard-container');
+            if (!data) {
+                container.innerHTML = '<p class="text-center text-red-500">Error: No data to display.</p>';
+                return;
+            }
+
+            const changeClass = parseFloat(data.percentageChange) >= 0 ? 'positive' : 'negative';
+            const changeSymbol = parseFloat(data.percentageChange) >= 0 ? '▲' : '▼';
+
+            const financials = [
+                { label: 'Sales', data: data.sales },
+                { label: 'Operating Profit', data: data.operating_profit },
+                { label: 'Profit Before Tax', data: data.profit_before_tax },
+                { label: 'Net Profit', data: data.net_profit }
+            ];
+            
+            const quarters = Object.keys(data.sales || {});
+
+            let dashboardHTML = `
+                <!-- Header -->
+                <div class="mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                    <div>
+                        <h1 class="text-3xl font-bold text-gray-900">${data.company_name}</h1>
+                        <p class="text-md text-gray-500">Scrip ID: ${data.scrip_id}</p>
+                    </div>
+                    <a href="${data.pdf_link}" target="_blank" class="inline-block bg-blue-600 text-white font-semibold px-5 py-2 rounded-lg hover:bg-blue-700 transition-colors shadow">
+                        View Report PDF
+                    </a>
+                </div>
+
+                <!-- Key Metrics Grid -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
+                    <div class="card">
+                        <p class="metric-label">Analyst Target Price</p>
+                        <p class="metric-value">₹${formatNumber(data.target_price_mean)}</p>
+                        <p class="text-sm text-gray-500 mt-1">${data.number_of_estimate} Estimates</p>
+                    </div>
+                    <div class="card">
+                        <p class="metric-label">Analyst Impact</p>
+                        <div class="mt-2">
+                           <span class="impact-badge ${getImpactClass(data.imapct)}">${data.imapct}</span>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <p class="metric-label">Potential Price Range</p>
+                        <p class="metric-value">${data.price_range}</p>
+                        <p class="text-sm text-gray-500 mt-1">Mid-point: ${data.mid_percentage}%</p>
+                    </div>
+                    <div class="card">
+                        <p class="metric-label">Impact Score</p>
+                        <p class="metric-value ${changeClass}">${data.impact_score} / 5</p>
+                    </div>
+                </div>
+
+                <!-- Price Information -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
+                    <div class="card">
+                        <p class="metric-label">Current Price (NSE)</p>
+                        <p class="metric-value">₹${data.current_price_nse}</p>
+                         <p class="font-semibold text-lg ${changeClass}">${changeSymbol} ${data.percentageChange}%</p>
+                    </div>
+                     <div class="card">
+                        <p class="metric-label">Current Price (BSE)</p>
+                        <p class="metric-value">₹${data.current_price_bse}</p>
+                    </div>
+                    <div class="card">
+                        <p class="metric-label">52-Week High</p>
+                        <p class="metric-value">₹${data.year_high}</p>
+                    </div>
+                    <div class="card">
+                        <p class="metric-label">52-Week Low</p>
+                        <p class="metric-value">₹${data.year_low}</p>
+                    </div>
+                </div>
+
+                <!-- Financials Table -->
+                <div class="card overflow-x-auto">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">Quarterly Financials (in Cr.)</h2>
+                    <table class="w-full text-left">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="p-3 font-semibold text-sm text-gray-600">Metric</th>
+                                ${quarters.map(q => `<th class="p-3 font-semibold text-sm text-gray-600 text-right">${q}</th>`).join('')}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${financials.map(fin => `
+                                <tr class="border-b border-gray-200 hover:bg-gray-50">
+                                    <td class="p-3 font-medium text-gray-800">${fin.label}</td>
+                                    ${quarters.map(q => {
+                                        const value = fin.data[q];
+                                        const valueClass = value >= 0 ? 'text-gray-900' : 'text-red-600';
+                                        return `<td class="p-3 text-right font-mono ${valueClass}">${formatNumber(value)}</td>`
+                                    }).join('')}
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            container.innerHTML = dashboardHTML;
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Use the first object from the JSON array
+            createDashboard(jsonData[0]);
+        });
+    </script>
+
+</body>
+</html>
