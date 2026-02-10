@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks
 from contextlib import asynccontextmanager
 import asyncio
+import logging
 
 from urllib.parse import unquote
 # Import the refactored functions
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI):
 
 # A simple in-memory lock to prevent concurrent analysis runs.
 analysis_lock = asyncio.Lock()
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(
     title="BSE Announcements Analyzer API",
@@ -42,7 +44,8 @@ async def run_analysis_pipeline(
     market_cap_st: int = Query(2500, description="Start of market cap range (in Crores)."),
     market_cap_end: int = Query(25000, description="End of market cap range (in Crores)."),
     hours: int = Query(5, description="Lookback window in hours from now."),
-    force: bool = Query(False, description="Reprocess existing announcements in the window.")
+    force: bool = Query(False, description="Reprocess existing announcements in the window."),
+    run_now: bool = Query(False, description="Run synchronously and return counts.")
 ):
     target_date = None
     if date:
@@ -56,6 +59,12 @@ async def run_analysis_pipeline(
 
     if analysis_lock.locked():
         raise HTTPException(status_code=409, detail="An analysis process is already running. Please try again later.")
+
+    if run_now:
+        result = await run_analysis_in_background(
+            target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours, force
+        )
+        return result
 
     background_tasks.add_task(
         run_analysis_in_background,
@@ -74,7 +83,14 @@ async def run_analysis_in_background(
 ):
     """The main analysis workflow, designed to be run as a background task."""
     async with analysis_lock:
-        #print(f"Starting background analysis for date: {target_date.strftime('%Y-%m-%d')}")
+        logger.info("Starting analysis for last %s hours (force=%s).", hours, force)
+        summary = {
+            "filtered": 0,
+            "pdfs": 0,
+            "analyzed": 0,
+            "inserted_predictions": 0,
+            "message": ""
+        }
     
         # --- Step 1: Fetch and Filter Announcements ---
         end_dt = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
@@ -88,22 +104,28 @@ async def run_analysis_in_background(
             end_datetime=end_dt,
             force_reprocess=force
         )
+        summary["filtered"] = len(filtered_df)
         if filtered_df.empty:
-            #print("No announcements found matching the criteria. Background task finished.")
-            return
+            summary["message"] = "No announcements found after filtering."
+            logger.info(summary["message"])
+            return summary
 
         # --- Step 2: Download PDFs ---
         pdf_df = download_pdfs_to_dataframe(filtered_df)
+        summary["pdfs"] = len(pdf_df)
         if pdf_df.empty:
-            #print("Announcements were found, but no PDFs could be downloaded. Background task finished.")
-            return
+            summary["message"] = "No PDFs downloaded."
+            logger.info(summary["message"])
+            return summary
 
         # --- Step 3: Analyze PDFs and Rank ---
         ranked_df = analyze_pdfs_from_dataframe(pdf_df)
+        summary["analyzed"] = 0 if ranked_df is None else len(ranked_df)
 
         if ranked_df is None or ranked_df.empty:
-            #print("PDFs were downloaded, but analysis yielded no results. Background task finished.")
-            return
+            summary["message"] = "Analysis produced no results."
+            logger.info(summary["message"])
+            return summary
 
         # --- Step 4: Merge with original data to add News_submission_dt ---
         pdf_df['SCRIP_CD'] = pdf_df['SCRIP_CD'].astype(str)
@@ -114,9 +136,12 @@ async def run_analysis_in_background(
         announcement_service = AnnouncementService()
         collection_name = "predictions"
         inserted_predictions = announcement_service.create_predictions(final_df, collection_name)
-        #print(f"MongoDB: Inserted {len(inserted_predictions)} new predictions.")
+        summary["inserted_predictions"] = len(inserted_predictions)
+        summary["message"] = "Analysis completed."
+        logger.info("Analysis completed. Inserted %s predictions.", summary["inserted_predictions"])
 
         #print("Background analysis task completed successfully.")
+        return summary
 
 
 @app.get("/predictions/{date}", summary="Fetch predictions by date")
