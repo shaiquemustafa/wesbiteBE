@@ -213,6 +213,8 @@ def analyze_pdfs_from_dataframe(pdf_df: pd.DataFrame):
     df = df.copy()
     
     df.sort_values(["Impact_Score", "Mid_%"], ascending=[False, False], inplace=True)
+    # Keep only the top 30 ranked results.
+    df = df.head(30).copy()
     # The 'SCRIP_CD' column is already populated from _process_pdf. Let's ensure it's a string for merging.
     df['SCRIP_CD'] = df['SCRIP_CD'].astype(str)
     # df = df.drop_duplicates(subset="Company", keep="first")
