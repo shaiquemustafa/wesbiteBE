@@ -8,8 +8,7 @@ import logging
 
 from urllib.parse import unquote
 from announcements import fetch_and_filter_announcements
-from data_to_pdf import download_pdfs_to_dataframe
-from results import analyze_pdfs_from_dataframe
+from results import analyze_announcements
 from database import connect_to_db, close_db_connection
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
@@ -102,20 +101,27 @@ async def run_analysis_in_background(
         now_ist = _now_ist_naive()
 
         # ----- Determine mode -----
-        if target_date:
-            # MODE 1: Full-day — process ALL announcements for that date
+        if target_date and hours > 0:
+            # MODE A: Specific date + time window (e.g. last 2h of Feb 10)
+            # end_dt = end of that date (23:59) or cut_off_time
+            mode = f"date+window ({hours}h)"
+            the_date = target_date
+            end_dt = target_date.replace(hour=23, minute=59, second=59)
+            start_dt = end_dt - timedelta(hours=hours)
+        elif target_date:
+            # MODE B: Full-day for a specific date
             mode = "full-day"
             the_date = target_date
-            start_dt = None   # no time window → announcements.py skips time filter
+            start_dt = None
             end_dt = None
         elif hours > 0:
-            # MODE 2: Incremental — last N hours
+            # MODE C: Incremental — last N hours from now
             mode = f"incremental ({hours}h)"
             the_date = now_ist
             end_dt = now_ist
             start_dt = end_dt - timedelta(hours=hours)
         else:
-            # hours=0 and no date → full today
+            # MODE D: hours=0 and no date → full today
             mode = "full-day (today)"
             the_date = now_ist
             start_dt = None
@@ -132,13 +138,12 @@ async def run_analysis_in_background(
             "mode": mode,
             "date": the_date.strftime("%Y-%m-%d"),
             "filtered": 0,
-            "pdfs_downloaded": 0,
             "analyzed": 0,
             "inserted_predictions": 0,
             "message": "",
         }
 
-        # --- Step 1: Fetch & filter ---
+        # --- Step 1: Fetch & filter announcements ---
         filtered_df = fetch_and_filter_announcements(
             target_date=the_date,
             market_cap_start=market_cap_start,
@@ -154,16 +159,8 @@ async def run_analysis_in_background(
             logger.info(summary["message"])
             return summary
 
-        # --- Step 2: Download PDFs ---
-        pdf_df = download_pdfs_to_dataframe(filtered_df)
-        summary["pdfs_downloaded"] = len(pdf_df)
-        if pdf_df.empty:
-            summary["message"] = "No PDFs downloaded."
-            logger.info(summary["message"])
-            return summary
-
-        # --- Step 3: Analyse PDFs & rank ---
-        ranked_df = analyze_pdfs_from_dataframe(pdf_df)
+        # --- Step 2: Download + Analyse PDFs one-at-a-time (memory efficient) ---
+        ranked_df = analyze_announcements(filtered_df)
         summary["analyzed"] = 0 if ranked_df is None else len(ranked_df)
 
         if ranked_df is None or ranked_df.empty:
@@ -171,7 +168,7 @@ async def run_analysis_in_background(
             logger.info(summary["message"])
             return summary
 
-        # --- Step 4: Store predictions ---
+        # --- Step 3: Store predictions ---
         announcement_service = AnnouncementService()
         inserted = announcement_service.create_predictions(ranked_df, "predictions", force=force)
         summary["inserted_predictions"] = len(inserted)

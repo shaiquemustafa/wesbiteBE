@@ -1,15 +1,17 @@
-# results.py – PDF analysis & ranking pipeline
+# results.py – Memory-efficient PDF analysis pipeline
+# Processes ONE PDF at a time: download → extract text → discard → OpenAI → next
 import os
 import re
 import warnings
 import io
+import gc
+import requests
 import pandas as pd
 import openai
 import pdfplumber
 from httpx import ReadTimeout, ConnectError
 from datetime import datetime
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 warnings.filterwarnings("ignore", message=r"Cannot set gray non-stroke color")
@@ -21,12 +23,18 @@ if not API_KEY:
     raise ValueError("OPENAI_API_KEY not found. Please set it in your .env file.")
 
 MODEL_SCREEN = "gpt-4.1-mini"
-BASE_URL = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
-
 client = openai.OpenAI(api_key=API_KEY)
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bseindia.com/",
+}
+
 # ---------------------------------------------------------------------------
-# Full screening prompt (from notebook – handles edge cases properly)
+# Full screening prompt (from notebook)
 # ---------------------------------------------------------------------------
 PROMPT_SCREEN = (
     "You are assessing the incremental price impact of this specific PDF filing.\n"
@@ -146,9 +154,7 @@ def _guess_category(text: str) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 _split_line = lambda l: l.split("\t") if l.count("\t") == 4 else re.split(r"\s*\|\s*", l)
-
 _price_mid = lambda s: [float(x) for x in re.findall(r"-?\d+\.?\d*", s)]
-
 _impact_map = {
     "STRONGLY POSITIVE": 5, "BEAT": 5,
     "POSITIVE": 4,
@@ -156,6 +162,26 @@ _impact_map = {
     "NEGATIVE": 2,
     "STRONGLY NEGATIVE": 1, "MISSED": 1,
 }
+
+
+def _download_pdf(url: str) -> Optional[bytes]:
+    """Download a single PDF into memory. Returns bytes or None."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=60, verify=False, stream=True)
+        resp.raise_for_status()
+        # Read in chunks to avoid large single allocation
+        chunks = []
+        size = 0
+        for chunk in resp.iter_content(8192):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > 10_000_000:  # 10 MB cap per PDF
+                print(f"  [skip] PDF too large (>{size} bytes): {url}")
+                return None
+        return b"".join(chunks)
+    except Exception as e:
+        print(f"  [download fail] {url}: {e}")
+        return None
 
 
 def _extract_text(pdf_bytes: bytes, max_pages=5, max_chars=12_000) -> str:
@@ -168,7 +194,7 @@ def _extract_text(pdf_bytes: bytes, max_pages=5, max_chars=12_000) -> str:
                     break
                 txt += (p.extract_text() or "") + "\n"
     except Exception as e:
-        print(f"  [extract] Error: {e}")
+        print(f"  [extract error] {e}")
         return ""
     return txt[:max_chars]
 
@@ -188,94 +214,108 @@ def _call_llm(prompt, user, retries=3, max_tokens=400, temperature=0.3):
             ).choices[0].message.content.strip()
         except (openai.APIConnectionError, ReadTimeout, ConnectError) as e:
             if attempt == retries - 1:
-                print(f"  [llm] Connection error (final attempt): {e}")
+                print(f"  [llm] Connection error (final): {e}")
                 return None
-            print(f"  [llm] Connection error (attempt {attempt+1}): {e}")
+            print(f"  [llm] Retrying... {e}")
         except Exception as e:
-            print(f"  [llm] Unexpected error: {e}")
+            print(f"  [llm] Error: {e}")
             return None
     return None
 
 
-def _process_single_pdf(pdf_row: pd.Series) -> Optional[dict]:
+def _process_single_announcement(row: dict, index: int, total: int) -> Optional[dict]:
     """
-    Process one PDF: extract text → screen with LLM → classify category.
-    Returns a dict ready for the predictions DataFrame, or None on failure.
+    Process ONE announcement: download PDF → extract text → discard PDF → LLM.
+    Memory-efficient: PDF bytes are freed immediately after text extraction.
     """
-    scrip_cd = str(pdf_row.get("SCRIP_CD", ""))
-    pdf_link = str(pdf_row.get("ATTACHMENTNAME", ""))
-    news_sub_dt = pdf_row.get("News_submission_dt")
-    company_name_hint = str(pdf_row.get("SLONGNAME", ""))
+    scrip_cd = str(row.get("SCRIP_CD", ""))
+    pdf_url = str(row.get("ATTACHMENTNAME", ""))
+    news_sub_dt = row.get("News_submission_dt")
+    company_hint = str(row.get("SLONGNAME", ""))
 
-    text = _extract_text(pdf_row["pdf_content"])
-    if not text or len(text) < 100:
-        print(f"  [skip] SCRIP {scrip_cd}: PDF text too short ({len(text)} chars)")
+    if not pdf_url.startswith("http"):
         return None
 
-    # 1) SCREENING
+    print(f"  [{index}/{total}] SCRIP {scrip_cd}: downloading PDF...")
+
+    # 1) Download PDF
+    pdf_bytes = _download_pdf(pdf_url)
+    if not pdf_bytes:
+        return None
+
+    # 2) Extract text & immediately free PDF bytes
+    text = _extract_text(pdf_bytes)
+    del pdf_bytes
+    gc.collect()
+
+    if not text or len(text) < 100:
+        print(f"  [{index}/{total}] SCRIP {scrip_cd}: text too short ({len(text)} chars), skipping")
+        return None
+
+    # 3) LLM screening
     resp = _call_llm(PROMPT_SCREEN, text + "\nReturn one line only.")
     if not resp:
-        print(f"  [skip] SCRIP {scrip_cd}: LLM returned nothing")
+        print(f"  [{index}/{total}] SCRIP {scrip_cd}: LLM returned nothing")
         return None
 
     parts = _split_line(resp)
     if len(parts) != 5:
-        print(f"  [skip] SCRIP {scrip_cd}: LLM returned {len(parts)} fields instead of 5")
+        print(f"  [{index}/{total}] SCRIP {scrip_cd}: LLM returned {len(parts)} fields, expected 5")
         return None
 
     company, imp_tag, summary, price_range, rationale = [p.strip() for p in parts]
     imp_tag = imp_tag.upper()
 
-    # Skip immaterial filings
     if imp_tag == "N/A":
-        print(f"  [skip] SCRIP {scrip_cd}: Impact = N/A (immaterial)")
+        print(f"  [{index}/{total}] SCRIP {scrip_cd}: N/A (immaterial)")
         return None
 
-    # 2) CATEGORY (independent – does not affect prediction)
+    # 4) Category (cheap call)
     cat_resp = _call_llm(PROMPT_CATEGORY, text, max_tokens=16, temperature=0.0)
     if not cat_resp or cat_resp not in CATEGORY_LABELS:
         cat_resp = _guess_category(text)
 
+    print(f"  [{index}/{total}] SCRIP {scrip_cd}: {imp_tag} | {company}")
+
     return {
         "File": scrip_cd,
-        "PDF_Link": pdf_link,
-        "Company": company or company_name_hint,
+        "PDF_Link": pdf_url,
+        "Company": company or company_hint,
         "SCRIP_CD": scrip_cd,
         "Impact": imp_tag,
         "Summary": summary,
         "Price_Range": price_range,
         "Rationale": rationale,
         "Category": cat_resp,
-        "News_submission_dt": news_sub_dt,  # carried through from raw data
+        "News_submission_dt": news_sub_dt,
     }
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def analyze_pdfs_from_dataframe(pdf_df: pd.DataFrame) -> pd.DataFrame:
+def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Analyse every PDF in *pdf_df*, rank them, return the top 30.
+    Memory-efficient pipeline: processes announcements ONE AT A TIME.
+    Downloads PDF → extracts text → frees PDF → calls OpenAI → next.
+
+    Returns ranked top-30 predictions DataFrame.
     """
-    if pdf_df.empty:
-        print("No PDFs to analyse.")
+    if filtered_df.empty:
+        print("No announcements to analyse.")
         return pd.DataFrame()
 
-    pdf_tasks = [row for _, row in pdf_df.iterrows()]
-    print(f"Starting analysis of {len(pdf_tasks)} PDFs ...")
+    total = len(filtered_df)
+    print(f"Starting sequential analysis of {total} announcements...")
 
     rows = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_map = {pool.submit(_process_single_pdf, task): task.get("SCRIP_CD") for task in pdf_tasks}
-        for i, future in enumerate(as_completed(future_map), 1):
-            result = future.result()
-            status = "OK" if result else "skipped"
-            print(f"  [{i}/{len(pdf_tasks)}] SCRIP {future_map[future]}: {status}")
-            if result:
-                rows.append(result)
+    for i, (_, row) in enumerate(filtered_df.iterrows(), 1):
+        result = _process_single_announcement(row.to_dict(), i, total)
+        if result:
+            rows.append(result)
 
     if not rows:
-        print("No valid PDFs produced predictions.")
+        print("No valid predictions produced.")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
@@ -286,7 +326,7 @@ def analyze_pdfs_from_dataframe(pdf_df: pd.DataFrame) -> pd.DataFrame:
         lambda r: (sum(_price_mid(r)) / len(_price_mid(r))) if _price_mid(r) else 0.0
     )
 
-    # Rank
+    # Rank & limit to top 30
     df.sort_values(["Impact_Score", "Mid_%"], ascending=[False, False], inplace=True)
     df = df.head(30).copy()
     df.reset_index(drop=True, inplace=True)
