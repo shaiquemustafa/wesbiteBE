@@ -45,11 +45,24 @@ class AnnouncementService:
                     """
                     SELECT data
                     FROM predictions
-                    WHERE impact = ANY(%s)
+                    WHERE UPPER(impact) = ANY(%s)
                       AND news_submission_dt >= %s
                       AND news_submission_dt < %s
                     """,
-                    (["STRONGLY POSITIVE", "POSITIVE", "NEGATIVE", "STRONGLY NEGATIVE"], start_of_day, end_of_day),
+                    (
+                        [
+                            "STRONGLY POSITIVE",
+                            "BEAT",
+                            "POSITIVE",
+                            "NEUTRAL",
+                            "MATCHED",
+                            "NEGATIVE",
+                            "STRONGLY NEGATIVE",
+                            "MISSED",
+                        ],
+                        start_of_day,
+                        end_of_day,
+                    ),
                 )
                 rows = [row[0] for row in cur.fetchall()]
 

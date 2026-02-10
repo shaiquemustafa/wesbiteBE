@@ -160,6 +160,7 @@ def _process_pdf_from_memory(pdf_row: pd.Series) ->  Optional[dict]:
         return None
 
     company, imp_tag, summ, prng, rat = [p.strip() for p in parts]
+    imp_tag = imp_tag.upper()
 
     # 2) INDEPENDENT CATEGORY (does not touch prediction)
     cat_resp = _call_llm(PROMPT_CATEGORY, text, max_tokens=16, temperature=0.0)
