@@ -8,7 +8,6 @@ import asyncio
 import logging
 
 from urllib.parse import unquote
-# Import the refactored functions
 from announcements import fetch_and_filter_announcements
 from data_to_pdf import download_pdfs_to_dataframe
 from results import analyze_pdfs_from_dataframe
@@ -18,15 +17,14 @@ from service.ui_data_service import UIDataService
 from entity.ui_data import UIDataItem
 from typing import List
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Code to run on startup
     connect_to_db()
     yield
-    # Code to run on shutdown
     close_db_connection()
 
-# A simple in-memory lock to prevent concurrent analysis runs.
+
 analysis_lock = asyncio.Lock()
 logger = logging.getLogger("uvicorn.error")
 
@@ -36,29 +34,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# =========================================================================
+# POST /analyze-announcements/
+# =========================================================================
 @app.post("/analyze-announcements/", summary="Run the full analysis pipeline")
 async def run_analysis_pipeline(
     background_tasks: BackgroundTasks,
-    date: str | None = Query(None, description="Target date in YYYY-MM-DD format.", regex=r"^\d{4}-\d{2}-\d{2}$"),
+    date: str | None = Query(None, description="Target date in YYYY-MM-DD format.", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     cut_off_time: str = Query("20:30:00", description="Cut-off time in HH:MM:SS format."),
     market_cap_st: int = Query(2500, description="Start of market cap range (in Crores)."),
     market_cap_end: int = Query(25000, description="End of market cap range (in Crores)."),
     hours: int = Query(5, description="Lookback window in hours from now."),
     force: bool = Query(False, description="Reprocess existing announcements in the window."),
-    run_now: bool = Query(False, description="Run synchronously and return counts.")
+    run_now: bool = Query(False, description="Run synchronously and return counts."),
 ):
     target_date = None
     if date:
         try:
             target_date = datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    # Decode the cut_off_time string to handle URL-encoded characters like '%3A' for colons.
     decoded_cut_off_time = unquote(cut_off_time)
 
     if analysis_lock.locked():
-        raise HTTPException(status_code=409, detail="An analysis process is already running. Please try again later.")
+        raise HTTPException(status_code=409, detail="Analysis already running. Try again later.")
 
     if run_now:
         result = await run_analysis_in_background(
@@ -68,33 +69,37 @@ async def run_analysis_pipeline(
 
     background_tasks.add_task(
         run_analysis_in_background,
-        target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours, force
+        target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours, force,
     )
-
     return {"message": "Analysis pipeline started in the background."}
 
+
 async def run_analysis_in_background(
-    target_date: datetime,
+    target_date: datetime | None,
     market_cap_start: int,
     market_cap_end: int,
     cut_off_time_str: str,
     hours: int,
-    force: bool
+    force: bool,
 ):
-    """The main analysis workflow, designed to be run as a background task."""
+    """The main analysis workflow."""
     async with analysis_lock:
-        logger.info("Starting analysis for last %s hours (force=%s).", hours, force)
+        logger.info("=== Pipeline start (hours=%s, force=%s) ===", hours, force)
         summary = {
             "filtered": 0,
-            "pdfs": 0,
+            "pdfs_downloaded": 0,
             "analyzed": 0,
             "inserted_predictions": 0,
-            "message": ""
+            "message": "",
         }
-    
-        # --- Step 1: Fetch and Filter Announcements ---
-        end_dt = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+        # --- Step 1: Fetch & filter ---
+        IST = ZoneInfo("Asia/Kolkata")
+        end_dt = datetime.now(IST).replace(tzinfo=None)
         start_dt = end_dt - timedelta(hours=hours)
+
+        logger.info("Time window: %s → %s (IST, naive)", start_dt, end_dt)
+
         filtered_df = fetch_and_filter_announcements(
             target_date=target_date or end_dt,
             market_cap_start=market_cap_start,
@@ -102,7 +107,7 @@ async def run_analysis_in_background(
             cut_off_time_str=cut_off_time_str,
             start_datetime=start_dt,
             end_datetime=end_dt,
-            force_reprocess=force
+            force_reprocess=force,
         )
         summary["filtered"] = len(filtered_df)
         if filtered_df.empty:
@@ -112,13 +117,13 @@ async def run_analysis_in_background(
 
         # --- Step 2: Download PDFs ---
         pdf_df = download_pdfs_to_dataframe(filtered_df)
-        summary["pdfs"] = len(pdf_df)
+        summary["pdfs_downloaded"] = len(pdf_df)
         if pdf_df.empty:
             summary["message"] = "No PDFs downloaded."
             logger.info(summary["message"])
             return summary
 
-        # --- Step 3: Analyze PDFs and Rank ---
+        # --- Step 3: Analyse PDFs & rank ---
         ranked_df = analyze_pdfs_from_dataframe(pdf_df)
         summary["analyzed"] = 0 if ranked_df is None else len(ranked_df)
 
@@ -127,72 +132,55 @@ async def run_analysis_in_background(
             logger.info(summary["message"])
             return summary
 
-        # --- Step 4: Merge with original data to add News_submission_dt ---
-        pdf_df['SCRIP_CD'] = pdf_df['SCRIP_CD'].astype(str)
-        merge_cols = pdf_df[['SCRIP_CD', 'News_submission_dt']].drop_duplicates(subset=['SCRIP_CD'])
-        final_df = pd.merge(ranked_df, merge_cols, on='SCRIP_CD', how='left')
-
-        # --- Step 5: Store predictions in MongoDB ---
+        # --- Step 4: Store predictions ---
         announcement_service = AnnouncementService()
-        collection_name = "predictions"
-        inserted_predictions = announcement_service.create_predictions(final_df, collection_name)
-        summary["inserted_predictions"] = len(inserted_predictions)
-        summary["message"] = "Analysis completed."
-        logger.info("Analysis completed. Inserted %s predictions.", summary["inserted_predictions"])
+        inserted = announcement_service.create_predictions(ranked_df, "predictions", force=force)
+        summary["inserted_predictions"] = len(inserted)
+        summary["message"] = "Analysis completed successfully."
+        logger.info("Pipeline done. Inserted %s predictions.", len(inserted))
 
-        #print("Background analysis task completed successfully.")
         return summary
 
 
+# =========================================================================
+# GET /predictions/{date}
+# =========================================================================
 @app.get("/predictions/{date}", summary="Fetch predictions by date")
 def get_predictions(
-    date: str = Path(..., description="Target date in YYYY-MM-DD format.", regex=r"^\d{4}-\d{2}-\d{2}$")
+    date: str = Path(..., description="Target date in YYYY-MM-DD format.", pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ):
-    """
-    Retrieves the stored prediction results for a given date from MongoDB.
-    """
     try:
         target_date = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    announcement_service = AnnouncementService()
+    service = AnnouncementService()
     try:
-        predictions_df = announcement_service.get_predictions_by_date(target_date)
+        predictions_df = service.get_predictions_by_date(target_date)
     except ConnectionError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     if predictions_df.empty:
-        return {"message": f"No predictions found for date {date}."}
+        return {"message": f"No predictions found for {date}."}
 
-    # Replace NaN with None for JSON compatibility before converting to dict.
-    # pd.NA can also be used, but None is more universally compatible.
     predictions_df = predictions_df.where(pd.notna(predictions_df), None)
-
     return predictions_df.to_dict("records")
 
 
+# =========================================================================
+# UI data endpoints
+# =========================================================================
 @app.post("/ui-data/", summary="Store UI Data Document")
-def store_ui_data(
-    data_item: UIDataItem
-):
-    """
-    Receives a single UI data item, validates it, and stores it
-    as a separate entry in MongoDB.
-    """
+def store_ui_data(data_item: UIDataItem):
     ui_service = UIDataService()
-    # The service expects a list, so we wrap our single item's dict in a list.
     data_item_as_dict_list = [data_item.model_dump()]
-    
     try:
-        # The service returns a list of results, one for each item we sent.
         results = ui_service.create_ui_data_document(data_item_as_dict_list)
     except ConnectionError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Since we only sent one item, we can inspect the first result.
     if not results or results[0].get("errors"):
-        error_details = results[0]["errors"] if results else "An unknown error occurred."
+        error_details = results[0]["errors"] if results else "Unknown error."
         raise HTTPException(status_code=422, detail=error_details)
 
     return {"message": "UI data stored successfully", "inserted_id": results[0]["inserted_id"]}
@@ -200,15 +188,7 @@ def store_ui_data(
 
 @app.get("/ui-data/today", summary="Fetch latest UI data for the current date")
 def get_todays_ui_data():
-    """
-    Retrieves UI data items from MongoDB that have 'news_time'
-    from the previous day's 15:30:00 up to the current system time in IST.
-    """
-    # Get current UTC time and manually add 5 hours and 30 minutes to approximate IST.
-    # WARNING: This results in a naive datetime object, which PyMongo treats as UTC.
-    # This can lead to incorrect query results if not handled carefully.
     target_date = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    #print(target_date)
     ui_service = UIDataService()
     try:
         latest_data = ui_service.get_latest_ui_data(target_date=target_date)
@@ -216,30 +196,25 @@ def get_todays_ui_data():
         raise HTTPException(status_code=500, detail=str(e))
 
     if not latest_data:
-        raise HTTPException(status_code=404, detail=f"No UI data found for today's date ({target_date.strftime('%Y-%m-%d')}).")
+        raise HTTPException(status_code=404, detail=f"No UI data found for today ({target_date.strftime('%Y-%m-%d')}).")
     return latest_data
 
 
+# =========================================================================
+# Misc endpoints
+# =========================================================================
 @app.get("/announcements/latest", summary="Fetch the latest raw announcement")
 def get_latest_announcement():
-    """
-    Retrieves the single most recent raw announcement from the 'raw_bse_announcements'
-    collection in MongoDB, sorted by submission time.
-    """
-    announcement_service = AnnouncementService()
+    service = AnnouncementService()
     try:
-        latest_announcement = announcement_service.get_latest_announcements()
+        latest = service.get_latest_announcements()
     except ConnectionError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if not latest:
+        return {"message": "No announcements found."}
+    return latest
 
-    if not latest_announcement:
-        return {"message": "No announcements found in the database."}
 
-    return latest_announcement
-
-@app.get("/ping", summary="Health check endpoint")
+@app.get("/ping", summary="Health check")
 def ping():
-    """
-    Returns a simple 'pong' message to indicate the API is running.
-    """
     return {"message": "pong"}

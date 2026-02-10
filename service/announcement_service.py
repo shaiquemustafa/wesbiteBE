@@ -1,169 +1,70 @@
 import pandas as pd
+import numpy as np
 from typing import List, Union
 from datetime import datetime, timedelta
 from pydantic import ValidationError
 from psycopg2.extras import execute_values, Json
 
 from database import get_conn
-from entity.filtered_announcements import FilteredAnnouncement
 from entity.prediction import Prediction
 
 
 def _normalize_for_json(value):
+    """Recursively convert Python objects to JSON-safe types."""
     if isinstance(value, dict):
         return {k: _normalize_for_json(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_normalize_for_json(v) for v in value]
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value) if not np.isnan(value) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, float) and np.isnan(value):
+        return None
     return value
 
+
 class AnnouncementService:
-    """
-    Service class to handle all database operations related to announcements.
-    """
+    """Service class to handle all database operations related to announcements."""
 
-    def get_predictions_by_date(self, target_date: datetime) -> pd.DataFrame:
-        """
-        Fetches prediction records from MongoDB for a specific date.
-
-        Args:
-            target_date: The date for which to fetch predictions.
-
-        Returns:
-            A pandas DataFrame containing the fetched predictions.
-            Returns an empty DataFrame if no records are found.
-        """
-        # Define the date range for the query.
-        # target_date is already at the beginning of the day (00:00:00).
-        start_of_day = target_date
-        end_of_day = start_of_day + timedelta(days=1)
-
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT data
-                    FROM predictions
-                    WHERE UPPER(impact) = ANY(%s)
-                      AND news_submission_dt >= %s
-                      AND news_submission_dt < %s
-                    """,
-                    (
-                        [
-                            "STRONGLY POSITIVE",
-                            "BEAT",
-                            "POSITIVE",
-                            "NEUTRAL",
-                            "MATCHED",
-                            "NEGATIVE",
-                            "STRONGLY NEGATIVE",
-                            "MISSED",
-                        ],
-                        start_of_day,
-                        end_of_day,
-                    ),
-                )
-                rows = [row[0] for row in cur.fetchall()]
-
-        return pd.DataFrame(rows)
-
-    def create_predictions(self, predictions_df: pd.DataFrame, collection_name: str) -> List[dict]:
-        """
-        Validates a DataFrame of predictions, filters out duplicates based on SCRIP_CD
-        and PDF_Link, and inserts new records into the specified MongoDB collection.
-
-        Args:
-            predictions_df: A pandas DataFrame containing the final analysis results.
-            collection_name: The name of the MongoDB collection to insert data into.
-
-        Returns:
-            A list of dictionary objects representing the newly inserted predictions.
-        """
-        valid_records = []
-        errors = []
-        for _, row in predictions_df.iterrows():
-            try:
-                # Convert row to dict and handle NaN values for Pydantic validation
-                record_data = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
-                validated_prediction = Prediction.model_validate(record_data)
-                valid_records.append(validated_prediction.model_dump(by_alias=True))
-            except ValidationError as e:
-                errors.append({"record": row.to_dict(), "error": str(e)})
-
-        if not valid_records:
-            return []
-
-        rows = []
-        for record in valid_records:
-            rows.append(
-                (
-                    str(record.get("SCRIP_CD")),
-                    record.get("PDF_Link"),
-                    record.get("Impact"),
-                    record.get("News_submission_dt"),
-                    Json(_normalize_for_json(record)),
-                )
-            )
-
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO predictions (scrip_cd, pdf_link, impact, news_submission_dt, data)
-                    VALUES %s
-                    ON CONFLICT (scrip_cd, pdf_link) DO NOTHING
-                    RETURNING id
-                    """,
-                    rows,
-                )
-                inserted_ids = [row[0] for row in cur.fetchall()]
-
-        if len(inserted_ids) < len(rows):
-            skipped_count = len(rows) - len(inserted_ids)
-            print(f"{skipped_count} predictions already present in the DB and were skipped.")
-
-        return [{"inserted_id": inserted_id} for inserted_id in inserted_ids]
-
+    # ------------------------------------------------------------------
+    # RAW ANNOUNCEMENTS (no Pydantic – store raw BSE dicts as JSONB)
+    # ------------------------------------------------------------------
     def create_announcements(self, announcements_df: pd.DataFrame, collection_name: str) -> List[dict]:
         """
-        Validates a DataFrame of announcements, filters out duplicates based on NEWSID,
-        and inserts new records into the specified MongoDB collection.
-
-        Args:
-            announcements_df: A pandas DataFrame containing the announcements to be saved.
-            collection_name: The name of the MongoDB collection to insert data into.
-
-        Returns:
-            A list of dictionary objects representing the newly inserted announcements.
+        Stores raw BSE announcement rows in PostgreSQL.
+        Skips strict Pydantic validation – just extracts NEWSID and
+        News_submission_dt for indexed columns and stores the full row as JSONB.
+        Returns a list of JSONB dicts for newly inserted rows.
         """
-        valid_records = []
-        errors = []
-        for _, row in announcements_df.iterrows():
-            try:
-                announcement_data = row.to_dict()
-                # Pydantic expects None for Optional fields, not NaN
-                record_data = {k: (None if pd.isna(v) else v) for k, v in announcement_data.items()}
-                validated_announcement = FilteredAnnouncement.model_validate(record_data)
-                valid_records.append(validated_announcement.model_dump(by_alias=True))
-            except ValidationError as e:
-                errors.append({"record": row.to_dict(), "error": str(e)})
-            except Exception as e:
-                errors.append({"record": row.to_dict(), "error": f"Unexpected error: {str(e)}"})
-
-        if not valid_records:
-            return []
-
         rows = []
-        for record in valid_records:
-            rows.append(
-                (
-                    record.get("NEWSID"),
-                    record.get("News_submission_dt"),
-                    Json(_normalize_for_json(record)),
-                )
-            )
+        for _, row in announcements_df.iterrows():
+            record = {}
+            for k, v in row.to_dict().items():
+                record[k] = _normalize_for_json(v)
+
+            newsid = str(record.get("NEWSID", ""))
+            if not newsid:
+                continue
+
+            # Extract News_submission_dt for the indexed column
+            news_sub_dt = record.get("News_submission_dt")
+            if isinstance(news_sub_dt, str):
+                try:
+                    news_sub_dt = datetime.fromisoformat(news_sub_dt)
+                except Exception:
+                    news_sub_dt = None
+
+            rows.append((newsid, news_sub_dt, Json(record)))
+
+        if not rows:
+            return []
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -179,42 +80,21 @@ class AnnouncementService:
                 )
                 inserted = [row[0] for row in cur.fetchall()]
 
-        if len(inserted) < len(rows):
-            skipped_count = len(rows) - len(inserted)
-            print(f"{skipped_count} announcements already present in the DB and were skipped.")
+        skipped = len(rows) - len(inserted)
+        if skipped:
+            print(f"{skipped} announcements already present in the DB and were skipped.")
 
         return inserted
 
-    def get_latest_announcements(self) -> Union[dict, None]:
-        """
-        Fetches the single most recent raw announcement from the 'raw_bse_announcements' collection
-        based on the 'News_submission_dt' field.
-
-        Returns:
-            A dictionary representing the latest announcement, or None if no announcements are found.
-        """
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT data
-                    FROM raw_bse_announcements
-                    ORDER BY news_submission_dt DESC NULLS LAST
-                    LIMIT 1
-                    """
-                )
-                row = cur.fetchone()
-        return row[0] if row else None
-
+    # ------------------------------------------------------------------
+    # RAW ANNOUNCEMENTS – window query
+    # ------------------------------------------------------------------
     def get_raw_announcements_by_window(
         self,
         start_dt: datetime | None,
-        end_dt: datetime | None
+        end_dt: datetime | None,
     ) -> pd.DataFrame:
-        """
-        Fetch raw announcements from Postgres within a datetime window.
-        If no window is provided, returns an empty DataFrame.
-        """
+        """Fetch raw announcements within a datetime window."""
         if not start_dt or not end_dt:
             return pd.DataFrame()
 
@@ -232,3 +112,111 @@ class AnnouncementService:
                 rows = [row[0] for row in cur.fetchall()]
 
         return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # PREDICTIONS
+    # ------------------------------------------------------------------
+    def get_predictions_by_date(self, target_date: datetime) -> pd.DataFrame:
+        """Fetch predictions for a given calendar date."""
+        start_of_day = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(days=1)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT data
+                    FROM predictions
+                    WHERE news_submission_dt >= %s
+                      AND news_submission_dt < %s
+                    ORDER BY (data->>'Impact_Score')::int DESC NULLS LAST
+                    """,
+                    (start_of_day, end_of_day),
+                )
+                rows = [row[0] for row in cur.fetchall()]
+
+        return pd.DataFrame(rows)
+
+    def create_predictions(
+        self, predictions_df: pd.DataFrame, collection_name: str, force: bool = False
+    ) -> List[dict]:
+        """
+        Validates predictions with Pydantic, then upserts into PostgreSQL.
+        When force=True, existing predictions are updated.
+        """
+        valid_records = []
+        errors = []
+        for _, row in predictions_df.iterrows():
+            try:
+                record_data = {k: _normalize_for_json(v) for k, v in row.to_dict().items()}
+                # Normalize impact to uppercase
+                if "Impact" in record_data and record_data["Impact"] is not None:
+                    record_data["Impact"] = str(record_data["Impact"]).upper()
+                validated = Prediction.model_validate(record_data)
+                valid_records.append(validated.model_dump(by_alias=True))
+            except ValidationError as e:
+                errors.append({"record": row.to_dict(), "error": str(e)})
+                print(f"Prediction validation error for SCRIP_CD={row.get('SCRIP_CD')}: {e}")
+
+        if errors:
+            print(f"{len(errors)} predictions failed validation.")
+
+        if not valid_records:
+            return []
+
+        rows = []
+        for record in valid_records:
+            rows.append(
+                (
+                    str(record.get("SCRIP_CD")),
+                    record.get("PDF_Link"),
+                    record.get("Impact"),
+                    record.get("News_submission_dt"),
+                    Json(_normalize_for_json(record)),
+                )
+            )
+
+        conflict_clause = (
+            "ON CONFLICT (scrip_cd, pdf_link) DO UPDATE SET "
+            "impact = EXCLUDED.impact, news_submission_dt = EXCLUDED.news_submission_dt, data = EXCLUDED.data"
+            if force
+            else "ON CONFLICT (scrip_cd, pdf_link) DO NOTHING"
+        )
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    f"""
+                    INSERT INTO predictions (scrip_cd, pdf_link, impact, news_submission_dt, data)
+                    VALUES %s
+                    {conflict_clause}
+                    RETURNING id
+                    """,
+                    rows,
+                )
+                inserted_ids = [row[0] for row in cur.fetchall()]
+
+        skipped = len(rows) - len(inserted_ids)
+        if skipped:
+            print(f"{skipped} predictions already present in the DB and were skipped.")
+
+        return [{"inserted_id": iid} for iid in inserted_ids]
+
+    # ------------------------------------------------------------------
+    # LATEST ANNOUNCEMENT
+    # ------------------------------------------------------------------
+    def get_latest_announcements(self) -> Union[dict, None]:
+        """Fetch the single most recent raw announcement."""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT data
+                    FROM raw_bse_announcements
+                    ORDER BY news_submission_dt DESC NULLS LAST
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+        return row[0] if row else None
