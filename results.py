@@ -326,6 +326,17 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
         lambda r: (sum(_price_mid(r)) / len(_price_mid(r))) if _price_mid(r) else 0.0
     )
 
+    # Drop NEUTRAL / MATCHED — keep only directional predictions
+    before = len(df)
+    df = df[~df["Impact"].isin(["NEUTRAL", "MATCHED"])].copy()
+    dropped = before - len(df)
+    if dropped:
+        print(f"Dropped {dropped} NEUTRAL/MATCHED predictions. {len(df)} remain.")
+
+    if df.empty:
+        print("No directional predictions remain after filtering out NEUTRAL/MATCHED.")
+        return pd.DataFrame()
+
     # Rank & limit to top 30
     df.sort_values(["Impact_Score", "Mid_%"], ascending=[False, False], inplace=True)
     df = df.head(30).copy()
