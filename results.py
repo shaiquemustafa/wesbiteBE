@@ -136,10 +136,10 @@ def _call_llm(prompt, user, retries=3, max_tokens=400, temperature=0.3):
         except (openai.APIConnectionError, ReadTimeout, ConnectError) as e:
             if a == retries - 1:
                 raise
-            #print(f"Error during OpenAI API call: {e}")
+            print(f"Error during OpenAI API call: {e}")
             return None # Return None if API call fails
         except Exception as e:
-            #print(f"Unexpected error during llm call: {e}")
+            print(f"Unexpected error during llm call: {e}")
             return None
 
 def _process_pdf_from_memory(pdf_row: pd.Series) ->  Optional[dict]:
@@ -148,7 +148,7 @@ def _process_pdf_from_memory(pdf_row: pd.Series) ->  Optional[dict]:
     and returns a dictionary with the results.
     """
     text = _extract_text(pdf_row['pdf_content'])
-    if not text or len(text) < 300:
+    if not text or len(text) < 100:
         return None
 
     resp = _call_llm(PROMPT_SCREEN, text + "\nReturn one line only.")
@@ -185,12 +185,12 @@ def analyze_pdfs_from_dataframe(pdf_df: pd.DataFrame):
 
     rows = []
     if pdf_df.empty:
-        #print("No PDFs to analyze in the DataFrame.")
+        print("No PDFs to analyze in the DataFrame.")
         return pd.DataFrame()
 
     pdf_tasks = [row for _, row in pdf_df.iterrows()]
 
-    #print(f"Starting analysis of {len(pdf_tasks)} PDFs with 5 workers...")
+    print(f"Starting analysis of {len(pdf_tasks)} PDFs with 2 workers...")
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_to_file = {executor.submit(_process_pdf_from_memory, task): task['SCRIP_CD'] for task in pdf_tasks}
         for i, future in enumerate(as_completed(future_to_file), 1):
@@ -200,16 +200,16 @@ def analyze_pdfs_from_dataframe(pdf_df: pd.DataFrame):
                 rows.append(result)
 
     if not rows:
-        #print("No valid PDFs were processed.")
+        print("No valid PDFs were processed.")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
 
     df["Impact_Score"] = df["Impact"].apply(impact)
-    df["Mid_%"] = df["Price_Range"].apply(lambda r: sum(price_mid(r)) / len(price_mid(r)) if price_mid(r) else 0)
-
-    # Filter for rows where the absolute mid-point percentage is greater than 1.
-    df = df[(df["Mid_%"] > 1) | (df["Mid_%"] < -1)].copy()
+    df["Mid_%"] = df["Price_Range"].apply(
+        lambda r: (sum(price_mid(r)) / len(price_mid(r))) if price_mid(r) else None
+    )
+    df = df.copy()
     
     df.sort_values(["Impact_Score", "Mid_%"], ascending=[False, False], inplace=True)
     # The 'SCRIP_CD' column is already populated from _process_pdf. Let's ensure it's a string for merging.
@@ -217,5 +217,5 @@ def analyze_pdfs_from_dataframe(pdf_df: pd.DataFrame):
     # df = df.drop_duplicates(subset="Company", keep="first")
     df.reset_index(drop=True, inplace=True)
     df.insert(0, "Rank", df.index + 1)
-    #print(f"Analysis complete. {len(df)} results ranked.")
+    print(f"Analysis complete. {len(df)} results ranked.")
     return df

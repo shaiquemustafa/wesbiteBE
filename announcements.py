@@ -40,7 +40,7 @@ def fetch_and_filter_announcements(
     total_pages = math.ceil(total_rows / rows_per_page)
     all_rows = []
 
-    #print(f"Fetching {total_rows} announcements across {total_pages} pages...")
+    print(f"Fetching {total_rows} announcements across {total_pages} pages...")
     with ThreadPoolExecutor(max_workers=2) as executor:
         # Submit all page fetch tasks to the thread pool
         future_to_page = {
@@ -59,16 +59,17 @@ def fetch_and_filter_announcements(
                 print(f"Page {page_no} generated an exception: {exc}")
 
     if not all_rows:
+        print("No announcements returned from BSE.")
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
     # Store raw announcements in MongoDB using the create_filtered_announcements service method
     #print(f"Storing raw announcements for {date_str} in MongoDB...")
     inserted_announcements = announcement_service.create_announcements(df, f"raw_bse_announcements")
-    #print(f"MongoDB: Inserted {len(inserted_announcements)} new raw announcements.")
+    print(f"Stored {len(inserted_announcements)} new raw announcements.")
 
     if not inserted_announcements:
-        #print("No new announcements to filter.")
+        print("No new announcements to filter.")
         return pd.DataFrame()
 
     # Use only the newly inserted announcements for further processing.
@@ -92,7 +93,7 @@ def fetch_and_filter_announcements(
     df_final = df_filtered_mcap[df_filtered_mcap["DT_TM"] > cutoff_datetime].copy()
     df_final['ATTACHMENTNAME'] = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/" + df_final['ATTACHMENTNAME'].astype(str)
 
-    #print(f"Returning {len(df_final)} filtered announcements.")
+    print(f"Returning {len(df_final)} filtered announcements.")
     return df_final
 
 if __name__ == "__main__":

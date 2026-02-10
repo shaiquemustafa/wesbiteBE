@@ -36,13 +36,13 @@ def download_pdfs_to_dataframe(announcements_df: pd.DataFrame) -> pd.DataFrame:
             download_tasks.append((index, url))
 
     if not download_tasks:
-        #print("No valid URLs found in the DataFrame.")
+        print("No valid URLs found in the DataFrame.")
         announcements_df['pdf_content'] = None
         return announcements_df
 
     # Limit workers to a low number suitable for a free-tier EC2 instance.
     num_workers = 2
-    #print(f"Starting PDF download with {num_workers} workers for {len(download_tasks)} URLs.")
+    print(f"Starting PDF download with {num_workers} workers for {len(download_tasks)} URLs.")
 
     # Use a dictionary to store results, keyed by the DataFrame index.
     # This avoids issues with non-sequential or non-zero-based indices.
@@ -58,4 +58,6 @@ def download_pdfs_to_dataframe(announcements_df: pd.DataFrame) -> pd.DataFrame:
     
     # Map the downloaded content back to the DataFrame using its index.
     announcements_df['pdf_content'] = announcements_df.index.map(pdf_contents_map)
-    return announcements_df.dropna(subset=['pdf_content'])
+    result_df = announcements_df.dropna(subset=['pdf_content'])
+    print(f"Downloaded {len(result_df)} PDFs.")
+    return result_df
