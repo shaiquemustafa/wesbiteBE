@@ -16,6 +16,14 @@ from service.ui_data_service import UIDataService
 from entity.ui_data import UIDataItem
 from typing import List
 
+# Fixed IST offset (no tzdata dependency)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _now_ist_naive() -> datetime:
+    """Current time in IST as a naive datetime."""
+    return datetime.now(IST).replace(tzinfo=None)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,12 +48,20 @@ app = FastAPI(
 @app.post("/analyze-announcements/", summary="Run the full analysis pipeline")
 async def run_analysis_pipeline(
     background_tasks: BackgroundTasks,
-    date: str | None = Query(None, description="Target date in YYYY-MM-DD format.", pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    cut_off_time: str = Query("20:30:00", description="Cut-off time in HH:MM:SS format."),
-    market_cap_st: int = Query(2500, description="Start of market cap range (in Crores)."),
-    market_cap_end: int = Query(25000, description="End of market cap range (in Crores)."),
-    hours: int = Query(5, description="Lookback window in hours from now."),
-    force: bool = Query(False, description="Reprocess existing announcements in the window."),
+    date: str | None = Query(
+        None,
+        description=(
+            "Target date YYYY-MM-DD. When provided, fetches & analyses ALL "
+            "announcements for that FULL DAY (ignores 'hours'). "
+            "When omitted, uses the lookback window ('hours') from now."
+        ),
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    ),
+    cut_off_time: str = Query("00:00:00", description="Cut-off time HH:MM:SS (only used when date is set without hours)."),
+    market_cap_st: int = Query(2500, description="Start of market cap range (Crores)."),
+    market_cap_end: int = Query(25000, description="End of market cap range (Crores)."),
+    hours: int = Query(0, description="Lookback window in hours from now. 0 = full day."),
+    force: bool = Query(True, description="Reprocess announcements already in DB."),
     run_now: bool = Query(False, description="Run synchronously and return counts."),
 ):
     target_date = None
@@ -83,8 +99,38 @@ async def run_analysis_in_background(
 ):
     """The main analysis workflow."""
     async with analysis_lock:
-        logger.info("=== Pipeline start (hours=%s, force=%s) ===", hours, force)
+        now_ist = _now_ist_naive()
+
+        # ----- Determine mode -----
+        if target_date:
+            # MODE 1: Full-day — process ALL announcements for that date
+            mode = "full-day"
+            the_date = target_date
+            start_dt = None   # no time window → announcements.py skips time filter
+            end_dt = None
+        elif hours > 0:
+            # MODE 2: Incremental — last N hours
+            mode = f"incremental ({hours}h)"
+            the_date = now_ist
+            end_dt = now_ist
+            start_dt = end_dt - timedelta(hours=hours)
+        else:
+            # hours=0 and no date → full today
+            mode = "full-day (today)"
+            the_date = now_ist
+            start_dt = None
+            end_dt = None
+
+        logger.info("=== Pipeline start | mode=%s | date=%s | force=%s ===",
+                     mode, the_date.strftime("%Y-%m-%d"), force)
+        if start_dt and end_dt:
+            logger.info("Time window: %s → %s (IST)", start_dt, end_dt)
+        else:
+            logger.info("Processing FULL DAY for %s", the_date.strftime("%Y-%m-%d"))
+
         summary = {
+            "mode": mode,
+            "date": the_date.strftime("%Y-%m-%d"),
             "filtered": 0,
             "pdfs_downloaded": 0,
             "analyzed": 0,
@@ -93,15 +139,8 @@ async def run_analysis_in_background(
         }
 
         # --- Step 1: Fetch & filter ---
-        # Use fixed UTC+5:30 offset (no tzdata dependency on Render)
-        IST = timezone(timedelta(hours=5, minutes=30))
-        end_dt = datetime.now(IST).replace(tzinfo=None)   # naive IST
-        start_dt = end_dt - timedelta(hours=hours)
-
-        logger.info("Time window: %s → %s (IST, naive)", start_dt, end_dt)
-
         filtered_df = fetch_and_filter_announcements(
-            target_date=target_date or end_dt,
+            target_date=the_date,
             market_cap_start=market_cap_start,
             market_cap_end=market_cap_end,
             cut_off_time_str=cut_off_time_str,
@@ -188,7 +227,7 @@ def store_ui_data(data_item: UIDataItem):
 
 @app.get("/ui-data/today", summary="Fetch latest UI data for the current date")
 def get_todays_ui_data():
-    target_date = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    target_date = _now_ist_naive()
     ui_service = UIDataService()
     try:
         latest_data = ui_service.get_latest_ui_data(target_date=target_date)

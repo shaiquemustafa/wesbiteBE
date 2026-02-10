@@ -13,7 +13,7 @@ def fetch_and_filter_announcements(
     target_date: datetime,
     market_cap_start: int = 2500,
     market_cap_end: int = 25000,
-    cut_off_time_str: str = "20:30:00",
+    cut_off_time_str: str = "00:00:00",
     mcap_csv_path: str = "./assets/bse_market_cap_f5.csv",
     output_dir: str = "./bse_announcements",
     start_datetime: datetime | None = None,
@@ -21,24 +21,24 @@ def fetch_and_filter_announcements(
     force_reprocess: bool = False,
 ) -> pd.DataFrame:
     """
-    1. Fetch all BSE announcements for the TARGET DATE (full day)
-    2. Store raw data in PostgreSQL (skip duplicates)
-    3. Merge with market-cap CSV
-    4. Filter by market cap range + time window
-    5. Build full PDF URLs
+    Pipeline:
+      1. Fetch ALL BSE announcements for target_date (full day from BSE).
+      2. Store raw data in PostgreSQL (skip duplicates).
+      3. Merge with market-cap CSV & filter by range.
+      4. Optionally filter by time window (if start/end provided).
+         If both are None → keep the FULL DAY (no time filter).
+      5. Build full PDF URLs.
     Returns a DataFrame ready for PDF download.
     """
     announcement_service = AnnouncementService()
     os.makedirs(output_dir, exist_ok=True)
 
     # ---- Determine which date(s) to query from BSE ----
-    # Always query BSE for the full target_date (today).
-    # If the time window spans midnight, also query the previous day.
     query_date = target_date.date() if hasattr(target_date, "date") else target_date
+
+    # If incremental window spans midnight, also query previous day
     from_date = query_date
     to_date = query_date
-
-    # If start_datetime is on a different day than end_datetime, widen the BSE query
     if start_datetime and end_datetime:
         sd = start_datetime.date() if hasattr(start_datetime, "date") else start_datetime
         ed = end_datetime.date() if hasattr(end_datetime, "date") else end_datetime
@@ -55,12 +55,11 @@ def fetch_and_filter_announcements(
         print(f"BSE API call failed: {e}")
         return pd.DataFrame()
 
-    # BSE returns Table1 with row count. If missing, there are zero announcements.
+    # BSE returns Table1 with row count metadata
     table1 = first_page.get("Table1")
     if not table1 or not isinstance(table1, list) or len(table1) == 0:
         print(f"BSE returned no Table1 metadata for {from_date}→{to_date}. "
-              f"Keys returned: {list(first_page.keys()) if isinstance(first_page, dict) else type(first_page)}")
-        # Fall through to reprocess path below (data might already be in DB)
+              f"Response keys: {list(first_page.keys()) if isinstance(first_page, dict) else type(first_page)}")
         total_rows = 0
     else:
         try:
@@ -107,22 +106,23 @@ def fetch_and_filter_announcements(
         df_to_process = pd.DataFrame(inserted)
         print(f"Processing {len(df_to_process)} newly inserted announcements.")
     elif force_reprocess:
-        # No new ones — reprocess existing data in the window
-        df_to_process = announcement_service.get_raw_announcements_by_window(
-            start_dt=start_datetime, end_dt=end_datetime
-        )
-        if df_to_process.empty:
-            # Also try the full day if window query found nothing
+        # Reprocess from DB – use time window if given, otherwise full day
+        if start_datetime and end_datetime:
+            df_to_process = announcement_service.get_raw_announcements_by_window(
+                start_dt=start_datetime, end_dt=end_datetime
+            )
+        else:
+            # Full-day mode: query midnight to midnight
             day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
             day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-            print(f"Window query empty. Trying full day: {day_start} → {day_end}")
+            print(f"Full-day reprocess: {day_start} → {day_end}")
             df_to_process = announcement_service.get_raw_announcements_by_window(
                 start_dt=day_start, end_dt=day_end
             )
         if df_to_process.empty:
-            print("Force-reprocess: no announcements found in DB for this window or day.")
+            print("No announcements found in DB for reprocessing.")
             return pd.DataFrame()
-        print(f"Force-reprocessing {len(df_to_process)} existing announcements from DB.")
+        print(f"Reprocessing {len(df_to_process)} existing announcements from DB.")
     else:
         print("No new announcements and force=False. Nothing to process.")
         return pd.DataFrame()
@@ -131,14 +131,11 @@ def fetch_and_filter_announcements(
     try:
         df_mcap = pd.read_csv(mcap_csv_path)
     except FileNotFoundError:
-        print(f"WARNING: Market cap file not found at {mcap_csv_path}. Skipping mcap filter.")
+        print(f"WARNING: Market cap file not found at {mcap_csv_path}.")
         return df_to_process
 
-    # Ensure SCRIP_CD is numeric for merge
     df_to_process["SCRIP_CD"] = pd.to_numeric(df_to_process["SCRIP_CD"], errors="coerce")
     df_mcap["FinInstrmId"] = pd.to_numeric(df_mcap["FinInstrmId"], errors="coerce")
-
-    # Drop any existing market cap columns to avoid conflicts
     df_to_process = df_to_process.drop(columns=["Market Cap", "FinInstrmId", "market_cap"], errors="ignore")
 
     df_merged = df_to_process.merge(
@@ -157,31 +154,29 @@ def fetch_and_filter_announcements(
     if df_filtered.empty:
         return pd.DataFrame()
 
-    # ---- Step 6: Filter by time window ----
+    # ---- Step 6: Filter by time window (ONLY if both start & end given) ----
     df_filtered["DT_TM"] = pd.to_datetime(df_filtered["DT_TM"], errors="coerce")
 
     if start_datetime and end_datetime:
+        # Incremental mode — filter to the time window
         df_final = df_filtered[
             (df_filtered["DT_TM"] >= start_datetime) & (df_filtered["DT_TM"] <= end_datetime)
         ].copy()
         print(f"After time filter ({start_datetime} → {end_datetime}): {len(df_final)} announcements.")
     else:
-        date_str = target_date.strftime("%Y-%m-%d")
-        cutoff = datetime.strptime(f"{date_str} {cut_off_time_str}", "%Y-%m-%d %H:%M:%S")
-        df_final = df_filtered[df_filtered["DT_TM"] > cutoff].copy()
-        print(f"After cutoff filter (>{cutoff}): {len(df_final)} announcements.")
+        # Full-day mode — keep ALL announcements for the date (no time filter)
+        df_final = df_filtered.copy()
+        print(f"Full-day mode: keeping all {len(df_final)} announcements (no time filter).")
 
     if df_final.empty:
         return pd.DataFrame()
 
     # ---- Step 7: Build full PDF URLs ----
-    # Only add prefix if not already a full URL
     df_final["ATTACHMENTNAME"] = df_final["ATTACHMENTNAME"].apply(
         lambda x: x if str(x).startswith("http") else
         "https://www.bseindia.com/xml-data/corpfiling/AttachLive/" + str(x)
     )
 
-    # Ensure News_submission_dt is present
     if "News_submission_dt" in df_final.columns:
         df_final["News_submission_dt"] = pd.to_datetime(df_final["News_submission_dt"], errors="coerce")
 
