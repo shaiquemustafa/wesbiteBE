@@ -13,7 +13,6 @@ def fetch_and_filter_announcements(
     target_date: datetime,
     market_cap_start: int = 2500,
     market_cap_end: int = 25000,
-    cut_off_time_str: str = "00:00:00",
     mcap_csv_path: str = "./assets/bse_market_cap_f5.csv",
     output_dir: str = "./bse_announcements",
     start_datetime: datetime | None = None,

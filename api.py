@@ -1,4 +1,3 @@
-import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks
@@ -6,7 +5,6 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 
-from urllib.parse import unquote
 from announcements import fetch_and_filter_announcements
 from results import analyze_announcements
 from database import connect_to_db, close_db_connection
@@ -49,14 +47,19 @@ async def run_analysis_pipeline(
     background_tasks: BackgroundTasks,
     date: str | None = Query(
         None,
-        description=(
-            "Target date YYYY-MM-DD. When provided, fetches & analyses ALL "
-            "announcements for that FULL DAY (ignores 'hours'). "
-            "When omitted, uses the lookback window ('hours') from now."
-        ),
+        description="Target date YYYY-MM-DD.",
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     ),
-    cut_off_time: str = Query("00:00:00", description="Cut-off time HH:MM:SS (only used when date is set without hours)."),
+    start_time: str | None = Query(
+        None,
+        description="Start of time window HH:MM (IST). Use with 'date'. E.g. 15:00",
+        pattern=r"^\d{2}:\d{2}(:\d{2})?$",
+    ),
+    end_time: str | None = Query(
+        None,
+        description="End of time window HH:MM (IST). Use with 'date'. E.g. 17:00",
+        pattern=r"^\d{2}:\d{2}(:\d{2})?$",
+    ),
     market_cap_st: int = Query(2500, description="Start of market cap range (Crores)."),
     market_cap_end: int = Query(25000, description="End of market cap range (Crores)."),
     hours: int = Query(0, description="Lookback window in hours from now. 0 = full day."),
@@ -70,20 +73,36 @@ async def run_analysis_pipeline(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    decoded_cut_off_time = unquote(cut_off_time)
+    # Parse optional start_time / end_time into time objects
+    parsed_start_time = None
+    parsed_end_time = None
+    if start_time:
+        try:
+            fmt = "%H:%M:%S" if start_time.count(":") == 2 else "%H:%M"
+            parsed_start_time = datetime.strptime(start_time, fmt).time()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_time. Use HH:MM or HH:MM:SS.")
+    if end_time:
+        try:
+            fmt = "%H:%M:%S" if end_time.count(":") == 2 else "%H:%M"
+            parsed_end_time = datetime.strptime(end_time, fmt).time()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_time. Use HH:MM or HH:MM:SS.")
 
     if analysis_lock.locked():
         raise HTTPException(status_code=409, detail="Analysis already running. Try again later.")
 
     if run_now:
         result = await run_analysis_in_background(
-            target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours, force
+            target_date, market_cap_st, market_cap_end, hours, force,
+            parsed_start_time, parsed_end_time,
         )
         return result
 
     background_tasks.add_task(
         run_analysis_in_background,
-        target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours, force,
+        target_date, market_cap_st, market_cap_end, hours, force,
+        parsed_start_time, parsed_end_time,
     )
     return {"message": "Analysis pipeline started in the background."}
 
@@ -92,36 +111,42 @@ async def run_analysis_in_background(
     target_date: datetime | None,
     market_cap_start: int,
     market_cap_end: int,
-    cut_off_time_str: str,
     hours: int,
     force: bool,
+    start_time_obj=None,   # datetime.time or None
+    end_time_obj=None,     # datetime.time or None
 ):
     """The main analysis workflow."""
     async with analysis_lock:
         now_ist = _now_ist_naive()
 
         # ----- Determine mode -----
-        if target_date and hours > 0:
-            # MODE A: Specific date + time window (e.g. last 2h of Feb 10)
-            # end_dt = end of that date (23:59) or cut_off_time
+        if target_date and start_time_obj and end_time_obj:
+            # MODE A: Precise time range on a given date  (e.g. 15:00–17:00)
+            mode = f"time-range ({start_time_obj.strftime('%H:%M')}–{end_time_obj.strftime('%H:%M')})"
+            the_date = target_date
+            start_dt = datetime.combine(target_date.date(), start_time_obj)
+            end_dt = datetime.combine(target_date.date(), end_time_obj)
+        elif target_date and hours > 0:
+            # MODE B: Specific date + lookback hours from end-of-day
             mode = f"date+window ({hours}h)"
             the_date = target_date
             end_dt = target_date.replace(hour=23, minute=59, second=59)
             start_dt = end_dt - timedelta(hours=hours)
         elif target_date:
-            # MODE B: Full-day for a specific date
+            # MODE C: Full-day for a specific date
             mode = "full-day"
             the_date = target_date
             start_dt = None
             end_dt = None
         elif hours > 0:
-            # MODE C: Incremental — last N hours from now
+            # MODE D: Incremental — last N hours from now
             mode = f"incremental ({hours}h)"
             the_date = now_ist
             end_dt = now_ist
             start_dt = end_dt - timedelta(hours=hours)
         else:
-            # MODE D: hours=0 and no date → full today
+            # MODE E: hours=0 and no date → full today
             mode = "full-day (today)"
             the_date = now_ist
             start_dt = None
@@ -148,7 +173,6 @@ async def run_analysis_in_background(
             target_date=the_date,
             market_cap_start=market_cap_start,
             market_cap_end=market_cap_end,
-            cut_off_time_str=cut_off_time_str,
             start_datetime=start_dt,
             end_datetime=end_dt,
             force_reprocess=force,

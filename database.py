@@ -45,21 +45,52 @@ def close_db_connection():
 
 @contextmanager
 def get_conn():
-    """Yields a pooled connection with commit/rollback handling."""
+    """
+    Yields a live pooled connection with commit/rollback handling.
+    Automatically detects and replaces stale/dead connections
+    (e.g. after Neon drops idle SSL connections).
+    """
     if _pool is None:
         raise ConnectionError("Database connection is not established.")
+
     conn = _pool.getconn()
-    if conn.closed:
-        _pool.putconn(conn, close=True)
-        conn = _pool.getconn()
+
+    # --- Liveness check: ping the connection before handing it out ---
+    alive = False
+    if not conn.closed:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()          # clear the implicit txn from the ping
+            alive = True
+        except Exception:
+            pass                      # connection is dead
+
+    if not alive:
+        # Discard the dead connection and get a fresh one from the pool
+        try:
+            _pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = _pool.getconn()        # pool will create a brand-new connection
+
     try:
         yield conn
-        conn.commit()
+        if not conn.closed:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        # Attempt rollback, but don't fail if the connection is already gone
+        if not conn.closed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
-        _pool.putconn(conn)
+        try:
+            _pool.putconn(conn, close=(conn.closed != 0))
+        except Exception:
+            pass
 
 
 def _ensure_tables(conn):
