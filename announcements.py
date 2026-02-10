@@ -102,17 +102,14 @@ def fetch_and_filter_announcements(
         print(f"Stored {len(inserted)} NEW raw announcements in DB.")
 
     # ---- Step 3: Decide which announcements to process ----
-    if inserted:
-        df_to_process = pd.DataFrame(inserted)
-        print(f"Processing {len(df_to_process)} newly inserted announcements.")
-    elif force_reprocess:
-        # Reprocess from DB – use time window if given, otherwise full day
+    # When force=True, ALWAYS pull ALL matching announcements from DB
+    # (not just newly inserted ones) so existing records get analysed too.
+    if force_reprocess:
         if start_datetime and end_datetime:
             df_to_process = announcement_service.get_raw_announcements_by_window(
                 start_dt=start_datetime, end_dt=end_datetime
             )
         else:
-            # Full-day mode: query midnight to midnight
             day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
             day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
             print(f"Full-day reprocess: {day_start} → {day_end}")
@@ -122,7 +119,10 @@ def fetch_and_filter_announcements(
         if df_to_process.empty:
             print("No announcements found in DB for reprocessing.")
             return pd.DataFrame()
-        print(f"Reprocessing {len(df_to_process)} existing announcements from DB.")
+        print(f"Processing {len(df_to_process)} announcements from DB (force=True).")
+    elif inserted:
+        df_to_process = pd.DataFrame(inserted)
+        print(f"Processing {len(df_to_process)} newly inserted announcements.")
     else:
         print("No new announcements and force=False. Nothing to process.")
         return pd.DataFrame()
