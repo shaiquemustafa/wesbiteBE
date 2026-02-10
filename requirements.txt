@@ -9,3 +9,4 @@ openpyxl
 dotenv
 python-dotenv
 psycopg2-binary
+tzdata

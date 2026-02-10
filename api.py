@@ -1,7 +1,6 @@
 import os
 import pandas as pd
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks
 from contextlib import asynccontextmanager
 import asyncio
@@ -94,8 +93,9 @@ async def run_analysis_in_background(
         }
 
         # --- Step 1: Fetch & filter ---
-        IST = ZoneInfo("Asia/Kolkata")
-        end_dt = datetime.now(IST).replace(tzinfo=None)
+        # Use fixed UTC+5:30 offset (no tzdata dependency on Render)
+        IST = timezone(timedelta(hours=5, minutes=30))
+        end_dt = datetime.now(IST).replace(tzinfo=None)   # naive IST
         start_dt = end_dt - timedelta(hours=hours)
 
         logger.info("Time window: %s → %s (IST, naive)", start_dt, end_dt)
