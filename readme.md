@@ -16,9 +16,10 @@ cd elrond-stock-analyzer-be
 ```
 
 2. Set Up Environment Variables
-   Create a file named `.env` in the root of the project directory and add your OpenAI API key to it:
+   Create a file named `.env` in the root of the project directory and add your OpenAI API key and database URL:
    ```
    OPENAI_API_KEY="your_secret_api_key_here"
+   DATABASE_URL="your_neon_postgres_connection_string"
    ```
 3. Create and Activate a Virtual Environment
    A virtual environment (venv) is highly recommended to keep project dependencies isolated.

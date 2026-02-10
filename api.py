@@ -11,7 +11,7 @@ from urllib.parse import unquote
 from announcements import fetch_and_filter_announcements
 from data_to_pdf import download_pdfs_to_dataframe
 from results import analyze_pdfs_from_dataframe
-from database import connect_to_mongo, close_mongo_connection
+from database import connect_to_db, close_db_connection
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
 from entity.ui_data import UIDataItem
@@ -20,10 +20,10 @@ from typing import List
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Code to run on startup
-    connect_to_mongo()
+    connect_to_db()
     yield
     # Code to run on shutdown
-    close_mongo_connection()
+    close_db_connection()
 
 # A simple in-memory lock to prevent concurrent analysis runs.
 analysis_lock = asyncio.Lock()

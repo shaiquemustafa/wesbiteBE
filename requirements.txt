@@ -8,4 +8,4 @@ httpx
 openpyxl
 dotenv
 python-dotenv
-pymongo
+psycopg2-binary

@@ -1,10 +1,20 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import ValidationError, TypeAdapter
-
 from datetime import datetime, timedelta
-from database import db_mongo
+from psycopg2.extras import execute_values, Json
+
+from database import get_conn
 from entity.ui_data import UIDataItem
-from typing import Dict, Any, Optional
+
+
+def _normalize_for_json(value):
+    if isinstance(value, dict):
+        return {k: _normalize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_for_json(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 class UIDataService:
     """
@@ -23,25 +33,41 @@ class UIDataService:
         Returns:
             A list of dictionaries, each containing the inserted ID and any validation errors for each item.
         """
-        if db_mongo.db is None:
-            raise ConnectionError("Database connection is not established.")
-
-        collection = db_mongo.db[collection_name]
-
         try:
             # Use TypeAdapter for robust list validation
             validated_items = TypeAdapter(List[UIDataItem]).validate_python(data_items)
             
             # Prepare each item for insertion
             documents_to_insert = [item.model_dump() for item in validated_items]
-            
-            # Insert many documents in one go
-            if documents_to_insert:
-                result = collection.insert_many(documents_to_insert)
-                inserted_ids = [str(id) for id in result.inserted_ids]
-                return [{"inserted_id": id, "errors": []} for id in inserted_ids]
-            else:
-                return [] # Return empty list if no documents to insert
+
+            if not documents_to_insert:
+                return []
+
+            rows = []
+            for item in documents_to_insert:
+                category = item.get("category") or item.get("Category")
+                rows.append(
+                    (
+                        item.get("news_time"),
+                        category,
+                        Json(_normalize_for_json(item)),
+                    )
+                )
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO ui_data (news_time, category, data)
+                        VALUES %s
+                        RETURNING id
+                        """,
+                        rows,
+                    )
+                    inserted_ids = [row[0] for row in cur.fetchall()]
+
+            return [{"inserted_id": inserted_id, "errors": []} for inserted_id in inserted_ids]
         except ValidationError as e:
             # Handle validation errors
             return [{"inserted_id": None, "errors": e.json()}]
@@ -63,14 +89,9 @@ class UIDataService:
             A list of dictionaries, each representing a UI data item, sorted by news_time descending.
             Returns an empty list if no items are found.
         """
-        if db_mongo.db is None:
-            raise ConnectionError("Database connection is not established.")
-
-        collection = db_mongo.db[collection_name]
-        
         # The query to find matching documents.
         find_query = {}
-
+        params = []
         if target_date:
             # Calculate start_of_query_window: previous day 15:30:00 of target_date
             previous_day = target_date - timedelta(days=1)
@@ -83,17 +104,23 @@ class UIDataService:
 
             # write a query to get news for "news_time" > start_of_query_window
             find_query = {
-                "news_time": {"$gte": start_of_query_window},
                 # "impact" : {"$in": ["POSITIVE", "STRONGLY POSITIVE"]}
             }
             #print(find_query)
-
         # Find all matching documents, sort them by news_time in descending order.
         # We don't limit to 1 anymore, as "latest" now implies a time window.
-        cursor = collection.find(find_query, projection={'_id': 0}).sort("news_time", -1)
+        base_query = "SELECT data FROM ui_data"
+        if target_date:
+            base_query += " WHERE news_time >= %s"
+            params.append(start_of_query_window)
+        base_query += " ORDER BY news_time DESC"
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(base_query, params)
+                items = [row[0] for row in cur.fetchall()]
 
         # Normalize and backfill fields for UI consumers
-        items = list(cursor)
         for item in items:
             # Backfill 'category' from 'Category' or default if missing
             if 'category' not in item or item.get('category') in (None, ""):
