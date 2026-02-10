@@ -15,7 +15,8 @@ def fetch_and_filter_announcements(
     mcap_csv_path: str = "./assets/bse_market_cap_f5.csv",
     output_dir: str = "./bse_announcements",
     start_datetime: datetime | None = None,
-    end_datetime: datetime | None = None
+    end_datetime: datetime | None = None,
+    force_reprocess: bool = False
 ) -> pd.DataFrame:
     """
     Fetches BSE announcements for a specific date, filters them by market cap and time,
@@ -73,11 +74,21 @@ def fetch_and_filter_announcements(
     print(f"Stored {len(inserted_announcements)} new raw announcements.")
 
     if not inserted_announcements:
-        print("No new announcements to filter.")
-        return pd.DataFrame()
-
-    # Use only the newly inserted announcements for further processing.
-    df_new = pd.DataFrame(inserted_announcements)
+        if force_reprocess:
+            df_new = announcement_service.get_raw_announcements_by_window(
+                start_dt=start_datetime,
+                end_dt=end_datetime
+            )
+            if df_new.empty:
+                print("No new announcements to filter, and none found in the window to reprocess.")
+                return pd.DataFrame()
+            print(f"Reprocessing {len(df_new)} existing raw announcements.")
+        else:
+            print("No new announcements to filter.")
+            return pd.DataFrame()
+    else:
+        # Use only the newly inserted announcements for further processing.
+        df_new = pd.DataFrame(inserted_announcements)
 
     # 2. Filter by Market Cap and Time
     try:

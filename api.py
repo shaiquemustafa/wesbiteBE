@@ -41,7 +41,8 @@ async def run_analysis_pipeline(
     cut_off_time: str = Query("20:30:00", description="Cut-off time in HH:MM:SS format."),
     market_cap_st: int = Query(2500, description="Start of market cap range (in Crores)."),
     market_cap_end: int = Query(25000, description="End of market cap range (in Crores)."),
-    hours: int = Query(5, description="Lookback window in hours from now.")
+    hours: int = Query(5, description="Lookback window in hours from now."),
+    force: bool = Query(False, description="Reprocess existing announcements in the window.")
 ):
     target_date = None
     if date:
@@ -58,7 +59,7 @@ async def run_analysis_pipeline(
 
     background_tasks.add_task(
         run_analysis_in_background,
-        target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours
+        target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours, force
     )
 
     return {"message": "Analysis pipeline started in the background."}
@@ -68,7 +69,8 @@ async def run_analysis_in_background(
     market_cap_start: int,
     market_cap_end: int,
     cut_off_time_str: str,
-    hours: int
+    hours: int,
+    force: bool
 ):
     """The main analysis workflow, designed to be run as a background task."""
     async with analysis_lock:
@@ -83,7 +85,8 @@ async def run_analysis_in_background(
             market_cap_end=market_cap_end,
             cut_off_time_str=cut_off_time_str,
             start_datetime=start_dt,
-            end_datetime=end_dt
+            end_datetime=end_dt,
+            force_reprocess=force
         )
         if filtered_df.empty:
             #print("No announcements found matching the criteria. Background task finished.")

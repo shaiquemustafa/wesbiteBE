@@ -205,3 +205,30 @@ class AnnouncementService:
                 )
                 row = cur.fetchone()
         return row[0] if row else None
+
+    def get_raw_announcements_by_window(
+        self,
+        start_dt: datetime | None,
+        end_dt: datetime | None
+    ) -> pd.DataFrame:
+        """
+        Fetch raw announcements from Postgres within a datetime window.
+        If no window is provided, returns an empty DataFrame.
+        """
+        if not start_dt or not end_dt:
+            return pd.DataFrame()
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT data
+                    FROM raw_bse_announcements
+                    WHERE news_submission_dt >= %s
+                      AND news_submission_dt <= %s
+                    """,
+                    (start_dt, end_dt),
+                )
+                rows = [row[0] for row in cur.fetchall()]
+
+        return pd.DataFrame(rows)
