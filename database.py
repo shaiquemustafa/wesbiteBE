@@ -21,7 +21,16 @@ def connect_to_db():
     """Initializes the Postgres connection pool and ensures tables exist."""
     global _pool
     if _pool is None:
-        _pool = SimpleConnectionPool(1, 8, dsn=DATABASE_URL, sslmode="require")
+        _pool = SimpleConnectionPool(
+            1,
+            8,
+            dsn=DATABASE_URL,
+            sslmode="require",
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
         with get_conn() as conn:
             _ensure_tables(conn)
 
@@ -40,6 +49,9 @@ def get_conn():
     if _pool is None:
         raise ConnectionError("Database connection is not established.")
     conn = _pool.getconn()
+    if conn.closed:
+        _pool.putconn(conn, close=True)
+        conn = _pool.getconn()
     try:
         yield conn
         conn.commit()
