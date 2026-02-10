@@ -37,15 +37,18 @@ app = FastAPI(
 @app.post("/analyze-announcements/", summary="Run the full analysis pipeline")
 async def run_analysis_pipeline(
     background_tasks: BackgroundTasks,
-    date: str = Query(..., description="Target date in YYYY-MM-DD format.", regex=r"^\d{4}-\d{2}-\d{2}$"),
+    date: str | None = Query(None, description="Target date in YYYY-MM-DD format.", regex=r"^\d{4}-\d{2}-\d{2}$"),
     cut_off_time: str = Query("20:30:00", description="Cut-off time in HH:MM:SS format."),
     market_cap_st: int = Query(2500, description="Start of market cap range (in Crores)."),
-    market_cap_end: int = Query(25000, description="End of market cap range (in Crores).")
+    market_cap_end: int = Query(25000, description="End of market cap range (in Crores)."),
+    hours: int = Query(5, description="Lookback window in hours from now.")
 ):
-    try:
-        target_date = datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
+    target_date = None
+    if date:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
 
     # Decode the cut_off_time string to handle URL-encoded characters like '%3A' for colons.
     decoded_cut_off_time = unquote(cut_off_time)
@@ -55,7 +58,7 @@ async def run_analysis_pipeline(
 
     background_tasks.add_task(
         run_analysis_in_background,
-        target_date, market_cap_st, market_cap_end, decoded_cut_off_time
+        target_date, market_cap_st, market_cap_end, decoded_cut_off_time, hours
     )
 
     return {"message": "Analysis pipeline started in the background."}
@@ -64,18 +67,23 @@ async def run_analysis_in_background(
     target_date: datetime,
     market_cap_start: int,
     market_cap_end: int,
-    cut_off_time_str: str
+    cut_off_time_str: str,
+    hours: int
 ):
     """The main analysis workflow, designed to be run as a background task."""
     async with analysis_lock:
         #print(f"Starting background analysis for date: {target_date.strftime('%Y-%m-%d')}")
     
         # --- Step 1: Fetch and Filter Announcements ---
+        end_dt = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+        start_dt = end_dt - timedelta(hours=hours)
         filtered_df = fetch_and_filter_announcements(
-            target_date=target_date,
+            target_date=target_date or end_dt,
             market_cap_start=market_cap_start,
             market_cap_end=market_cap_end,
-            cut_off_time_str=cut_off_time_str
+            cut_off_time_str=cut_off_time_str,
+            start_datetime=start_dt,
+            end_datetime=end_dt
         )
         if filtered_df.empty:
             #print("No announcements found matching the criteria. Background task finished.")

@@ -13,7 +13,9 @@ def fetch_and_filter_announcements(
     market_cap_end: int = 25000,
     cut_off_time_str: str = "20:30:00",
     mcap_csv_path: str = "./assets/bse_market_cap_f5.csv",
-    output_dir: str = "./bse_announcements"
+    output_dir: str = "./bse_announcements",
+    start_datetime: datetime | None = None,
+    end_datetime: datetime | None = None
 ) -> pd.DataFrame:
     """
     Fetches BSE announcements for a specific date, filters them by market cap and time,
@@ -29,8 +31,10 @@ def fetch_and_filter_announcements(
     # 1. Fetch Announcements
     # Increase timeout to 60 seconds to prevent request timeouts on slow responses
     b = BSE(download_folder="./bse_downloads")
+    from_date = start_datetime.date() if start_datetime else target_date
+    to_date = end_datetime.date() if end_datetime else target_date
     try:
-        latest = b.announcements(page_no=1, from_date=target_date, to_date=target_date)
+        latest = b.announcements(page_no=1, from_date=from_date, to_date=to_date)
         total_rows = int(latest['Table1'][0]['ROWCNT'])
     except (IndexError, KeyError):
         #print(f"No announcements found for {date_str}.")
@@ -44,7 +48,7 @@ def fetch_and_filter_announcements(
     with ThreadPoolExecutor(max_workers=2) as executor:
         # Submit all page fetch tasks to the thread pool
         future_to_page = {
-            executor.submit(b.announcements, page_no=p, from_date=target_date, to_date=target_date): p
+            executor.submit(b.announcements, page_no=p, from_date=from_date, to_date=to_date): p
             for p in range(1, total_pages + 1)
         }
 
@@ -88,9 +92,14 @@ def fetch_and_filter_announcements(
     df_merged = df_new.merge(df_mcap[["FinInstrmId", "Market Cap"]], left_on="SCRIP_CD", right_on="FinInstrmId", how="left")
     df_filtered_mcap = df_merged[(df_merged["Market Cap"] >= market_cap_start) & (df_merged["Market Cap"] <= market_cap_end)]
 
-    cutoff_datetime = datetime.strptime(f"{date_str} {cut_off_time_str}", "%Y-%m-%d %H:%M:%S")
     df_filtered_mcap["DT_TM"] = pd.to_datetime(df_filtered_mcap["DT_TM"], errors='coerce')
-    df_final = df_filtered_mcap[df_filtered_mcap["DT_TM"] > cutoff_datetime].copy()
+    if start_datetime and end_datetime:
+        df_final = df_filtered_mcap[
+            (df_filtered_mcap["DT_TM"] >= start_datetime) & (df_filtered_mcap["DT_TM"] <= end_datetime)
+        ].copy()
+    else:
+        cutoff_datetime = datetime.strptime(f"{date_str} {cut_off_time_str}", "%Y-%m-%d %H:%M:%S")
+        df_final = df_filtered_mcap[df_filtered_mcap["DT_TM"] > cutoff_datetime].copy()
     df_final['ATTACHMENTNAME'] = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/" + df_final['ATTACHMENTNAME'].astype(str)
 
     print(f"Returning {len(df_final)} filtered announcements.")
