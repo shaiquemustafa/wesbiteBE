@@ -2,6 +2,7 @@ import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
 import logging
@@ -115,6 +116,15 @@ app = FastAPI(
     title="BSE Announcements Analyzer API",
     description="Triggers a pipeline to fetch, filter, download, and analyze BSE announcements.",
     lifespan=lifespan,
+)
+
+# Allow frontend (Netlify) to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],            # Allow all origins (or set your Netlify URL)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
