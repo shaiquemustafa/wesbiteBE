@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks
@@ -17,21 +18,79 @@ from typing import List
 # Fixed IST offset (no tzdata dependency)
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# Scheduler config (env-overridable)
+SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "10"))
+SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+
 
 def _now_ist_naive() -> datetime:
     """Current time in IST as a naive datetime."""
     return datetime.now(IST).replace(tzinfo=None)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    connect_to_db()
-    yield
-    close_db_connection()
-
-
 analysis_lock = asyncio.Lock()
 logger = logging.getLogger("uvicorn.error")
+_scheduler_task: asyncio.Task | None = None
+
+
+# =========================================================================
+# Background scheduler — runs the pipeline every N minutes
+# =========================================================================
+async def _scheduled_analysis_loop():
+    """
+    Runs the full analysis pipeline at a fixed interval.
+    - Only processes NEW announcements (force=False)
+    - Looks back 1 hour to catch anything missed (overlap is fine — dupes are skipped)
+    - Skips if a manual run is already in progress
+    """
+    interval = SCHEDULER_INTERVAL_MIN * 60
+    logger.info("Scheduler started: running every %s minutes.", SCHEDULER_INTERVAL_MIN)
+
+    # Wait one interval before the first run (let the app warm up)
+    await asyncio.sleep(interval)
+
+    while True:
+        now_ist = _now_ist_naive()
+        logger.info("=== Scheduled run @ %s IST ===", now_ist.strftime("%H:%M:%S"))
+
+        if analysis_lock.locked():
+            logger.info("Scheduler: skipping — analysis already in progress.")
+        else:
+            try:
+                await run_analysis_in_background(
+                    target_date=None,       # today
+                    market_cap_start=2500,
+                    market_cap_end=25000,
+                    hours=1,                # look back 1 hour (generous overlap)
+                    force=False,            # only NEW announcements
+                )
+            except Exception as e:
+                logger.error("Scheduled analysis failed: %s", e)
+
+        await asyncio.sleep(interval)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _scheduler_task
+    connect_to_db()
+
+    # Start the background scheduler
+    if SCHEDULER_ENABLED:
+        _scheduler_task = asyncio.create_task(_scheduled_analysis_loop())
+    else:
+        logger.info("Scheduler is DISABLED (SCHEDULER_ENABLED=false).")
+
+    yield
+
+    # Shutdown: cancel scheduler + close DB
+    if _scheduler_task:
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
+    close_db_connection()
 
 app = FastAPI(
     title="BSE Announcements Analyzer API",
