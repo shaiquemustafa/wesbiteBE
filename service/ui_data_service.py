@@ -74,6 +74,42 @@ class UIDataService:
         except Exception as e:
             # Handle other exceptions
             return [{"inserted_id": None, "errors": str(e)}]
+    def bulk_store_enriched(self, enriched_items: List[dict]) -> int:
+        """
+        Stores a list of enriched prediction dicts into ui_data as JSONB.
+        No strict Pydantic validation — accepts any dict.
+        Returns the number of rows inserted.
+        """
+        if not enriched_items:
+            return 0
+
+        rows = []
+        for item in enriched_items:
+            news_time = item.get("news_time")
+            if isinstance(news_time, str):
+                try:
+                    news_time = datetime.fromisoformat(news_time)
+                except (ValueError, TypeError):
+                    news_time = None
+
+            category = item.get("category")
+            rows.append((news_time, category, Json(_normalize_for_json(item))))
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO ui_data (news_time, category, data)
+                    VALUES %s
+                    RETURNING id
+                    """,
+                    rows,
+                )
+                inserted = cur.fetchall()
+
+        return len(inserted)
+
     def get_latest_ui_data(self, target_date: datetime = None, collection_name: str = "ui_data") -> List[Dict[str, Any]]:
         """
         Fetches UI data items. If a date is provided, it fetches

@@ -7,6 +7,7 @@ import logging
 
 from announcements import fetch_and_filter_announcements
 from results import analyze_announcements
+from stock_enrichment import enrich_prediction
 from database import connect_to_db, close_db_connection
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
@@ -196,8 +197,26 @@ async def run_analysis_in_background(
         announcement_service = AnnouncementService()
         inserted = announcement_service.create_predictions(ranked_df, "predictions", force=force)
         summary["inserted_predictions"] = len(inserted)
+
+        # --- Step 4: Enrich predictions with Indian Stock API → store in ui_data ---
+        logger.info("Enriching %s predictions with stock data...", len(ranked_df))
+        enriched_items = []
+        for _, row in ranked_df.iterrows():
+            try:
+                enriched = enrich_prediction(row.to_dict())
+                enriched_items.append(enriched)
+            except Exception as e:
+                logger.warning("Enrichment failed for SCRIP %s: %s", row.get("SCRIP_CD"), e)
+
+        ui_count = 0
+        if enriched_items:
+            ui_service = UIDataService()
+            ui_count = ui_service.bulk_store_enriched(enriched_items)
+            logger.info("Stored %s enriched records in ui_data.", ui_count)
+
+        summary["ui_data_stored"] = ui_count
         summary["message"] = "Analysis completed successfully."
-        logger.info("Pipeline done. Inserted %s predictions.", len(inserted))
+        logger.info("Pipeline done. Predictions=%s, UI data=%s.", len(inserted), ui_count)
 
         return summary
 
