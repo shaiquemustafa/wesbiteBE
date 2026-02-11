@@ -39,8 +39,9 @@ _scheduler_task: asyncio.Task | None = None
 async def _scheduled_analysis_loop():
     """
     Runs the full analysis pipeline at a fixed interval.
-    - Only processes NEW announcements (force=False)
-    - Looks back 1 hour to catch anything missed (overlap is fine — dupes are skipped)
+    - Fetches ALL of today's announcements from BSE
+    - Only NEW ones (not already in DB) get processed (force=False)
+    - No time filter — any new announcement for today gets analyzed
     - Skips if a manual run is already in progress
     """
     interval = SCHEDULER_INTERVAL_MIN * 60
@@ -61,8 +62,8 @@ async def _scheduled_analysis_loop():
                     target_date=None,       # today
                     market_cap_start=2500,
                     market_cap_end=25000,
-                    hours=1,                # look back 1 hour (generous overlap)
-                    force=False,            # only NEW announcements
+                    hours=0,                # full day (no time filter)
+                    force=False,            # only NEW announcements get processed
                 )
             except Exception as e:
                 logger.error("Scheduled analysis failed: %s", e)
