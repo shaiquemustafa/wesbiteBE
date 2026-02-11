@@ -9,7 +9,7 @@ import logging
 from announcements import fetch_and_filter_announcements
 from results import analyze_announcements
 from stock_enrichment import enrich_prediction
-from database import connect_to_db, close_db_connection
+from database import connect_to_db, close_db_connection, get_conn
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
 from entity.ui_data import UIDataItem
@@ -31,6 +31,24 @@ def _now_ist_naive() -> datetime:
 analysis_lock = asyncio.Lock()
 logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
+
+
+def _cleanup_old_records():
+    """Delete records older than 48 hours from all tables to keep the DB lean."""
+    cutoff = _now_ist_naive() - timedelta(hours=48)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM raw_bse_announcements WHERE news_submission_dt < %s", (cutoff,))
+                raw_del = cur.rowcount
+                cur.execute("DELETE FROM predictions WHERE news_submission_dt < %s", (cutoff,))
+                pred_del = cur.rowcount
+                cur.execute("DELETE FROM ui_data WHERE news_time < %s", (cutoff,))
+                ui_del = cur.rowcount
+        if raw_del or pred_del or ui_del:
+            logger.info("Cleanup (>48h): deleted %s raw, %s predictions, %s ui_data.", raw_del, pred_del, ui_del)
+    except Exception as e:
+        logger.warning("Cleanup failed: %s", e)
 
 
 # =========================================================================
@@ -275,6 +293,10 @@ async def run_analysis_in_background(
             logger.info("Stored %s enriched records in ui_data.", ui_count)
 
         summary["ui_data_stored"] = ui_count
+
+        # --- Step 5: Cleanup records older than 48 hours ---
+        _cleanup_old_records()
+
         summary["message"] = "Analysis completed successfully."
         logger.info("Pipeline done. Predictions=%s, UI data=%s.", len(inserted), ui_count)
 

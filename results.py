@@ -299,7 +299,7 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
     Memory-efficient pipeline: processes announcements ONE AT A TIME.
     Downloads PDF → extracts text → frees PDF → calls OpenAI → next.
 
-    Returns ranked top-30 predictions DataFrame.
+    Returns all directional predictions DataFrame (sorted by impact).
     """
     if filtered_df.empty:
         print("No announcements to analyse.")
@@ -337,9 +337,8 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
         print("No directional predictions remain after filtering out NEUTRAL/MATCHED.")
         return pd.DataFrame()
 
-    # Rank & limit to top 30
+    # Rank all predictions (no cap — store everything)
     df.sort_values(["Impact_Score", "Mid_%"], ascending=[False, False], inplace=True)
-    df = df.head(30).copy()
     df.reset_index(drop=True, inplace=True)
     df.insert(0, "Rank", df.index + 1)
     df["SCRIP_CD"] = df["SCRIP_CD"].astype(str)
