@@ -19,7 +19,7 @@ from typing import List
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # Scheduler config (env-overridable)
-SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "10"))
+SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "2"))
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
 
 
