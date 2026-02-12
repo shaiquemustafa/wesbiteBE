@@ -257,6 +257,8 @@ async def run_analysis_in_background(
             "message": "",
         }
 
+        announcement_service = AnnouncementService()
+
         # --- Step 1: Fetch & filter announcements ---
         filtered_df = fetch_and_filter_announcements(
             target_date=the_date,
@@ -272,17 +274,30 @@ async def run_analysis_in_background(
             logger.info(summary["message"])
             return summary
 
+        # Collect NEWSIDs so we can mark them as "analyzed" at the end
+        newsids_processed = []
+        if "NEWSID" in filtered_df.columns:
+            newsids_processed = filtered_df["NEWSID"].dropna().astype(str).tolist()
+
         # --- Step 2: Download + Analyse PDFs one-at-a-time (memory efficient) ---
         ranked_df = analyze_announcements(filtered_df)
         summary["analyzed"] = 0 if ranked_df is None else len(ranked_df)
 
+        # Mark ALL filtered announcements as analyzed (even if they produced
+        # no predictions — they were still evaluated and are immaterial).
+        if newsids_processed:
+            try:
+                announcement_service.mark_as_analyzed(newsids_processed)
+                logger.info("Marked %s announcements as analyzed.", len(newsids_processed))
+            except Exception as e:
+                logger.warning("Failed to mark analyzed: %s", e)
+
         if ranked_df is None or ranked_df.empty:
-            summary["message"] = "Analysis produced no results."
+            summary["message"] = "Analysis produced no directional results."
             logger.info(summary["message"])
             return summary
 
         # --- Step 3: Store predictions ---
-        announcement_service = AnnouncementService()
         inserted = announcement_service.create_predictions(ranked_df, "predictions", force=force)
         summary["inserted_predictions"] = len(inserted)
 

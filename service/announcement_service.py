@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 from typing import List, Union
@@ -7,6 +8,8 @@ from psycopg2.extras import execute_values, Json
 
 from database import get_conn
 from entity.prediction import Prediction
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _normalize_for_json(value):
@@ -82,7 +85,7 @@ class AnnouncementService:
 
         skipped = len(rows) - len(inserted)
         if skipped:
-            print(f"{skipped} announcements already present in the DB and were skipped.")
+            logger.info("%s announcements already present in the DB and were skipped.", skipped)
 
         return inserted
 
@@ -112,6 +115,53 @@ class AnnouncementService:
                 rows = [row[0] for row in cur.fetchall()]
 
         return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # UNANALYZED announcements (for scheduler catch-up)
+    # ------------------------------------------------------------------
+    def get_unanalyzed_announcements(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> pd.DataFrame:
+        """
+        Fetch raw announcements that have NOT been analyzed yet
+        within a datetime window.  Used by the scheduler to pick up
+        announcements that were stored but never processed (e.g. due
+        to service restarts).
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT data
+                    FROM raw_bse_announcements
+                    WHERE analyzed = FALSE
+                      AND news_submission_dt >= %s
+                      AND news_submission_dt <= %s
+                    """,
+                    (start_dt, end_dt),
+                )
+                rows = [row[0] for row in cur.fetchall()]
+
+        return pd.DataFrame(rows)
+
+    def mark_as_analyzed(self, newsids: list[str]):
+        """Mark a batch of announcements as analyzed (processed)."""
+        if not newsids:
+            return
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE raw_bse_announcements
+                    SET analyzed = TRUE
+                    WHERE newsid = ANY(%s)
+                    """,
+                    (newsids,),
+                )
+                updated = cur.rowcount
+        return updated
 
     # ------------------------------------------------------------------
     # PREDICTIONS
@@ -156,14 +206,14 @@ class AnnouncementService:
                 valid_records.append(validated.model_dump(by_alias=True))
             except ValidationError as e:
                 errors.append({"record": row.to_dict(), "error": str(e)})
-                print(f"Prediction validation error for SCRIP_CD={row.get('SCRIP_CD')}: {e}")
+                logger.warning("Prediction validation error for SCRIP_CD=%s: %s", row.get('SCRIP_CD'), e)
 
         if errors:
-            print(f"{len(errors)} predictions failed validation.")
+            logger.warning("%s predictions failed validation.", len(errors))
 
         if not valid_records:
             return []
-
+            
         rows = []
         for record in valid_records:
             rows.append(
@@ -199,7 +249,7 @@ class AnnouncementService:
 
         skipped = len(rows) - len(inserted_ids)
         if skipped:
-            print(f"{skipped} predictions already present in the DB and were skipped.")
+            logger.info("%s predictions already present in the DB and were skipped.", skipped)
 
         return [{"inserted_id": iid} for iid in inserted_ids]
 

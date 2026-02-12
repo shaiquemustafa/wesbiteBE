@@ -2,6 +2,7 @@
 # Processes ONE PDF at a time: download → extract text → discard → OpenAI → next
 import os
 import re
+import logging
 import warnings
 import io
 import gc
@@ -17,6 +18,8 @@ from typing import Optional
 warnings.filterwarnings("ignore", message=r"Cannot set gray non-stroke color")
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 API_KEY = os.environ.get("OPENAI_API_KEY")
 if not API_KEY:
@@ -176,11 +179,11 @@ def _download_pdf(url: str) -> Optional[bytes]:
             chunks.append(chunk)
             size += len(chunk)
             if size > 10_000_000:  # 10 MB cap per PDF
-                print(f"  [skip] PDF too large (>{size} bytes): {url}")
+                logger.info("  [skip] PDF too large (>%s bytes): %s", size, url)
                 return None
         return b"".join(chunks)
     except Exception as e:
-        print(f"  [download fail] {url}: {e}")
+        logger.warning("  [download fail] %s: %s", url, e)
         return None
 
 
@@ -194,7 +197,7 @@ def _extract_text(pdf_bytes: bytes, max_pages=5, max_chars=12_000) -> str:
                     break
                 txt += (p.extract_text() or "") + "\n"
     except Exception as e:
-        print(f"  [extract error] {e}")
+        logger.warning("  [extract error] %s", e)
         return ""
     return txt[:max_chars]
 
@@ -214,11 +217,11 @@ def _call_llm(prompt, user, retries=3, max_tokens=400, temperature=0.3):
             ).choices[0].message.content.strip()
         except (openai.APIConnectionError, ReadTimeout, ConnectError) as e:
             if attempt == retries - 1:
-                print(f"  [llm] Connection error (final): {e}")
+                logger.warning("  [llm] Connection error (final): %s", e)
                 return None
-            print(f"  [llm] Retrying... {e}")
+            logger.info("  [llm] Retrying... %s", e)
         except Exception as e:
-            print(f"  [llm] Error: {e}")
+            logger.warning("  [llm] Error: %s", e)
             return None
     return None
 
@@ -236,7 +239,7 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
     if not pdf_url.startswith("http"):
         return None
 
-    print(f"  [{index}/{total}] SCRIP {scrip_cd}: downloading PDF...")
+    logger.info("  [%s/%s] SCRIP %s: downloading PDF...", index, total, scrip_cd)
 
     # 1) Download PDF
     pdf_bytes = _download_pdf(pdf_url)
@@ -249,25 +252,25 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
     gc.collect()
 
     if not text or len(text) < 100:
-        print(f"  [{index}/{total}] SCRIP {scrip_cd}: text too short ({len(text)} chars), skipping")
+        logger.info("  [%s/%s] SCRIP %s: text too short (%s chars), skipping", index, total, scrip_cd, len(text))
         return None
 
     # 3) LLM screening
     resp = _call_llm(PROMPT_SCREEN, text + "\nReturn one line only.")
     if not resp:
-        print(f"  [{index}/{total}] SCRIP {scrip_cd}: LLM returned nothing")
+        logger.info("  [%s/%s] SCRIP %s: LLM returned nothing", index, total, scrip_cd)
         return None
 
     parts = _split_line(resp)
     if len(parts) != 5:
-        print(f"  [{index}/{total}] SCRIP {scrip_cd}: LLM returned {len(parts)} fields, expected 5")
+        logger.info("  [%s/%s] SCRIP %s: LLM returned %s fields, expected 5", index, total, scrip_cd, len(parts))
         return None
 
     company, imp_tag, summary, price_range, rationale = [p.strip() for p in parts]
     imp_tag = imp_tag.upper()
 
     if imp_tag == "N/A":
-        print(f"  [{index}/{total}] SCRIP {scrip_cd}: N/A (immaterial)")
+        logger.info("  [%s/%s] SCRIP %s: N/A (immaterial)", index, total, scrip_cd)
         return None
 
     # 4) Category (cheap call)
@@ -275,7 +278,7 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
     if not cat_resp or cat_resp not in CATEGORY_LABELS:
         cat_resp = _guess_category(text)
 
-    print(f"  [{index}/{total}] SCRIP {scrip_cd}: {imp_tag} | {company}")
+    logger.info("  [%s/%s] SCRIP %s: %s | %s", index, total, scrip_cd, imp_tag, company)
 
     return {
         "File": scrip_cd,
@@ -302,11 +305,11 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
     Returns all directional predictions DataFrame (sorted by impact).
     """
     if filtered_df.empty:
-        print("No announcements to analyse.")
+        logger.info("No announcements to analyse.")
         return pd.DataFrame()
 
     total = len(filtered_df)
-    print(f"Starting sequential analysis of {total} announcements...")
+    logger.info("Starting sequential analysis of %s announcements...", total)
 
     rows = []
     for i, (_, row) in enumerate(filtered_df.iterrows(), 1):
@@ -315,7 +318,7 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
             rows.append(result)
 
     if not rows:
-        print("No valid predictions produced.")
+        logger.info("No valid predictions produced.")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
@@ -331,10 +334,10 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
     df = df[~df["Impact"].isin(["NEUTRAL", "MATCHED"])].copy()
     dropped = before - len(df)
     if dropped:
-        print(f"Dropped {dropped} NEUTRAL/MATCHED predictions. {len(df)} remain.")
+        logger.info("Dropped %s NEUTRAL/MATCHED predictions. %s remain.", dropped, len(df))
 
     if df.empty:
-        print("No directional predictions remain after filtering out NEUTRAL/MATCHED.")
+        logger.info("No directional predictions remain after filtering out NEUTRAL/MATCHED.")
         return pd.DataFrame()
 
     # Rank all predictions (no cap — store everything)
@@ -343,5 +346,5 @@ def analyze_announcements(filtered_df: pd.DataFrame) -> pd.DataFrame:
     df.insert(0, "Rank", df.index + 1)
     df["SCRIP_CD"] = df["SCRIP_CD"].astype(str)
 
-    print(f"Analysis complete. {len(df)} predictions ranked.")
+    logger.info("Analysis complete. %s predictions ranked.", len(df))
     return df

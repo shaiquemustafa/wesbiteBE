@@ -100,7 +100,8 @@ def _ensure_tables(conn):
             CREATE TABLE IF NOT EXISTS raw_bse_announcements (
                 newsid TEXT PRIMARY KEY,
                 news_submission_dt TIMESTAMPTZ,
-                data JSONB NOT NULL
+                data JSONB NOT NULL,
+                analyzed BOOLEAN NOT NULL DEFAULT FALSE
             );
             """
         )
@@ -125,6 +126,20 @@ def _ensure_tables(conn):
                 category TEXT,
                 data JSONB NOT NULL
             );
+            """
+        )
+        # Add 'analyzed' column if it doesn't exist (safe for existing tables)
+        cur.execute(
+            """
+            ALTER TABLE raw_bse_announcements
+                ADD COLUMN IF NOT EXISTS analyzed BOOLEAN NOT NULL DEFAULT FALSE;
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_bse_analyzed
+                ON raw_bse_announcements (analyzed)
+                WHERE analyzed = FALSE;
             """
         )
         cur.execute(

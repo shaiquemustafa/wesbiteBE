@@ -1,4 +1,5 @@
 # announcements.py – Fetch, store & filter BSE announcements
+import logging
 from datetime import datetime
 from bse import BSE
 import pandas as pd
@@ -7,6 +8,8 @@ import math
 import os
 
 from service.announcement_service import AnnouncementService
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def fetch_and_filter_announcements(
@@ -23,10 +26,12 @@ def fetch_and_filter_announcements(
     Pipeline:
       1. Fetch ALL BSE announcements for target_date (full day from BSE).
       2. Store raw data in PostgreSQL (skip duplicates).
-      3. Merge with market-cap CSV & filter by range.
-      4. Optionally filter by time window (if start/end provided).
-         If both are None → keep the FULL DAY (no time filter).
-      5. Build full PDF URLs.
+      3. Pick announcements to process:
+         - force=True  → ALL matching from DB (for manual reruns)
+         - force=False → newly inserted  +  any previously-stored-but-unanalyzed
+      4. Merge with market-cap CSV & filter by range.
+      5. Optionally filter by time window (if start/end provided).
+      6. Build full PDF URLs.
     Returns a DataFrame ready for PDF download.
     """
     announcement_service = AnnouncementService()
@@ -44,21 +49,22 @@ def fetch_and_filter_announcements(
         from_date = min(sd, from_date)
         to_date = max(ed, to_date)
 
-    print(f"BSE query dates: {from_date} → {to_date}")
+    logger.info("BSE query dates: %s → %s", from_date, to_date)
 
     # ---- Step 1: Fetch all pages from BSE ----
     b = BSE(download_folder="./bse_downloads")
     try:
         first_page = b.announcements(page_no=1, from_date=from_date, to_date=to_date)
     except Exception as e:
-        print(f"BSE API call failed: {e}")
+        logger.error("BSE API call failed: %s", e)
         return pd.DataFrame()
 
     # BSE returns Table1 with row count metadata
     table1 = first_page.get("Table1")
     if not table1 or not isinstance(table1, list) or len(table1) == 0:
-        print(f"BSE returned no Table1 metadata for {from_date}→{to_date}. "
-              f"Response keys: {list(first_page.keys()) if isinstance(first_page, dict) else type(first_page)}")
+        logger.warning("BSE returned no Table1 metadata for %s→%s. "
+                        "Response keys: %s", from_date, to_date,
+                        list(first_page.keys()) if isinstance(first_page, dict) else type(first_page))
         total_rows = 0
     else:
         try:
@@ -70,7 +76,7 @@ def fetch_and_filter_announcements(
     if total_rows > 0:
         rows_per_page = 50
         total_pages = math.ceil(total_rows / rows_per_page)
-        print(f"Fetching {total_rows} announcements across {total_pages} pages...")
+        logger.info("Fetching %s announcements across %s pages...", total_rows, total_pages)
 
         # First page already fetched
         all_rows.extend(first_page.get("Table", []))
@@ -87,23 +93,22 @@ def fetch_and_filter_announcements(
                         page_data = future.result()
                         all_rows.extend(page_data.get("Table", []))
                     except Exception as exc:
-                        print(f"  Page {page_no} error: {exc}")
+                        logger.warning("  Page %s error: %s", page_no, exc)
 
-        print(f"Fetched {len(all_rows)} raw announcements from BSE.")
+        logger.info("Fetched %s raw announcements from BSE.", len(all_rows))
     else:
-        print(f"BSE reports 0 announcements for {from_date}→{to_date}.")
+        logger.info("BSE reports 0 announcements for %s→%s.", from_date, to_date)
 
     # ---- Step 2: Store raw announcements (if any) ----
     inserted = []
     if all_rows:
         df_raw = pd.DataFrame(all_rows)
         inserted = announcement_service.create_announcements(df_raw, "raw_bse_announcements")
-        print(f"Stored {len(inserted)} NEW raw announcements in DB.")
+        logger.info("Stored %s NEW raw announcements in DB.", len(inserted))
 
     # ---- Step 3: Decide which announcements to process ----
-    # When force=True, ALWAYS pull ALL matching announcements from DB
-    # (not just newly inserted ones) so existing records get analysed too.
     if force_reprocess:
+        # FORCE mode: Pull ALL matching from DB
         if start_datetime and end_datetime:
             df_to_process = announcement_service.get_raw_announcements_by_window(
                 start_dt=start_datetime, end_dt=end_datetime
@@ -111,26 +116,39 @@ def fetch_and_filter_announcements(
         else:
             day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
             day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-            print(f"Full-day reprocess: {day_start} → {day_end}")
+            logger.info("Full-day reprocess: %s → %s", day_start, day_end)
             df_to_process = announcement_service.get_raw_announcements_by_window(
                 start_dt=day_start, end_dt=day_end
             )
         if df_to_process.empty:
-            print("No announcements found in DB for reprocessing.")
+            logger.info("No announcements found in DB for reprocessing.")
             return pd.DataFrame()
-        print(f"Processing {len(df_to_process)} announcements from DB (force=True).")
+        logger.info("Processing %s announcements from DB (force=True).", len(df_to_process))
+
     elif inserted:
+        # We have brand-new announcements just stored
         df_to_process = pd.DataFrame(inserted)
-        print(f"Processing {len(df_to_process)} newly inserted announcements.")
+        logger.info("Processing %s newly inserted announcements.", len(df_to_process))
+
     else:
-        print("No new announcements and force=False. Nothing to process.")
-        return pd.DataFrame()
+        # No new insertions — but there may be announcements stored in PREVIOUS
+        # scheduler runs that were never analyzed (e.g. service restarted mid-run).
+        # Query for unanalyzed announcements for today.
+        day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        df_to_process = announcement_service.get_unanalyzed_announcements(
+            start_dt=day_start, end_dt=day_end
+        )
+        if df_to_process.empty:
+            logger.info("All announcements already analyzed. Nothing to do.")
+            return pd.DataFrame()
+        logger.info("Found %s UNANALYZED announcements in DB — processing now.", len(df_to_process))
 
     # ---- Step 4: Merge with market cap CSV ----
     try:
         df_mcap = pd.read_csv(mcap_csv_path)
     except FileNotFoundError:
-        print(f"WARNING: Market cap file not found at {mcap_csv_path}.")
+        logger.warning("Market cap file not found at %s.", mcap_csv_path)
         return df_to_process
 
     df_to_process["SCRIP_CD"] = pd.to_numeric(df_to_process["SCRIP_CD"], errors="coerce")
@@ -148,7 +166,8 @@ def fetch_and_filter_announcements(
     df_filtered = df_merged[
         (df_merged["Market Cap"] >= market_cap_start) & (df_merged["Market Cap"] <= market_cap_end)
     ].copy()
-    print(f"After market cap filter ({market_cap_start}–{market_cap_end} Cr): {len(df_filtered)} announcements.")
+    logger.info("After market cap filter (%s–%s Cr): %s announcements.",
+                market_cap_start, market_cap_end, len(df_filtered))
 
     if df_filtered.empty:
         return pd.DataFrame()
@@ -161,11 +180,12 @@ def fetch_and_filter_announcements(
         df_final = df_filtered[
             (df_filtered["DT_TM"] >= start_datetime) & (df_filtered["DT_TM"] <= end_datetime)
         ].copy()
-        print(f"After time filter ({start_datetime} → {end_datetime}): {len(df_final)} announcements.")
+        logger.info("After time filter (%s → %s): %s announcements.",
+                     start_datetime, end_datetime, len(df_final))
     else:
         # Full-day mode — keep ALL announcements for the date (no time filter)
         df_final = df_filtered.copy()
-        print(f"Full-day mode: keeping all {len(df_final)} announcements (no time filter).")
+        logger.info("Full-day mode: keeping all %s announcements (no time filter).", len(df_final))
 
     if df_final.empty:
         return pd.DataFrame()
@@ -179,7 +199,7 @@ def fetch_and_filter_announcements(
     if "News_submission_dt" in df_final.columns:
         df_final["News_submission_dt"] = pd.to_datetime(df_final["News_submission_dt"], errors="coerce")
 
-    print(f"Returning {len(df_final)} filtered announcements for PDF download.")
+    logger.info("Returning %s filtered announcements for PDF download.", len(df_final))
     return df_final
 
 
