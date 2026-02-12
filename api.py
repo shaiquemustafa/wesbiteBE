@@ -55,6 +55,8 @@ def _cleanup_old_records():
 # =========================================================================
 # Background scheduler — runs the pipeline every N minutes
 # =========================================================================
+_run_counter = 0
+
 async def _scheduled_analysis_loop():
     """
     Runs the full analysis pipeline at a fixed interval.
@@ -63,29 +65,44 @@ async def _scheduled_analysis_loop():
     - No time filter — any new announcement for today gets analyzed
     - Skips if a manual run is already in progress
     """
+    global _run_counter
     interval = SCHEDULER_INTERVAL_MIN * 60
-    logger.info("Scheduler started: running every %s minutes.", SCHEDULER_INTERVAL_MIN)
+    logger.info("Scheduler started: will run every %s minutes.", SCHEDULER_INTERVAL_MIN)
 
     # Wait one interval before the first run (let the app warm up)
     await asyncio.sleep(interval)
 
     while True:
+        _run_counter += 1
         now_ist = _now_ist_naive()
-        logger.info("=== Scheduled run @ %s IST ===", now_ist.strftime("%H:%M:%S"))
+        logger.info("=" * 60)
+        logger.info("🔄 SCHEDULED RUN #%s STARTED  —  %s IST",
+                     _run_counter, now_ist.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info("=" * 60)
 
         if analysis_lock.locked():
-            logger.info("Scheduler: skipping — analysis already in progress.")
+            logger.info("⏭️  SKIPPED — previous run still in progress.")
         else:
             try:
-                await run_analysis_in_background(
+                result = await run_analysis_in_background(
                     target_date=None,       # today
                     market_cap_start=2500,
                     market_cap_end=25000,
                     hours=0,                # full day (no time filter)
                     force=False,            # only NEW announcements get processed
                 )
+                # ---- Clean summary box ----
+                logger.info("-" * 60)
+                logger.info("✅ RUN #%s COMPLETED — Summary:", _run_counter)
+                logger.info("   BSE announcements today:  %s", result.get("bse_total", "N/A"))
+                logger.info("   New announcements stored:  %s", result.get("new_stored", 0))
+                logger.info("   Sent for analysis:         %s", result.get("filtered", 0))
+                logger.info("   Predictions created:       %s", result.get("inserted_predictions", 0))
+                logger.info("   UI data records stored:    %s", result.get("ui_data_stored", 0))
+                logger.info("   Status: %s", result.get("message", ""))
+                logger.info("-" * 60)
             except Exception as e:
-                logger.error("Scheduled analysis failed: %s", e)
+                logger.error("❌ RUN #%s FAILED: %s", _run_counter, e)
 
         await asyncio.sleep(interval)
 
@@ -262,16 +279,16 @@ def _pipeline_sync(
         start_dt = None
         end_dt = None
 
-    logger.info("=== Pipeline start | mode=%s | date=%s | force=%s ===",
+    logger.info("  Pipeline: mode=%s | date=%s | force=%s",
                  mode, the_date.strftime("%Y-%m-%d"), force)
     if start_dt and end_dt:
-        logger.info("Time window: %s → %s (IST)", start_dt, end_dt)
-    else:
-        logger.info("Processing FULL DAY for %s", the_date.strftime("%Y-%m-%d"))
+        logger.info("  Time window: %s → %s IST", start_dt, end_dt)
 
     summary = {
         "mode": mode,
         "date": the_date.strftime("%Y-%m-%d"),
+        "bse_total": 0,
+        "new_stored": 0,
         "filtered": 0,
         "analyzed": 0,
         "inserted_predictions": 0,
@@ -283,7 +300,7 @@ def _pipeline_sync(
     ui_service = UIDataService()
 
     # --- Step 1: Fetch & filter announcements ---
-    filtered_df = fetch_and_filter_announcements(
+    filtered_df, fetch_stats = fetch_and_filter_announcements(
         target_date=the_date,
         market_cap_start=market_cap_start,
         market_cap_end=market_cap_end,
@@ -291,25 +308,29 @@ def _pipeline_sync(
         end_datetime=end_dt,
         force_reprocess=force,
     )
+    summary["bse_total"] = fetch_stats.get("bse_total", 0)
+    summary["new_stored"] = fetch_stats.get("new_stored", 0)
     summary["filtered"] = len(filtered_df)
     if filtered_df.empty:
-        summary["message"] = "No announcements found after filtering."
-        logger.info(summary["message"])
+        summary["message"] = "No new announcements to process."
         return summary
 
-    # --- Step 2: Process in BATCHES of 25 ---
+    # --- Step 2: Analyse PDFs in batches of 25 ---
     BATCH_SIZE = 25
     total = len(filtered_df)
+    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
     total_predictions = 0
     total_ui = 0
+
+    logger.info("  [Step 7] Analysing %s PDFs in %s batch(es) of %s ...",
+                total, total_batches, BATCH_SIZE)
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, total)
         batch_df = filtered_df.iloc[batch_start:batch_end].copy()
         batch_num = (batch_start // BATCH_SIZE) + 1
-        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
-        logger.info("=== Batch %s/%s (%s announcements) ===",
+        logger.info("    --- Batch %s/%s  (%s PDFs) ---",
                     batch_num, total_batches, len(batch_df))
 
         # Collect NEWSIDs for this batch
@@ -324,12 +345,11 @@ def _pipeline_sync(
         if batch_newsids:
             try:
                 announcement_service.mark_as_analyzed(batch_newsids)
-                logger.info("Marked %s announcements as analyzed.", len(batch_newsids))
             except Exception as e:
-                logger.warning("Failed to mark analyzed: %s", e)
+                logger.warning("    Failed to mark analyzed: %s", e)
 
         if ranked_df is None or ranked_df.empty:
-            logger.info("Batch %s: no directional predictions.", batch_num)
+            logger.info("    Batch %s result: 0 directional predictions.", batch_num)
             continue
 
         # 2c) Store predictions for this batch
@@ -337,7 +357,6 @@ def _pipeline_sync(
             ranked_df, "predictions", force=force
         )
         total_predictions += len(inserted)
-        logger.info("Batch %s: stored %s predictions.", batch_num, len(inserted))
 
         # 2d) Enrich & store in ui_data
         enriched_items = []
@@ -346,13 +365,16 @@ def _pipeline_sync(
                 enriched = enrich_prediction(row.to_dict())
                 enriched_items.append(enriched)
             except Exception as e:
-                logger.warning("Enrichment failed for SCRIP %s: %s",
+                logger.warning("    Enrichment failed for SCRIP %s: %s",
                                row.get("SCRIP_CD"), e)
 
+        ui_count_batch = 0
         if enriched_items:
-            ui_count = ui_service.bulk_store_enriched(enriched_items)
-            total_ui += ui_count
-            logger.info("Batch %s: stored %s ui_data records.", batch_num, ui_count)
+            ui_count_batch = ui_service.bulk_store_enriched(enriched_items)
+            total_ui += ui_count_batch
+
+        logger.info("    Batch %s result: %s predictions → DB, %s ui_data → DB.",
+                    batch_num, len(inserted), ui_count_batch)
 
     # --- Step 3: Summary ---
     summary["analyzed"] = total
@@ -362,9 +384,7 @@ def _pipeline_sync(
     # --- Step 4: Cleanup records older than 48 hours ---
     _cleanup_old_records()
 
-    summary["message"] = "Analysis completed successfully."
-    logger.info("Pipeline done. Total predictions=%s, UI data=%s.",
-                total_predictions, total_ui)
+    summary["message"] = "Done."
 
     return summary
 
