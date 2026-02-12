@@ -205,149 +205,168 @@ async def run_analysis_in_background(
     start_time_obj=None,   # datetime.time or None
     end_time_obj=None,     # datetime.time or None
 ):
-    """The main analysis workflow."""
+    """
+    Async wrapper: acquires the lock, then runs the HEAVY synchronous
+    pipeline in a separate thread so the event loop stays responsive
+    (health checks, scheduler, other requests keep working).
+    """
     async with analysis_lock:
-        now_ist = _now_ist_naive()
-
-        # ----- Determine mode -----
-        if target_date and start_time_obj and end_time_obj:
-            # MODE A: Precise time range on a given date  (e.g. 15:00–17:00)
-            mode = f"time-range ({start_time_obj.strftime('%H:%M')}–{end_time_obj.strftime('%H:%M')})"
-            the_date = target_date
-            start_dt = datetime.combine(target_date.date(), start_time_obj)
-            end_dt = datetime.combine(target_date.date(), end_time_obj)
-        elif target_date and hours > 0:
-            # MODE B: Specific date + lookback hours from end-of-day
-            mode = f"date+window ({hours}h)"
-            the_date = target_date
-            end_dt = target_date.replace(hour=23, minute=59, second=59)
-            start_dt = end_dt - timedelta(hours=hours)
-        elif target_date:
-            # MODE C: Full-day for a specific date
-            mode = "full-day"
-            the_date = target_date
-            start_dt = None
-            end_dt = None
-        elif hours > 0:
-            # MODE D: Incremental — last N hours from now
-            mode = f"incremental ({hours}h)"
-            the_date = now_ist
-            end_dt = now_ist
-            start_dt = end_dt - timedelta(hours=hours)
-        else:
-            # MODE E: hours=0 and no date → full today
-            mode = "full-day (today)"
-            the_date = now_ist
-            start_dt = None
-            end_dt = None
-
-        logger.info("=== Pipeline start | mode=%s | date=%s | force=%s ===",
-                     mode, the_date.strftime("%Y-%m-%d"), force)
-        if start_dt and end_dt:
-            logger.info("Time window: %s → %s (IST)", start_dt, end_dt)
-        else:
-            logger.info("Processing FULL DAY for %s", the_date.strftime("%Y-%m-%d"))
-
-        summary = {
-            "mode": mode,
-            "date": the_date.strftime("%Y-%m-%d"),
-            "filtered": 0,
-            "analyzed": 0,
-            "inserted_predictions": 0,
-            "message": "",
-        }
-
-        announcement_service = AnnouncementService()
-        ui_service = UIDataService()
-
-        # --- Step 1: Fetch & filter announcements ---
-        filtered_df = fetch_and_filter_announcements(
-            target_date=the_date,
-            market_cap_start=market_cap_start,
-            market_cap_end=market_cap_end,
-            start_datetime=start_dt,
-            end_datetime=end_dt,
-            force_reprocess=force,
+        result = await asyncio.to_thread(
+            _pipeline_sync,
+            target_date, market_cap_start, market_cap_end,
+            hours, force, start_time_obj, end_time_obj,
         )
-        summary["filtered"] = len(filtered_df)
-        if filtered_df.empty:
-            summary["message"] = "No announcements found after filtering."
-            logger.info(summary["message"])
-            return summary
+        return result
 
-        # --- Step 2: Process in BATCHES of 25 ---
-        # Each batch: analyse PDFs → store predictions → enrich → mark analyzed
-        # This way progress is saved incrementally. If the service restarts
-        # mid-way, completed batches are not lost.
-        BATCH_SIZE = 25
-        total = len(filtered_df)
-        total_predictions = 0
-        total_ui = 0
 
-        for batch_start in range(0, total, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total)
-            batch_df = filtered_df.iloc[batch_start:batch_end].copy()
-            batch_num = (batch_start // BATCH_SIZE) + 1
-            total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+def _pipeline_sync(
+    target_date: datetime | None,
+    market_cap_start: int,
+    market_cap_end: int,
+    hours: int,
+    force: bool,
+    start_time_obj=None,
+    end_time_obj=None,
+):
+    """
+    The SYNCHRONOUS pipeline that does all heavy I/O (BSE fetch, PDF
+    download, OpenAI calls, DB writes).  Runs in a thread via
+    asyncio.to_thread() so it never blocks the event loop.
+    """
+    now_ist = _now_ist_naive()
 
-            logger.info("=== Batch %s/%s (%s announcements) ===",
-                        batch_num, total_batches, len(batch_df))
+    # ----- Determine mode -----
+    if target_date and start_time_obj and end_time_obj:
+        mode = f"time-range ({start_time_obj.strftime('%H:%M')}–{end_time_obj.strftime('%H:%M')})"
+        the_date = target_date
+        start_dt = datetime.combine(target_date.date(), start_time_obj)
+        end_dt = datetime.combine(target_date.date(), end_time_obj)
+    elif target_date and hours > 0:
+        mode = f"date+window ({hours}h)"
+        the_date = target_date
+        end_dt = target_date.replace(hour=23, minute=59, second=59)
+        start_dt = end_dt - timedelta(hours=hours)
+    elif target_date:
+        mode = "full-day"
+        the_date = target_date
+        start_dt = None
+        end_dt = None
+    elif hours > 0:
+        mode = f"incremental ({hours}h)"
+        the_date = now_ist
+        end_dt = now_ist
+        start_dt = end_dt - timedelta(hours=hours)
+    else:
+        mode = "full-day (today)"
+        the_date = now_ist
+        start_dt = None
+        end_dt = None
 
-            # Collect NEWSIDs for this batch
-            batch_newsids = []
-            if "NEWSID" in batch_df.columns:
-                batch_newsids = batch_df["NEWSID"].dropna().astype(str).tolist()
+    logger.info("=== Pipeline start | mode=%s | date=%s | force=%s ===",
+                 mode, the_date.strftime("%Y-%m-%d"), force)
+    if start_dt and end_dt:
+        logger.info("Time window: %s → %s (IST)", start_dt, end_dt)
+    else:
+        logger.info("Processing FULL DAY for %s", the_date.strftime("%Y-%m-%d"))
 
-            # 2a) Analyse PDFs in this batch
-            ranked_df = analyze_announcements(batch_df)
+    summary = {
+        "mode": mode,
+        "date": the_date.strftime("%Y-%m-%d"),
+        "filtered": 0,
+        "analyzed": 0,
+        "inserted_predictions": 0,
+        "ui_data_stored": 0,
+        "message": "",
+    }
 
-            # 2b) Mark this batch as analyzed (even if no predictions)
-            if batch_newsids:
-                try:
-                    announcement_service.mark_as_analyzed(batch_newsids)
-                    logger.info("Marked %s announcements as analyzed.", len(batch_newsids))
-                except Exception as e:
-                    logger.warning("Failed to mark analyzed: %s", e)
+    announcement_service = AnnouncementService()
+    ui_service = UIDataService()
 
-            if ranked_df is None or ranked_df.empty:
-                logger.info("Batch %s: no directional predictions.", batch_num)
-                continue
-
-            # 2c) Store predictions for this batch
-            inserted = announcement_service.create_predictions(
-                ranked_df, "predictions", force=force
-            )
-            total_predictions += len(inserted)
-            logger.info("Batch %s: stored %s predictions.", batch_num, len(inserted))
-
-            # 2d) Enrich & store in ui_data
-            enriched_items = []
-            for _, row in ranked_df.iterrows():
-                try:
-                    enriched = enrich_prediction(row.to_dict())
-                    enriched_items.append(enriched)
-                except Exception as e:
-                    logger.warning("Enrichment failed for SCRIP %s: %s",
-                                   row.get("SCRIP_CD"), e)
-
-            if enriched_items:
-                ui_count = ui_service.bulk_store_enriched(enriched_items)
-                total_ui += ui_count
-                logger.info("Batch %s: stored %s ui_data records.", batch_num, ui_count)
-
-        # --- Step 3: Summary ---
-        summary["analyzed"] = total
-        summary["inserted_predictions"] = total_predictions
-        summary["ui_data_stored"] = total_ui
-
-        # --- Step 4: Cleanup records older than 48 hours ---
-        _cleanup_old_records()
-
-        summary["message"] = "Analysis completed successfully."
-        logger.info("Pipeline done. Total predictions=%s, UI data=%s.",
-                    total_predictions, total_ui)
-
+    # --- Step 1: Fetch & filter announcements ---
+    filtered_df = fetch_and_filter_announcements(
+        target_date=the_date,
+        market_cap_start=market_cap_start,
+        market_cap_end=market_cap_end,
+        start_datetime=start_dt,
+        end_datetime=end_dt,
+        force_reprocess=force,
+    )
+    summary["filtered"] = len(filtered_df)
+    if filtered_df.empty:
+        summary["message"] = "No announcements found after filtering."
+        logger.info(summary["message"])
         return summary
+
+    # --- Step 2: Process in BATCHES of 25 ---
+    BATCH_SIZE = 25
+    total = len(filtered_df)
+    total_predictions = 0
+    total_ui = 0
+
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, total)
+        batch_df = filtered_df.iloc[batch_start:batch_end].copy()
+        batch_num = (batch_start // BATCH_SIZE) + 1
+        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+        logger.info("=== Batch %s/%s (%s announcements) ===",
+                    batch_num, total_batches, len(batch_df))
+
+        # Collect NEWSIDs for this batch
+        batch_newsids = []
+        if "NEWSID" in batch_df.columns:
+            batch_newsids = batch_df["NEWSID"].dropna().astype(str).tolist()
+
+        # 2a) Analyse PDFs in this batch
+        ranked_df = analyze_announcements(batch_df)
+
+        # 2b) Mark this batch as analyzed (even if no predictions)
+        if batch_newsids:
+            try:
+                announcement_service.mark_as_analyzed(batch_newsids)
+                logger.info("Marked %s announcements as analyzed.", len(batch_newsids))
+            except Exception as e:
+                logger.warning("Failed to mark analyzed: %s", e)
+
+        if ranked_df is None or ranked_df.empty:
+            logger.info("Batch %s: no directional predictions.", batch_num)
+            continue
+
+        # 2c) Store predictions for this batch
+        inserted = announcement_service.create_predictions(
+            ranked_df, "predictions", force=force
+        )
+        total_predictions += len(inserted)
+        logger.info("Batch %s: stored %s predictions.", batch_num, len(inserted))
+
+        # 2d) Enrich & store in ui_data
+        enriched_items = []
+        for _, row in ranked_df.iterrows():
+            try:
+                enriched = enrich_prediction(row.to_dict())
+                enriched_items.append(enriched)
+            except Exception as e:
+                logger.warning("Enrichment failed for SCRIP %s: %s",
+                               row.get("SCRIP_CD"), e)
+
+        if enriched_items:
+            ui_count = ui_service.bulk_store_enriched(enriched_items)
+            total_ui += ui_count
+            logger.info("Batch %s: stored %s ui_data records.", batch_num, ui_count)
+
+    # --- Step 3: Summary ---
+    summary["analyzed"] = total
+    summary["inserted_predictions"] = total_predictions
+    summary["ui_data_stored"] = total_ui
+
+    # --- Step 4: Cleanup records older than 48 hours ---
+    _cleanup_old_records()
+
+    summary["message"] = "Analysis completed successfully."
+    logger.info("Pipeline done. Total predictions=%s, UI data=%s.",
+                total_predictions, total_ui)
+
+    return summary
 
 
 # =========================================================================
