@@ -258,6 +258,7 @@ async def run_analysis_in_background(
         }
 
         announcement_service = AnnouncementService()
+        ui_service = UIDataService()
 
         # --- Step 1: Fetch & filter announcements ---
         filtered_df = fetch_and_filter_announcements(
@@ -274,56 +275,77 @@ async def run_analysis_in_background(
             logger.info(summary["message"])
             return summary
 
-        # Collect NEWSIDs so we can mark them as "analyzed" at the end
-        newsids_processed = []
-        if "NEWSID" in filtered_df.columns:
-            newsids_processed = filtered_df["NEWSID"].dropna().astype(str).tolist()
+        # --- Step 2: Process in BATCHES of 25 ---
+        # Each batch: analyse PDFs → store predictions → enrich → mark analyzed
+        # This way progress is saved incrementally. If the service restarts
+        # mid-way, completed batches are not lost.
+        BATCH_SIZE = 25
+        total = len(filtered_df)
+        total_predictions = 0
+        total_ui = 0
 
-        # --- Step 2: Download + Analyse PDFs one-at-a-time (memory efficient) ---
-        ranked_df = analyze_announcements(filtered_df)
-        summary["analyzed"] = 0 if ranked_df is None else len(ranked_df)
+        for batch_start in range(0, total, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            batch_df = filtered_df.iloc[batch_start:batch_end].copy()
+            batch_num = (batch_start // BATCH_SIZE) + 1
+            total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
-        # Mark ALL filtered announcements as analyzed (even if they produced
-        # no predictions — they were still evaluated and are immaterial).
-        if newsids_processed:
-            try:
-                announcement_service.mark_as_analyzed(newsids_processed)
-                logger.info("Marked %s announcements as analyzed.", len(newsids_processed))
-            except Exception as e:
-                logger.warning("Failed to mark analyzed: %s", e)
+            logger.info("=== Batch %s/%s (%s announcements) ===",
+                        batch_num, total_batches, len(batch_df))
 
-        if ranked_df is None or ranked_df.empty:
-            summary["message"] = "Analysis produced no directional results."
-            logger.info(summary["message"])
-            return summary
+            # Collect NEWSIDs for this batch
+            batch_newsids = []
+            if "NEWSID" in batch_df.columns:
+                batch_newsids = batch_df["NEWSID"].dropna().astype(str).tolist()
 
-        # --- Step 3: Store predictions ---
-        inserted = announcement_service.create_predictions(ranked_df, "predictions", force=force)
-        summary["inserted_predictions"] = len(inserted)
+            # 2a) Analyse PDFs in this batch
+            ranked_df = analyze_announcements(batch_df)
 
-        # --- Step 4: Enrich predictions with Indian Stock API → store in ui_data ---
-        logger.info("Enriching %s predictions with stock data...", len(ranked_df))
-        enriched_items = []
-        for _, row in ranked_df.iterrows():
-            try:
-                enriched = enrich_prediction(row.to_dict())
-                enriched_items.append(enriched)
-            except Exception as e:
-                logger.warning("Enrichment failed for SCRIP %s: %s", row.get("SCRIP_CD"), e)
+            # 2b) Mark this batch as analyzed (even if no predictions)
+            if batch_newsids:
+                try:
+                    announcement_service.mark_as_analyzed(batch_newsids)
+                    logger.info("Marked %s announcements as analyzed.", len(batch_newsids))
+                except Exception as e:
+                    logger.warning("Failed to mark analyzed: %s", e)
 
-        ui_count = 0
-        if enriched_items:
-            ui_service = UIDataService()
-            ui_count = ui_service.bulk_store_enriched(enriched_items)
-            logger.info("Stored %s enriched records in ui_data.", ui_count)
+            if ranked_df is None or ranked_df.empty:
+                logger.info("Batch %s: no directional predictions.", batch_num)
+                continue
 
-        summary["ui_data_stored"] = ui_count
+            # 2c) Store predictions for this batch
+            inserted = announcement_service.create_predictions(
+                ranked_df, "predictions", force=force
+            )
+            total_predictions += len(inserted)
+            logger.info("Batch %s: stored %s predictions.", batch_num, len(inserted))
 
-        # --- Step 5: Cleanup records older than 48 hours ---
+            # 2d) Enrich & store in ui_data
+            enriched_items = []
+            for _, row in ranked_df.iterrows():
+                try:
+                    enriched = enrich_prediction(row.to_dict())
+                    enriched_items.append(enriched)
+                except Exception as e:
+                    logger.warning("Enrichment failed for SCRIP %s: %s",
+                                   row.get("SCRIP_CD"), e)
+
+            if enriched_items:
+                ui_count = ui_service.bulk_store_enriched(enriched_items)
+                total_ui += ui_count
+                logger.info("Batch %s: stored %s ui_data records.", batch_num, ui_count)
+
+        # --- Step 3: Summary ---
+        summary["analyzed"] = total
+        summary["inserted_predictions"] = total_predictions
+        summary["ui_data_stored"] = total_ui
+
+        # --- Step 4: Cleanup records older than 48 hours ---
         _cleanup_old_records()
 
         summary["message"] = "Analysis completed successfully."
-        logger.info("Pipeline done. Predictions=%s, UI data=%s.", len(inserted), ui_count)
+        logger.info("Pipeline done. Total predictions=%s, UI data=%s.",
+                    total_predictions, total_ui)
 
         return summary
 
