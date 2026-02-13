@@ -123,25 +123,31 @@ class AnnouncementService:
         self,
         start_dt: datetime,
         end_dt: datetime,
+        limit: int = 0,
     ) -> pd.DataFrame:
         """
         Fetch raw announcements that have NOT been analyzed yet
         within a datetime window.  Used by the scheduler to pick up
         announcements that were stored but never processed (e.g. due
         to service restarts).
+        limit=0 means no limit (fetch all).
         """
+        query = """
+            SELECT data
+            FROM raw_bse_announcements
+            WHERE analyzed = FALSE
+              AND news_submission_dt >= %s
+              AND news_submission_dt <= %s
+            ORDER BY news_submission_dt DESC
+        """
+        params: list = [start_dt, end_dt]
+        if limit > 0:
+            query += " LIMIT %s"
+            params.append(limit)
+
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT data
-                    FROM raw_bse_announcements
-                    WHERE analyzed = FALSE
-                      AND news_submission_dt >= %s
-                      AND news_submission_dt <= %s
-                    """,
-                    (start_dt, end_dt),
-                )
+                cur.execute(query, params)
                 rows = [row[0] for row in cur.fetchall()]
 
         return pd.DataFrame(rows)

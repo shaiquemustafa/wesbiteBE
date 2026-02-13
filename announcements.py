@@ -125,15 +125,20 @@ def fetch_and_filter_announcements(
         logger.info("  Processing %s brand-new announcements.", len(df_to_process))
 
     else:
+        # No new announcements — check for a SMALL number of unanalyzed
+        # ones as gradual catch-up (e.g. from a previous crash).
+        # We cap at 5 per run to stay within 512 MB RAM.
+        MAX_CATCHUP = 5
         day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
         df_to_process = announcement_service.get_unanalyzed_announcements(
-            start_dt=day_start, end_dt=day_end
+            start_dt=day_start, end_dt=day_end, limit=MAX_CATCHUP
         )
         if df_to_process.empty:
             logger.info("  No new or unanalyzed announcements. Nothing to do.")
             return pd.DataFrame(), stats
-        logger.info("  Found %s previously-unanalyzed announcements — processing now.", len(df_to_process))
+        logger.info("  Catch-up: processing %s unanalyzed announcements (max %s per run).",
+                    len(df_to_process), MAX_CATCHUP)
 
     # ---- Step 4: Merge with market cap CSV ----
     try:

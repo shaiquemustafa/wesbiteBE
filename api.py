@@ -8,7 +8,7 @@ import asyncio
 import logging
 
 from announcements import fetch_and_filter_announcements
-from results import analyze_announcements
+from results import _process_single_announcement, _impact_map
 from stock_enrichment import enrich_prediction
 from database import connect_to_db, close_db_connection, get_conn
 from service.announcement_service import AnnouncementService
@@ -315,66 +315,67 @@ def _pipeline_sync(
         summary["message"] = "No new announcements to process."
         return summary
 
-    # --- Step 2: Analyse PDFs in batches of 25 ---
-    BATCH_SIZE = 25
+    # --- Step 2: Process each PDF ONE BY ONE ---
+    # After each PDF: mark as analyzed + save prediction + save ui_data
+    # This way if the service crashes, completed PDFs are NOT retried.
     total = len(filtered_df)
-    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
     total_predictions = 0
     total_ui = 0
 
-    logger.info("  [Step 7] Analysing %s PDFs in %s batch(es) of %s ...",
-                total, total_batches, BATCH_SIZE)
+    logger.info("  [Analyse] Processing %s PDFs one-by-one ...", total)
 
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, total)
-        batch_df = filtered_df.iloc[batch_start:batch_end].copy()
-        batch_num = (batch_start // BATCH_SIZE) + 1
+    for i, (_, row) in enumerate(filtered_df.iterrows(), 1):
+        row_dict = row.to_dict()
+        newsid = str(row_dict.get("NEWSID", ""))
 
-        logger.info("    --- Batch %s/%s  (%s PDFs) ---",
-                    batch_num, total_batches, len(batch_df))
+        # 2a) Process this single PDF (download → extract → OpenAI)
+        result = _process_single_announcement(row_dict, i, total)
 
-        # Collect NEWSIDs for this batch
-        batch_newsids = []
-        if "NEWSID" in batch_df.columns:
-            batch_newsids = batch_df["NEWSID"].dropna().astype(str).tolist()
-
-        # 2a) Analyse PDFs in this batch
-        ranked_df = analyze_announcements(batch_df)
-
-        # 2b) Mark this batch as analyzed (even if no predictions)
-        if batch_newsids:
+        # 2b) IMMEDIATELY mark as analyzed (even if N/A or no prediction)
+        if newsid:
             try:
-                announcement_service.mark_as_analyzed(batch_newsids)
+                announcement_service.mark_as_analyzed([newsid])
             except Exception as e:
-                logger.warning("    Failed to mark analyzed: %s", e)
+                logger.warning("  Failed to mark %s as analyzed: %s", newsid, e)
 
-        if ranked_df is None or ranked_df.empty:
-            logger.info("    Batch %s result: 0 directional predictions.", batch_num)
+        # If no directional prediction, move on
+        if not result:
             continue
 
-        # 2c) Store predictions for this batch
-        inserted = announcement_service.create_predictions(
-            ranked_df, "predictions", force=force
+        # 2c) Store this single prediction in DB
+        pred_df = pd.DataFrame([result])
+        # Add derived metrics
+        pred_df["Impact_Score"] = pred_df["Impact"].apply(
+            lambda t: _impact_map.get(t.upper(), 0)
         )
-        total_predictions += len(inserted)
+        # Drop NEUTRAL/MATCHED
+        if pred_df.iloc[0]["Impact"] in ("NEUTRAL", "MATCHED"):
+            logger.info("  [%s/%s] %s: filtered out (NEUTRAL/MATCHED).", i, total, newsid)
+            continue
+
+        pred_df["Mid_%"] = 0.0  # placeholder
+        pred_df["Rank"] = 0
+        pred_df["SCRIP_CD"] = pred_df["SCRIP_CD"].astype(str)
+
+        try:
+            inserted = announcement_service.create_predictions(
+                pred_df, "predictions", force=force
+            )
+            if inserted:
+                total_predictions += len(inserted)
+                logger.info("  [%s/%s] ✅ Prediction saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
+        except Exception as e:
+            logger.warning("  [%s/%s] Failed to save prediction: %s", i, total, e)
 
         # 2d) Enrich & store in ui_data
-        enriched_items = []
-        for _, row in ranked_df.iterrows():
-            try:
-                enriched = enrich_prediction(row.to_dict())
-                enriched_items.append(enriched)
-            except Exception as e:
-                logger.warning("    Enrichment failed for SCRIP %s: %s",
-                               row.get("SCRIP_CD"), e)
-
-        ui_count_batch = 0
-        if enriched_items:
-            ui_count_batch = ui_service.bulk_store_enriched(enriched_items)
-            total_ui += ui_count_batch
-
-        logger.info("    Batch %s result: %s predictions → DB, %s ui_data → DB.",
-                    batch_num, len(inserted), ui_count_batch)
+        try:
+            enriched = enrich_prediction(result)
+            ui_count = ui_service.bulk_store_enriched([enriched])
+            if ui_count:
+                total_ui += ui_count
+                logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
+        except Exception as e:
+            logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
 
     # --- Step 3: Summary ---
     summary["analyzed"] = total
