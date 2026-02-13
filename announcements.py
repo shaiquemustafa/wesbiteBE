@@ -127,8 +127,8 @@ def fetch_and_filter_announcements(
     else:
         # No new announcements — check for a SMALL number of unanalyzed
         # ones as gradual catch-up (e.g. from a previous crash).
-        # We cap at 5 per run to stay within 512 MB RAM.
-        MAX_CATCHUP = 5
+        # We cap at 25 per run so the backlog clears quickly.
+        MAX_CATCHUP = 25
         day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
         df_to_process = announcement_service.get_unanalyzed_announcements(
@@ -139,6 +139,19 @@ def fetch_and_filter_announcements(
             return pd.DataFrame(), stats
         logger.info("  Catch-up: processing %s unanalyzed announcements (max %s per run).",
                     len(df_to_process), MAX_CATCHUP)
+
+        # Mark ALL of these as analyzed RIGHT NOW — even if they don't pass
+        # the market cap filter.  This prevents the same announcements from
+        # being picked up again and again in every run.
+        catchup_newsids = []
+        if "NEWSID" in df_to_process.columns:
+            catchup_newsids = df_to_process["NEWSID"].dropna().astype(str).tolist()
+        if catchup_newsids:
+            try:
+                announcement_service.mark_as_analyzed(catchup_newsids)
+                logger.info("  Marked %s catch-up announcements as analyzed.", len(catchup_newsids))
+            except Exception as e:
+                logger.warning("  Failed to mark catch-up as analyzed: %s", e)
 
     # ---- Step 4: Merge with market cap CSV ----
     try:
