@@ -13,6 +13,7 @@ from stock_enrichment import enrich_prediction
 from database import connect_to_db, close_db_connection, get_conn
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
+from service.company_service import CompanyService
 from entity.ui_data import UIDataItem
 from typing import List
 
@@ -298,6 +299,7 @@ def _pipeline_sync(
 
     announcement_service = AnnouncementService()
     ui_service = UIDataService()
+    company_service = CompanyService()
 
     # --- Step 1: Fetch & filter announcements ---
     filtered_df, fetch_stats = fetch_and_filter_announcements(
@@ -341,6 +343,16 @@ def _pipeline_sync(
         # If no directional prediction, move on
         if not result:
             continue
+
+        # 2b-ii) Update NSE symbol in company_master if extracted from PDF
+        nse_sym = result.get("NSE_Symbol")
+        if nse_sym:
+            try:
+                scrip_int = int(row_dict.get("SCRIP_CD", 0))
+                if scrip_int:
+                    company_service.update_nse_symbol(scrip_int, nse_sym)
+            except (ValueError, TypeError):
+                pass
 
         # 2c) Store this single prediction in DB
         pred_df = pd.DataFrame([result])
@@ -466,3 +478,48 @@ def get_latest_announcement():
 @app.get("/ping", summary="Health check")
 def ping():
     return {"message": "pong"}
+
+
+# =========================================================================
+# Company master management
+# =========================================================================
+@app.post("/load-company-master", summary="Load company master data from Excel file")
+def load_company_master(
+    file_path: str = Query(
+        "./assets/LIST_OF_comapnies_BSE_NSE_with_mcap.xlsx",
+        description="Path to Excel file with company data.",
+    ),
+):
+    """
+    One-time (or periodic) endpoint to bulk-load / refresh the company_master
+    table from an Excel file.  The file must have columns:
+    ISIN, Company Name, BSE_Scrip_Code, NSE_Symbol, MktCapFull
+    """
+    try:
+        df = pd.read_excel(file_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read Excel: {e}")
+
+    required = {"BSE_Scrip_Code", "Company Name", "MktCapFull"}
+    if not required.issubset(set(df.columns)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Excel must have columns: {required}. Found: {list(df.columns)}"
+        )
+
+    company_service = CompanyService()
+    count = company_service.bulk_load_from_dataframe(df)
+    total = company_service.get_count()
+    return {
+        "message": f"Loaded {count} companies. Total in DB: {total}.",
+        "loaded": count,
+        "total_in_db": total,
+    }
+
+
+@app.get("/company-master/count", summary="Get company master count")
+def company_master_count():
+    company_service = CompanyService()
+    return {"total": company_service.get_count()}

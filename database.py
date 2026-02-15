@@ -128,6 +128,18 @@ def _ensure_tables(conn):
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_master (
+                bse_scrip_code INTEGER PRIMARY KEY,
+                isin TEXT,
+                company_name TEXT NOT NULL,
+                nse_symbol TEXT,
+                mkt_cap_full DOUBLE PRECISION,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
         # Add 'analyzed' column if it doesn't exist (safe for existing tables)
         cur.execute(
             """
@@ -158,5 +170,12 @@ def _ensure_tables(conn):
             """
             CREATE INDEX IF NOT EXISTS idx_ui_data_news_time
                 ON ui_data (news_time);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_company_master_nse_symbol
+                ON company_master (nse_symbol)
+                WHERE nse_symbol IS NOT NULL;
             """
         )

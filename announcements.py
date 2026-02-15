@@ -8,6 +8,7 @@ import math
 import os
 
 from service.announcement_service import AnnouncementService
+from service.company_service import CompanyService
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -16,7 +17,6 @@ def fetch_and_filter_announcements(
     target_date: datetime,
     market_cap_start: int = 2500,
     market_cap_end: int = 25000,
-    mcap_csv_path: str = "./assets/bse_market_cap_f5.csv",
     output_dir: str = "./bse_announcements",
     start_datetime: datetime | None = None,
     end_datetime: datetime | None = None,
@@ -29,12 +29,15 @@ def fetch_and_filter_announcements(
       3. Pick announcements to process:
          - force=True  → ALL matching from DB (for manual reruns)
          - force=False → newly inserted  +  any previously-stored-but-unanalyzed
-      4. Merge with market-cap CSV & filter by range.
-      5. Optionally filter by time window (if start/end provided).
-      6. Build full PDF URLs.
+      4. Look up market cap from company_master DB table.
+         - For unknown scrip codes → call BSE API to fetch MktCapFull and insert.
+      5. Filter by market cap range.
+      6. Optionally filter by time window (if start/end provided).
+      7. Build full PDF URLs.
     Returns (DataFrame ready for PDF download, stats dict).
     """
     announcement_service = AnnouncementService()
+    company_service = CompanyService()
     os.makedirs(output_dir, exist_ok=True)
 
     # Stats dict returned alongside the DataFrame
@@ -127,7 +130,6 @@ def fetch_and_filter_announcements(
     else:
         # No new announcements — check for a SMALL number of unanalyzed
         # ones as gradual catch-up (e.g. from a previous crash).
-        # We cap at 25 per run so the backlog clears quickly.
         MAX_CATCHUP = 25
         day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
@@ -141,8 +143,7 @@ def fetch_and_filter_announcements(
                     len(df_to_process), MAX_CATCHUP)
 
         # Mark ALL of these as analyzed RIGHT NOW — even if they don't pass
-        # the market cap filter.  This prevents the same announcements from
-        # being picked up again and again in every run.
+        # the market cap filter.
         catchup_newsids = []
         if "NEWSID" in df_to_process.columns:
             catchup_newsids = df_to_process["NEWSID"].dropna().astype(str).tolist()
@@ -153,29 +154,48 @@ def fetch_and_filter_announcements(
             except Exception as e:
                 logger.warning("  Failed to mark catch-up as analyzed: %s", e)
 
-    # ---- Step 4: Merge with market cap CSV ----
-    try:
-        df_mcap = pd.read_csv(mcap_csv_path)
-    except FileNotFoundError:
-        logger.warning("  Market cap file not found at %s.", mcap_csv_path)
-        return df_to_process, stats
-
+    # ---- Step 4: Look up market cap from company_master DB ----
     df_to_process["SCRIP_CD"] = pd.to_numeric(df_to_process["SCRIP_CD"], errors="coerce")
-    df_mcap["FinInstrmId"] = pd.to_numeric(df_mcap["FinInstrmId"], errors="coerce")
-    df_to_process = df_to_process.drop(columns=["Market Cap", "FinInstrmId", "market_cap"], errors="ignore")
+    scrip_codes = df_to_process["SCRIP_CD"].dropna().astype(int).unique().tolist()
 
-    df_merged = df_to_process.merge(
-        df_mcap[["FinInstrmId", "Market Cap"]],
-        left_on="SCRIP_CD",
-        right_on="FinInstrmId",
-        how="left",
-    )
+    # Batch lookup from company_master
+    mcap_map = company_service.get_market_caps(scrip_codes)
+    found_codes = set(mcap_map.keys())
+    missing_codes = [c for c in scrip_codes if c not in found_codes]
+
+    if missing_codes:
+        logger.info("  [Step 4] %s scrip codes not in company_master — fetching from BSE API...",
+                     len(missing_codes))
+        for code in missing_codes:
+            mcap = company_service.fetch_mcap_from_bse_api(code)
+            if mcap is not None:
+                mcap_map[code] = mcap
+                # Find company name from announcement data
+                matching = df_to_process[df_to_process["SCRIP_CD"] == code]
+                comp_name = ""
+                if not matching.empty:
+                    comp_name = str(matching.iloc[0].get("SLONGNAME", "")).strip()
+                # Insert into company_master (NSE symbol will be added later from PDF)
+                try:
+                    company_service.upsert_company(
+                        bse_scrip_code=code,
+                        company_name=comp_name,
+                        mkt_cap_full=mcap,
+                    )
+                    logger.info("    Added SCRIP %s (%s) to company_master: ₹%s Cr",
+                                code, comp_name, f"{mcap:,.2f}")
+                except Exception as e:
+                    logger.warning("    Failed to insert SCRIP %s into company_master: %s", code, e)
+
+    # Map market cap onto announcements
+    df_to_process["MktCapFull"] = df_to_process["SCRIP_CD"].map(mcap_map)
 
     # ---- Step 5: Filter by market cap ----
-    df_filtered = df_merged[
-        (df_merged["Market Cap"] >= market_cap_start) & (df_merged["Market Cap"] <= market_cap_end)
+    df_filtered = df_to_process[
+        (df_to_process["MktCapFull"] >= market_cap_start)
+        & (df_to_process["MktCapFull"] <= market_cap_end)
     ].copy()
-    logger.info("  [Step 4] After market cap filter (%s–%s Cr): %s announcements.",
+    logger.info("  [Step 5] After market cap filter (%s–%s Cr): %s announcements.",
                 market_cap_start, market_cap_end, len(df_filtered))
 
     if df_filtered.empty:
@@ -188,7 +208,7 @@ def fetch_and_filter_announcements(
         df_final = df_filtered[
             (df_filtered["DT_TM"] >= start_datetime) & (df_filtered["DT_TM"] <= end_datetime)
         ].copy()
-        logger.info("  [Step 5] After time filter (%s → %s): %s announcements.",
+        logger.info("  [Step 6] After time filter (%s → %s): %s announcements.",
                      start_datetime, end_datetime, len(df_final))
     else:
         df_final = df_filtered.copy()
@@ -205,7 +225,7 @@ def fetch_and_filter_announcements(
     if "News_submission_dt" in df_final.columns:
         df_final["News_submission_dt"] = pd.to_datetime(df_final["News_submission_dt"], errors="coerce")
 
-    logger.info("  [Step 6] Sending %s announcements for PDF analysis.", len(df_final))
+    logger.info("  [Step 7] Sending %s announcements for PDF analysis.", len(df_final))
     return df_final, stats
 
 

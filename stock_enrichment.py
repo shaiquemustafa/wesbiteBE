@@ -152,10 +152,13 @@ def enrich_prediction(prediction: dict) -> dict:
 
     logger.info("  Enriching '%s' ...", clean_name)
 
+    nse_symbol = prediction.get("NSE_Symbol") or ""
+
     enriched = {
         # ---- From prediction ----
         "scrip_cd": str(prediction.get("SCRIP_CD", "")),
         "company_name": company,
+        "nse_symbol": nse_symbol or None,
         "impact": prediction.get("Impact"),
         "impact_score": prediction.get("Impact_Score"),
         "mid_percentage": prediction.get("Mid_%"),

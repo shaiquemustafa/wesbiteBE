@@ -226,10 +226,70 @@ def _call_llm(prompt, user, retries=3, max_tokens=400, temperature=0.3):
     return None
 
 
+def extract_nse_symbol(text: str) -> Optional[str]:
+    """
+    Extract the NSE trading symbol from PDF text.
+    Handles various formats found in BSE filings:
+      - "NSE Scrip Symbol: OLAELEC"
+      - "NSE Symbol: SANDHAR"
+      - "NSE: SANDHAR"
+      - "NSE Code: CUB"
+      - "NSE Scrip Code: BBTC"
+      - "Scrip Code: BBTC" (when near BSE context)
+    Returns the symbol string or None.
+    """
+    if not text:
+        return None
+
+    # Patterns ordered from most specific to least specific
+    patterns = [
+        # "NSE Scrip Symbol: OLAELEC" or "NSE Scrip Symbol : OLAELEC"
+        r'NSE\s+Scrip\s+Symbol\s*[:\-–]\s*([A-Z][A-Z0-9&]{1,19})',
+        # "NSE Symbol: SANDHAR" or "NSE Symbol : SANDHAR"
+        r'NSE\s+Symbol\s*[:\-–]\s*([A-Z][A-Z0-9&]{1,19})',
+        # "NSE Scrip Code: BBTC"
+        r'NSE\s+Scrip\s+Code\s*[:\-–]\s*([A-Z][A-Z0-9&]{1,19})',
+        # "NSE Code: CUB"
+        r'NSE\s+Code\s*[:\-–]\s*([A-Z][A-Z0-9&]{1,19})',
+        # "NSE: SANDHAR" (with colon)
+        r'NSE\s*[:\-–]\s*([A-Z][A-Z0-9&]{1,19})',
+        # "Symbol: BBTC" or "Scrip Code: BBTC" (only if preceded by NSE context)
+        # This is a looser pattern; we use it only for text near "NSE" mentions
+        r'(?:Symbol|Scrip\s+Code)\s*[:\-–]\s*([A-Z][A-Z0-9&]{1,19})',
+    ]
+
+    # Try the specific NSE patterns first
+    for pattern in patterns[:-1]:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            symbol = match.group(1).strip().upper()
+            # Sanity: must be 2-20 chars, all caps/digits
+            if 2 <= len(symbol) <= 20 and symbol.isalnum():
+                return symbol
+
+    # For the loose "Symbol/Scrip Code" pattern, only accept if "NSE" appears
+    # within 500 chars before or the document mentions both BSE and NSE
+    if re.search(r'\bNSE\b', text, re.IGNORECASE):
+        for match in re.finditer(patterns[-1], text, re.IGNORECASE):
+            symbol = match.group(1).strip().upper()
+            # Must be alphabetic (not a numeric BSE code)
+            if 2 <= len(symbol) <= 20 and symbol.isalpha():
+                # Check it's not a numeric BSE scrip code nearby
+                start = max(0, match.start() - 200)
+                context = text[start:match.end()]
+                # If "BSE" appears right before this "Scrip Code:", skip it
+                if re.search(r'BSE\s+Scrip\s+Code', context, re.IGNORECASE):
+                    continue
+                return symbol
+
+    return None
+
+
 def _process_single_announcement(row: dict, index: int, total: int) -> Optional[dict]:
     """
     Process ONE announcement: download PDF → extract text → discard PDF → LLM.
     Memory-efficient: PDF bytes are freed immediately after text extraction.
+    Also extracts NSE symbol from the PDF text.
     """
     scrip_cd = str(row.get("SCRIP_CD", ""))
     pdf_url = str(row.get("ATTACHMENTNAME", ""))
@@ -255,6 +315,9 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
         logger.info("  [%s/%s] SCRIP %s: text too short (%s chars), skipping", index, total, scrip_cd, len(text))
         return None
 
+    # 2b) Extract NSE symbol from PDF text
+    nse_symbol = extract_nse_symbol(text)
+
     # 3) LLM screening
     resp = _call_llm(PROMPT_SCREEN, text + "\nReturn one line only.")
     if not resp:
@@ -278,7 +341,8 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
     if not cat_resp or cat_resp not in CATEGORY_LABELS:
         cat_resp = _guess_category(text)
 
-    logger.info("  [%s/%s] SCRIP %s: %s | %s", index, total, scrip_cd, imp_tag, company)
+    logger.info("  [%s/%s] SCRIP %s: %s | %s%s", index, total, scrip_cd, imp_tag, company,
+                f" | NSE: {nse_symbol}" if nse_symbol else "")
 
     return {
         "File": scrip_cd,
@@ -291,6 +355,7 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
         "Rationale": rationale,
         "Category": cat_resp,
         "News_submission_dt": news_sub_dt,
+        "NSE_Symbol": nse_symbol,
     }
 
 
