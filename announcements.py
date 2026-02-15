@@ -163,9 +163,14 @@ def fetch_and_filter_announcements(
     found_codes = set(mcap_map.keys())
     missing_codes = [c for c in scrip_codes if c not in found_codes]
 
+    logger.info("  [Step 4] Market cap lookup: %s unique scrip codes | %s found in company_master | %s NOT found",
+                len(scrip_codes), len(found_codes), len(missing_codes))
+
+    new_companies_added = 0
+    bse_api_failures = 0
+
     if missing_codes:
-        logger.info("  [Step 4] %s scrip codes not in company_master — fetching from BSE API...",
-                     len(missing_codes))
+        logger.info("  [Step 4] Fetching %s unknown scrip codes from BSE API ...", len(missing_codes))
         for code in missing_codes:
             mcap = company_service.fetch_mcap_from_bse_api(code)
             if mcap is not None:
@@ -182,10 +187,21 @@ def fetch_and_filter_announcements(
                         company_name=comp_name,
                         mkt_cap_full=mcap,
                     )
-                    logger.info("    Added SCRIP %s (%s) to company_master: ₹%s Cr",
+                    new_companies_added += 1
+                    logger.info("    ➕ NEW in company_master: SCRIP %s | %s | MktCap ₹%s Cr",
                                 code, comp_name, f"{mcap:,.2f}")
                 except Exception as e:
-                    logger.warning("    Failed to insert SCRIP %s into company_master: %s", code, e)
+                    logger.warning("    ❌ Failed to insert SCRIP %s into company_master: %s", code, e)
+            else:
+                bse_api_failures += 1
+                logger.warning("    ⚠️  BSE API returned no MktCap for SCRIP %s — skipping.", code)
+
+        if new_companies_added:
+            logger.info("  [Step 4] Added %s new companies to company_master.", new_companies_added)
+        if bse_api_failures:
+            logger.warning("  [Step 4] BSE API failed for %s scrip codes (no market cap data).", bse_api_failures)
+    else:
+        logger.info("  [Step 4] ✅ All %s scrip codes found in company_master.", len(found_codes))
 
     # Map market cap onto announcements
     df_to_process["MktCapFull"] = df_to_process["SCRIP_CD"].map(mcap_map)
