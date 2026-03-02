@@ -79,9 +79,30 @@ class WhatsAppService:
             logger.error("  ❌ WhatsApp API error sending OTP to %s: %s", phone, e)
             return False
 
+    def _update_contact_attributes(self, phone: str, attributes: list) -> bool:
+        """
+        Updates contact attributes in WATI before sending a template
+        that uses Shopify/WooCommerce variable names.
+        """
+        url = f"{self.base_url}/api/v1/updateContactAttributes/{phone}"
+        payload = {"customParams": attributes}
+
+        try:
+            response = requests.post(url, json=payload, headers=self.headers, timeout=15)
+            logger.info("  📋 Contact attributes update for %s: status=%s body=%s",
+                        phone, response.status_code,
+                        response.text[:300] if response.text else "(empty)")
+            return response.status_code == 200
+        except Exception as e:
+            logger.error("  ❌ Failed to update contact attributes for %s: %s", phone, e)
+            return False
+
     def send_market_update(self, phone: str, item: dict) -> bool:
         """
         Sends a market update notification using the market_update_1 template.
+
+        WATI Shopify-variable templates pull values from contact attributes,
+        so we first update the contact's attributes, then send the template.
 
         Template parameter mapping:
             shop_name                          → Company Name
@@ -120,22 +141,27 @@ class WhatsAppService:
             except Exception:
                 news_time = str(news_time)
 
-        # Template body order:
-        #   {{1}} = shop_name (company name)
-        #   {{2}} = first_name (category)
-        #   {{3}} = last_name (impact tag)
-        #   {{4}} = product_details (summary)
-        #   {{5}} = tracking_number (news time)
-        #   {{6}} = catalog_checkout_url_partial_variable (RITO link)
-        #   {{7}} = tracking_url_partial_variable (manage link)
+        # Step 1: Set contact attributes (WATI pulls these into the template)
+        attributes = [
+            {"name": "shop_name", "value": item.get("company_name", "Unknown")},
+            {"name": "first_name", "value": item.get("category", "General")},
+            {"name": "last_name", "value": impact_display},
+            {"name": "product_details", "value": item.get("summary", "No details available.")},
+            {"name": "tracking_number", "value": str(news_time)},
+            {"name": "catalog_checkout_url_partial_variable", "value": RITO_WEBSITE_URL},
+            {"name": "tracking_url_partial_variable", "value": RITO_MANAGE_URL},
+        ]
+        self._update_contact_attributes(phone, attributes)
+
+        # Step 2: Send template (WATI fills in values from contact attributes)
         parameters = [
-            {"name": "1", "value": item.get("company_name", "Unknown")},
-            {"name": "2", "value": item.get("category", "General")},
-            {"name": "3", "value": impact_display},
-            {"name": "4", "value": item.get("summary", "No details available.")},
-            {"name": "5", "value": str(news_time)},
-            {"name": "6", "value": RITO_WEBSITE_URL},
-            {"name": "7", "value": RITO_MANAGE_URL},
+            {"name": "shop_name", "value": item.get("company_name", "Unknown")},
+            {"name": "first_name", "value": item.get("category", "General")},
+            {"name": "last_name", "value": impact_display},
+            {"name": "product_details", "value": item.get("summary", "No details available.")},
+            {"name": "tracking_number", "value": str(news_time)},
+            {"name": "catalog_checkout_url_partial_variable", "value": RITO_WEBSITE_URL},
+            {"name": "tracking_url_partial_variable", "value": RITO_MANAGE_URL},
         ]
 
         return self.send_template_message(phone, MARKET_UPDATE_TEMPLATE, parameters)
