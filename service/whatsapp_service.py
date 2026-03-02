@@ -49,7 +49,20 @@ class WhatsAppService:
         }
 
         try:
+            logger.info("  📤 WATI request: POST %s", url)
+            logger.info("  📤 WATI payload: %s", payload)
+            logger.info("  📤 WATI base_url env: %s", self.base_url)
+            logger.info("  📤 WATI token present: %s (len=%s)", bool(self.token), len(self.token) if self.token else 0)
+
             response = requests.post(url, json=payload, headers=self.headers, timeout=15)
+
+            logger.info("  📥 WATI response status: %s", response.status_code)
+            logger.info("  📥 WATI response body: %s", response.text[:500] if response.text else "(empty)")
+
+            if not response.text or not response.text.strip():
+                logger.error("  ❌ WATI returned empty response body (status %s)", response.status_code)
+                return False
+
             data = response.json()
             success = data.get("result", False)
 
