@@ -120,14 +120,22 @@ class WhatsAppService:
             except Exception:
                 news_time = str(news_time)
 
+        # Template body order:
+        #   {{1}} = shop_name (company name)
+        #   {{2}} = first_name (category)
+        #   {{3}} = last_name (impact tag)
+        #   {{4}} = product_details (summary)
+        #   {{5}} = tracking_number (news time)
+        #   {{6}} = catalog_checkout_url_partial_variable (RITO link)
+        #   {{7}} = tracking_url_partial_variable (manage link)
         parameters = [
-            {"name": "shop_name", "value": item.get("company_name", "Unknown")},
-            {"name": "first_name", "value": item.get("category", "General")},
-            {"name": "last_name", "value": impact_display},
-            {"name": "product_details", "value": item.get("summary", "No details available.")},
-            {"name": "tracking_number", "value": str(news_time)},
-            {"name": "catalog_checkout_url_partial_variable", "value": RITO_WEBSITE_URL},
-            {"name": "tracking_url_partial_variable", "value": RITO_MANAGE_URL},
+            {"name": "1", "value": item.get("company_name", "Unknown")},
+            {"name": "2", "value": item.get("category", "General")},
+            {"name": "3", "value": impact_display},
+            {"name": "4", "value": item.get("summary", "No details available.")},
+            {"name": "5", "value": str(news_time)},
+            {"name": "6", "value": RITO_WEBSITE_URL},
+            {"name": "7", "value": RITO_MANAGE_URL},
         ]
 
         return self.send_template_message(phone, MARKET_UPDATE_TEMPLATE, parameters)
