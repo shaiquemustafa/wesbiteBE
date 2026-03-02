@@ -11,10 +11,10 @@ logger = logging.getLogger("uvicorn.error")
 WATI_BASE_URL = os.getenv("WATI_BASE_URL", "https://live-mt-server.wati.io/10103450")
 WATI_API_TOKEN = os.getenv("WATI_API_TOKEN", "")
 
-# Template used for OTP messages (change this when you get a proper OTP template approved)
-OTP_TEMPLATE_NAME = os.getenv("WATI_OTP_TEMPLATE", "test22")
+# Template used for OTP messages (approved authentication template)
+OTP_TEMPLATE_NAME = os.getenv("WATI_OTP_TEMPLATE", "otp_login")
 # The parameter name in your template that holds the OTP value
-OTP_PARAM_NAME = os.getenv("WATI_OTP_PARAM", "total_price")
+OTP_PARAM_NAME = os.getenv("WATI_OTP_PARAM", "1")
 
 
 class WhatsAppService:
@@ -53,18 +53,10 @@ class WhatsAppService:
         }
 
         try:
-            logger.info("  📤 WATI request: POST %s", url)
-            logger.info("  📤 WATI payload: %s", payload)
-            logger.info("  📤 WATI base_url env: %s", self.base_url)
-            logger.info("  📤 WATI token present: %s (len=%s)", bool(self.token), len(self.token) if self.token else 0)
-
             response = requests.post(url, json=payload, headers=self.headers, timeout=15)
 
-            logger.info("  📥 WATI response status: %s", response.status_code)
-            logger.info("  📥 WATI response body: %s", response.text[:500] if response.text else "(empty)")
-
             if not response.text or not response.text.strip():
-                logger.error("  ❌ WATI returned empty response body (status %s)", response.status_code)
+                logger.error("  ❌ WATI returned empty response (status %s) for %s", response.status_code, phone)
                 return False
 
             data = response.json()
