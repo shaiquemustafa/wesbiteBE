@@ -647,3 +647,30 @@ def update_name(body: UpdateNameRequest, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=404, detail="User not found.")
 
     return {"message": "Name updated successfully.", "name": body.name}
+
+
+# =========================================================================
+# Test – Manual notification trigger (for debugging)
+# =========================================================================
+
+@app.post("/api/test/send-market-update", summary="[TEST] Send a market update to all users")
+def test_send_market_update():
+    """
+    Sends a test market update notification to all active users.
+    Uses dummy data to verify the template works end-to-end.
+    """
+    test_item = {
+        "company_name": "Laxmi Organic Industries Ltd",
+        "category": "Board Meeting",
+        "impact": "POSITIVE",
+        "summary": "Laxmi Organic Industries reported strong quarterly results with revenue growth of 12% YoY. The board has recommended a dividend of Rs 3 per share.",
+        "news_time": "2026-03-02T14:30:00",
+    }
+
+    notif_service = NotificationService()
+    result = notif_service.notify_all_users(test_item)
+
+    return {
+        "message": "Test notification triggered.",
+        "result": result,
+    }
