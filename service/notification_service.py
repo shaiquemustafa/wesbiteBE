@@ -1,49 +1,64 @@
-# service/notification_service.py – Send market updates to all registered users
+# service/notification_service.py – Send market updates to relevant users
 import logging
 from typing import List
 
 from database import get_conn
 from service.whatsapp_service import WhatsAppService
+from service.watchlist_service import WatchlistService
 
 logger = logging.getLogger("uvicorn.error")
 
 
 class NotificationService:
-    """Sends WhatsApp notifications to all active users."""
+    """Sends WhatsApp notifications to users based on their watchlists."""
 
     def __init__(self):
         self.whatsapp = WhatsAppService()
+        self.watchlist_service = WatchlistService()
 
-    def _get_all_active_users(self) -> List[str]:
-        """Returns a list of phone numbers for all active users."""
+    def _get_all_active_phones(self) -> List[str]:
+        """Fallback: returns all active user phone numbers."""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT phone FROM users WHERE is_active = TRUE")
-                rows = cur.fetchall()
-        return [row[0] for row in rows]
+                return [row[0] for row in cur.fetchall()]
 
     def notify_all_users(self, enriched_item: dict) -> dict:
         """
-        Sends a market update notification to ALL active users
-        for a single enriched UI data item.
+        Sends a market update notification to users who should receive it:
+        - Users who have this stock in their watchlist
+        - Users who have receive_all_updates = TRUE
+        - Users who haven't completed onboarding yet (they get everything)
 
         Args:
-            enriched_item: The enriched prediction dict with company_name,
-                           impact, summary, category, news_time, etc.
+            enriched_item: The enriched prediction dict.
 
         Returns:
             {"total_users": int, "sent": int, "failed": int}
         """
-        phones = self._get_all_active_users()
+        company = enriched_item.get("company_name", "Unknown")
+
+        # Try to get scrip code to do targeted notifications
+        scrip_cd = enriched_item.get("scrip_cd") or enriched_item.get("SCRIP_CD")
+
+        if scrip_cd:
+            try:
+                scrip_cd = int(scrip_cd)
+                phones = self.watchlist_service.get_users_to_notify(scrip_cd)
+            except (ValueError, TypeError):
+                # Fallback: send to all active users
+                phones = self._get_all_active_phones()
+        else:
+            # No scrip code available — send to all
+            phones = self._get_all_active_phones()
 
         if not phones:
-            logger.info("  📭 No active users to notify.")
+            logger.info("  📭 No users to notify for '%s'.", company)
             return {"total_users": 0, "sent": 0, "failed": 0}
 
-        company = enriched_item.get("company_name", "Unknown")
         logger.info(
-            "  📢 Sending market update for '%s' to %d user(s)...",
-            company, len(phones),
+            "  📢 Sending market update for '%s' (scrip=%s) to %d user(s)...",
+            company, scrip_cd, len(phones),
         )
 
         sent = 0
@@ -70,7 +85,6 @@ class NotificationService:
     def notify_all_users_bulk(self, enriched_items: List[dict]) -> dict:
         """
         Sends market update notifications for multiple items.
-        Each item is sent to all active users.
 
         Args:
             enriched_items: List of enriched prediction dicts.

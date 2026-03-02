@@ -201,11 +201,18 @@ class AuthService:
                         "UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE phone = %s",
                         (phone,),
                     )
+                    # Fetch onboarding flag
+                    cur.execute(
+                        "SELECT COALESCE(onboarding_complete, FALSE) FROM users WHERE phone = %s",
+                        (phone,),
+                    )
+                    ob_row = cur.fetchone()
                     user = {
                         "id": user_row[0],
                         "phone": user_row[1],
                         "name": user_row[2],
                         "created_at": user_row[3].isoformat() if user_row[3] else None,
+                        "onboarding_complete": ob_row[0] if ob_row else False,
                     }
                 else:
                     # New user — insert
@@ -224,6 +231,7 @@ class AuthService:
                         "phone": new_row[1],
                         "name": new_row[2],
                         "created_at": new_row[3].isoformat() if new_row[3] else None,
+                        "onboarding_complete": False,
                     }
 
         # ── Issue JWT ──
@@ -283,7 +291,8 @@ class AuthService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, phone, name, is_active, created_at, last_login_at
+                    SELECT id, phone, name, is_active, created_at, last_login_at,
+                           COALESCE(onboarding_complete, FALSE) AS onboarding_complete
                     FROM users WHERE phone = %s
                     """,
                     (phone,),
@@ -299,6 +308,7 @@ class AuthService:
             "is_active": row[3],
             "created_at": row[4].isoformat() if row[4] else None,
             "last_login_at": row[5].isoformat() if row[5] else None,
+            "onboarding_complete": row[6],
         }
 
     # ──────────────────────────────────────────────────────────────────

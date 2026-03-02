@@ -219,3 +219,36 @@ def _ensure_tables(conn):
                 ON otp_requests (phone, expires_at);
             """
         )
+
+        # ── User watchlist ────────────────────────────────────────────
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_watchlist (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                bse_scrip_code INTEGER NOT NULL,
+                added_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (user_id, bse_scrip_code)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_watchlist_user
+                ON user_watchlist (user_id);
+            """
+        )
+        # Add receive_all_updates column to users (safe for existing tables)
+        cur.execute(
+            """
+            ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS receive_all_updates BOOLEAN DEFAULT FALSE;
+            """
+        )
+        # Track whether user has completed stock selection onboarding
+        cur.execute(
+            """
+            ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE;
+            """
+        )

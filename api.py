@@ -17,6 +17,7 @@ from service.ui_data_service import UIDataService
 from service.company_service import CompanyService
 from service.auth_service import AuthService
 from service.notification_service import NotificationService
+from service.watchlist_service import WatchlistService
 from entity.ui_data import UIDataItem
 from typing import List, Optional
 
@@ -647,6 +648,61 @@ def update_name(body: UpdateNameRequest, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=404, detail="User not found.")
 
     return {"message": "Name updated successfully.", "name": body.name}
+
+
+# =========================================================================
+# Stock Search & Watchlist
+# =========================================================================
+
+@app.get("/api/stocks/search", summary="Search companies by name or NSE symbol")
+def search_stocks(
+    q: str = Query(..., min_length=1, description="Search term (company name or NSE symbol)"),
+    limit: int = Query(20, ge=1, le=50, description="Max results to return"),
+):
+    """
+    Searches the company_master table for companies matching the query.
+    Returns results sorted by market cap (largest first).
+    """
+    service = WatchlistService()
+    results = service.search_companies(q, limit)
+    return {"results": results, "count": len(results)}
+
+
+class SaveWatchlistRequest(BaseModel):
+    scrip_codes: List[int] = Field(..., description="List of BSE scrip codes (3-15)")
+    receive_all_updates: bool = Field(False, description="Also receive updates for stocks not in watchlist")
+
+
+@app.get("/api/user/watchlist", summary="Get current user's stock watchlist")
+def get_watchlist(authorization: Optional[str] = Header(None)):
+    """
+    Returns the user's selected stocks and notification preferences.
+    Requires a valid JWT in the Authorization header.
+    """
+    decoded = _get_current_user(authorization)
+    service = WatchlistService()
+    return service.get_watchlist(decoded["user_id"])
+
+
+@app.put("/api/user/watchlist", summary="Save user's stock watchlist")
+def save_watchlist(body: SaveWatchlistRequest, authorization: Optional[str] = Header(None)):
+    """
+    Replaces the user's entire watchlist with the given scrip codes.
+    Must have 3-15 stocks. Also sets the 'receive_all_updates' preference.
+    Requires a valid JWT in the Authorization header.
+    """
+    decoded = _get_current_user(authorization)
+    service = WatchlistService()
+    result = service.save_watchlist(
+        user_id=decoded["user_id"],
+        scrip_codes=body.scrip_codes,
+        receive_all_updates=body.receive_all_updates,
+    )
+
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+
+    return {"message": f"Watchlist saved with {result['count']} stocks.", "count": result["count"]}
 
 
 # =========================================================================
