@@ -16,6 +16,13 @@ OTP_TEMPLATE_NAME = os.getenv("WATI_OTP_TEMPLATE", "otp_login")
 # The parameter name in your template that holds the OTP value
 OTP_PARAM_NAME = os.getenv("WATI_OTP_PARAM", "1")
 
+# Template for market update notifications
+MARKET_UPDATE_TEMPLATE = os.getenv("WATI_MARKET_TEMPLATE", "market_update_1")
+
+# RITO website URL (used in notification messages)
+RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "https://rito.co.in")
+RITO_MANAGE_URL = os.getenv("RITO_MANAGE_URL", "https://rito.co.in/preferences")
+
 
 class WhatsAppService:
     """Sends WhatsApp messages via WATI API."""
@@ -71,6 +78,59 @@ class WhatsAppService:
         except Exception as e:
             logger.error("  ❌ WhatsApp API error sending OTP to %s: %s", phone, e)
             return False
+
+    def send_market_update(self, phone: str, item: dict) -> bool:
+        """
+        Sends a market update notification using the market_update_1 template.
+
+        Template parameter mapping:
+            shop_name                          → Company Name
+            first_name                         → Category
+            last_name                          → Impact tag (🟢 POSITIVE / 🔴 NEGATIVE etc.)
+            product_details                    → Summary
+            tracking_number                    → News Time
+            catalog_checkout_url_partial_variable → RITO website link
+            tracking_url_partial_variable      → Manage alerts link
+        """
+        impact_raw = (item.get("impact") or "UNKNOWN").upper()
+        impact_emoji_map = {
+            "POSITIVE": "🟢 POSITIVE",
+            "STRONGLY POSITIVE": "🟢 STRONGLY POSITIVE",
+            "BEAT": "🟢 BEAT",
+            "NEGATIVE": "🔴 NEGATIVE",
+            "STRONGLY NEGATIVE": "🔴 STRONGLY NEGATIVE",
+            "MISSED": "🔴 MISSED",
+            "NEUTRAL": "⚪ NEUTRAL",
+        }
+        impact_display = impact_emoji_map.get(impact_raw, f"⚪ {impact_raw}")
+
+        # Format news_time nicely
+        news_time = item.get("news_time", "")
+        if news_time:
+            try:
+                from datetime import datetime
+                if isinstance(news_time, str):
+                    dt = datetime.fromisoformat(news_time)
+                elif isinstance(news_time, datetime):
+                    dt = news_time
+                else:
+                    dt = None
+                if dt:
+                    news_time = dt.strftime("%-d %b, %I:%M %p")
+            except Exception:
+                news_time = str(news_time)
+
+        parameters = [
+            {"name": "shop_name", "value": item.get("company_name", "Unknown")},
+            {"name": "first_name", "value": item.get("category", "General")},
+            {"name": "last_name", "value": impact_display},
+            {"name": "product_details", "value": item.get("summary", "No details available.")},
+            {"name": "tracking_number", "value": str(news_time)},
+            {"name": "catalog_checkout_url_partial_variable", "value": RITO_WEBSITE_URL},
+            {"name": "tracking_url_partial_variable", "value": RITO_MANAGE_URL},
+        ]
+
+        return self.send_template_message(phone, MARKET_UPDATE_TEMPLATE, parameters)
 
     def send_template_message(self, phone: str, template_name: str, parameters: list = None) -> bool:
         """

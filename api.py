@@ -16,6 +16,7 @@ from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
 from service.company_service import CompanyService
 from service.auth_service import AuthService
+from service.notification_service import NotificationService
 from entity.ui_data import UIDataItem
 from typing import List, Optional
 
@@ -325,6 +326,7 @@ def _pipeline_sync(
     total = len(filtered_df)
     total_predictions = 0
     total_ui = 0
+    items_to_notify = []  # Collect enriched items to notify users about
 
     logger.info("  [Analyse] Processing %s PDFs one-by-one ...", total)
 
@@ -387,16 +389,34 @@ def _pipeline_sync(
             ui_count = ui_service.bulk_store_enriched([enriched])
             if ui_count:
                 total_ui += ui_count
+                items_to_notify.append(enriched)
                 logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
         except Exception as e:
             logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
 
-    # --- Step 3: Summary ---
+    # --- Step 3: Send WhatsApp notifications for new items ---
+    total_notified = 0
+    if items_to_notify:
+        try:
+            notif_service = NotificationService()
+            notif_result = notif_service.notify_all_users_bulk(items_to_notify)
+            total_notified = notif_result["total_sent"]
+            logger.info(
+                "  📢 Notifications: %d sent, %d failed for %d items.",
+                notif_result["total_sent"],
+                notif_result["total_failed"],
+                notif_result["items_processed"],
+            )
+        except Exception as e:
+            logger.warning("  ⚠️ Notification sending failed: %s", e)
+
+    # --- Step 4: Summary ---
     summary["analyzed"] = total
     summary["inserted_predictions"] = total_predictions
     summary["ui_data_stored"] = total_ui
+    summary["notifications_sent"] = total_notified
 
-    # --- Step 4: Cleanup records older than 48 hours ---
+    # --- Step 5: Cleanup records older than 48 hours ---
     _cleanup_old_records()
 
     summary["message"] = "Done."
