@@ -1,8 +1,9 @@
 import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import asyncio
 import logging
@@ -14,8 +15,9 @@ from database import connect_to_db, close_db_connection, get_conn
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
 from service.company_service import CompanyService
+from service.auth_service import AuthService
 from entity.ui_data import UIDataItem
-from typing import List
+from typing import List, Optional
 
 # Fixed IST offset (no tzdata dependency)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -523,3 +525,105 @@ def load_company_master(
 def company_master_count():
     company_service = CompanyService()
     return {"total": company_service.get_count()}
+
+
+# =========================================================================
+# Auth – WhatsApp OTP Login
+# =========================================================================
+
+class SendOTPRequest(BaseModel):
+    phone: str = Field(..., description="Phone number (with or without country code)", examples=["9474841416", "919474841416"])
+
+class VerifyOTPRequest(BaseModel):
+    phone: str = Field(..., description="Phone number used to request the OTP")
+    otp: str = Field(..., min_length=6, max_length=6, description="6-digit OTP received on WhatsApp")
+
+class UpdateNameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="User's display name")
+
+
+def _get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    """
+    Helper that extracts and validates the JWT from the Authorization header.
+    Returns the decoded token payload or raises 401.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header missing.")
+
+    token = authorization.replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Token missing.")
+
+    auth_service = AuthService()
+    decoded = auth_service.decode_token(token)
+
+    if not decoded["valid"]:
+        raise HTTPException(status_code=401, detail=decoded["message"])
+
+    return decoded
+
+
+@app.post("/api/auth/send-otp", summary="Send OTP to WhatsApp number")
+def send_otp(body: SendOTPRequest):
+    """
+    Generates a 6-digit OTP, saves it, and sends it to the
+    user's WhatsApp number via WATI.
+    """
+    auth_service = AuthService()
+    result = auth_service.send_otp(body.phone)
+
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+
+    return {"message": result["message"]}
+
+
+@app.post("/api/auth/verify-otp", summary="Verify OTP and get JWT token")
+def verify_otp(body: VerifyOTPRequest):
+    """
+    Verifies the OTP. On success returns a JWT token (valid 30 days)
+    and the user object.  Automatically creates the user on first login.
+    """
+    auth_service = AuthService()
+    result = auth_service.verify_otp(body.phone, body.otp)
+
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+
+    return {
+        "token": result["token"],
+        "is_new_user": result["is_new_user"],
+        "user": result["user"],
+    }
+
+
+@app.get("/api/auth/me", summary="Get current logged-in user")
+def get_me(authorization: Optional[str] = Header(None)):
+    """
+    Returns the current user's profile.  Requires a valid JWT
+    in the Authorization header: `Bearer <token>`
+    """
+    decoded = _get_current_user(authorization)
+    auth_service = AuthService()
+    user = auth_service.get_user(decoded["phone"])
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    return {"user": user}
+
+
+@app.put("/api/auth/me/name", summary="Update user display name")
+def update_name(body: UpdateNameRequest, authorization: Optional[str] = Header(None)):
+    """
+    Updates the current user's display name.
+    Requires a valid JWT in the Authorization header.
+    """
+    decoded = _get_current_user(authorization)
+    auth_service = AuthService()
+    updated = auth_service.update_user_name(decoded["phone"], body.name)
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    return {"message": "Name updated successfully.", "name": body.name}

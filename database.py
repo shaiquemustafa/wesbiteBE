@@ -179,3 +179,43 @@ def _ensure_tables(conn):
                 WHERE nse_symbol IS NOT NULL;
             """
         )
+
+        # ── Auth tables ──────────────────────────────────────────────
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                phone VARCHAR(15) UNIQUE NOT NULL,
+                name VARCHAR(100),
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                last_login_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS otp_requests (
+                id BIGSERIAL PRIMARY KEY,
+                phone VARCHAR(15) NOT NULL,
+                otp_code VARCHAR(6) NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                is_verified BOOLEAN DEFAULT FALSE,
+                attempts INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_phone
+                ON users (phone);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_otp_phone_expires
+                ON otp_requests (phone, expires_at);
+            """
+        )
