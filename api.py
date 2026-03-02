@@ -536,7 +536,7 @@ class SendOTPRequest(BaseModel):
 
 class VerifyOTPRequest(BaseModel):
     phone: str = Field(..., description="Phone number used to request the OTP")
-    otp: str = Field(..., min_length=6, max_length=6, description="6-digit OTP received on WhatsApp")
+    otp: str = Field(..., min_length=4, max_length=4, description="4-digit OTP received on WhatsApp")
 
 class UpdateNameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="User's display name")

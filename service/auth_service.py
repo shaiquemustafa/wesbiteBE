@@ -20,7 +20,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change-me-to-a-random-secret-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = int(os.getenv("JWT_EXPIRY_DAYS", "30"))
 
-OTP_LENGTH = 6
+OTP_LENGTH = 4
 OTP_EXPIRY_MINUTES = 5
 OTP_MAX_ATTEMPTS = 3
 OTP_COOLDOWN_SECONDS = 60   # min gap between OTP requests for the same number
