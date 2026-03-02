@@ -152,9 +152,27 @@ class WhatsAppService:
         }
 
         try:
+            logger.info("  📤 WATI template request: POST %s", url)
+            logger.info("  📤 WATI template: %s | params: %s", template_name, parameters)
+
             response = requests.post(url, json=payload, headers=self.headers, timeout=15)
+
+            logger.info("  📥 WATI response status: %s", response.status_code)
+            logger.info("  📥 WATI response body: %s", response.text[:500] if response.text else "(empty)")
+
+            if not response.text or not response.text.strip():
+                logger.error("  ❌ WATI returned empty response (status %s) for %s", response.status_code, phone)
+                return False
+
             data = response.json()
-            return data.get("result", False)
+            success = data.get("result", False)
+
+            if success:
+                logger.info("  ✅ Template '%s' sent to %s", template_name, phone)
+            else:
+                logger.warning("  ❌ Template '%s' failed for %s: %s", template_name, phone, data.get("info", "Unknown"))
+
+            return success
         except Exception as e:
             logger.error("  ❌ WhatsApp API error for %s: %s", phone, e)
             return False
