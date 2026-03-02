@@ -21,8 +21,12 @@ class WhatsAppService:
     """Sends WhatsApp messages via WATI API."""
 
     def __init__(self):
-        self.base_url = WATI_BASE_URL
-        self.token = WATI_API_TOKEN
+        self.base_url = WATI_BASE_URL.rstrip("/") if WATI_BASE_URL else ""
+        # Strip "Bearer " prefix if someone pasted the full header value
+        raw_token = (WATI_API_TOKEN or "").strip()
+        if raw_token.lower().startswith("bearer "):
+            raw_token = raw_token[7:].strip()
+        self.token = raw_token
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json-patch+json",
