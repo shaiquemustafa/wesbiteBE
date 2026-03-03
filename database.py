@@ -238,11 +238,11 @@ def _ensure_tables(conn):
                 ON user_watchlist (user_id);
             """
         )
-        # Add receive_all_updates column to users (safe for existing tables)
+        # Add receive_all_updates column to users (default TRUE for new users)
         cur.execute(
             """
             ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS receive_all_updates BOOLEAN DEFAULT FALSE;
+                ADD COLUMN IF NOT EXISTS receive_all_updates BOOLEAN DEFAULT TRUE;
             """
         )
         # Track whether user has completed stock selection onboarding
