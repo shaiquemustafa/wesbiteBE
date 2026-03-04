@@ -22,7 +22,7 @@ MARKET_UPDATE_TEMPLATE = os.getenv("WATI_MARKET_TEMPLATE", "market_update_1")
 
 # RITO website URL (used in notification messages)
 RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "rito.co.in")
-RITO_MANAGE_URL = os.getenv("RITO_MANAGE_URL", "rito.co.in/preferences")
+RITO_MANAGE_URL = os.getenv("RITO_MANAGE_URL", "rito.co.in/#watchlist")
 
 
 class WhatsAppService:

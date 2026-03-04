@@ -91,8 +91,8 @@ async def _scheduled_analysis_loop():
             try:
                 result = await run_analysis_in_background(
                     target_date=None,       # today
-                    market_cap_start=2500,
-                    market_cap_end=25000,
+                    market_cap_start=4000,
+                    market_cap_end=999999,
                     hours=0,                # full day (no time filter)
                     force=False,            # only NEW announcements get processed
                 )
@@ -171,17 +171,17 @@ async def run_analysis_pipeline(
         description="End of time window HH:MM (IST). Use with 'date'. E.g. 17:00",
         pattern=r"^\d{2}:\d{2}(:\d{2})?$",
     ),
-    market_cap_st: int = Query(2500, description="Start of market cap range (Crores)."),
-    market_cap_end: int = Query(25000, description="End of market cap range (Crores)."),
+    market_cap_st: int = Query(4000, description="Start of market cap range (Crores)."),
+    market_cap_end: int = Query(999999, description="End of market cap range (Crores)."),
     hours: int = Query(0, description="Lookback window in hours from now. 0 = full day."),
     force: bool = Query(True, description="Reprocess announcements already in DB."),
     run_now: bool = Query(False, description="Run synchronously and return counts."),
 ):
     target_date = None
     if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
     # Parse optional start_time / end_time into time objects
@@ -308,8 +308,8 @@ def _pipeline_sync(
     # --- Step 1: Fetch & filter announcements ---
     filtered_df, fetch_stats = fetch_and_filter_announcements(
         target_date=the_date,
-        market_cap_start=market_cap_start,
-        market_cap_end=market_cap_end,
+            market_cap_start=market_cap_start,
+            market_cap_end=market_cap_end,
         start_datetime=start_dt,
         end_datetime=end_dt,
         force_reprocess=force,
