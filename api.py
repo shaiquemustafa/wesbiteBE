@@ -179,9 +179,9 @@ async def run_analysis_pipeline(
 ):
     target_date = None
     if date:
-    try:
-        target_date = datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
     # Parse optional start_time / end_time into time objects
