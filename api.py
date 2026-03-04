@@ -710,46 +710,6 @@ def save_watchlist(body: SaveWatchlistRequest, authorization: Optional[str] = He
 # Test – Manual notification trigger (for debugging)
 # =========================================================================
 
-@app.post("/api/admin/seed-users", summary="[ADMIN] One-time bulk seed users")
-def seed_users():
-    """One-time endpoint to bulk-insert users. Remove after use."""
-    users_to_add = [
-        {"name": "Keven Eleven",         "phone": "919158478997"},
-        {"name": "Pradeepkumar Surname", "phone": "918235355360"},
-        {"name": "ASHMEER MALLIK",       "phone": "919971648417"},
-        {"name": "Simar Singh",          "phone": "919999779599"},
-        {"name": "Akshit Bhatnagar",     "phone": "919352897598"},
-        {"name": "Romeo Simte",          "phone": "919362299011"},
-        {"name": "Tunji Ram",            "phone": "917984193437"},
-        {"name": "Pramod Singh",         "phone": "919924712863"},
-        {"name": "Pintu Kumar",          "phone": "917015813460"},
-        {"name": "Amit Kumar Prasad",    "phone": "916299196725"},
-        {"name": "Frederic Maliakkal",   "phone": "919400546822"},
-        {"name": "Vishal Mittal",        "phone": "919882323992"},
-    ]
-
-    results = []
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            for u in users_to_add:
-                cur.execute(
-                    """
-                    INSERT INTO users (phone, name, is_active, receive_all_updates, onboarding_complete, created_at, last_login_at, updated_at)
-                    VALUES (%s, %s, TRUE, TRUE, FALSE, NOW(), NOW(), NOW())
-                    ON CONFLICT (phone) DO UPDATE SET
-                        name = EXCLUDED.name,
-                        receive_all_updates = TRUE,
-                        updated_at = NOW()
-                    RETURNING id, phone, name
-                    """,
-                    (u["phone"], u["name"]),
-                )
-                row = cur.fetchone()
-                results.append({"id": row[0], "phone": row[1], "name": row[2]})
-
-    return {"message": f"{len(results)} users inserted/updated.", "users": results}
-
-
 @app.post("/api/test/send-market-update", summary="[TEST] Send a market update to all users")
 def test_send_market_update():
     """
