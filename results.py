@@ -42,7 +42,7 @@ HEADERS = {
 PROMPT_SCREEN = (
     "You are assessing the incremental price impact of this specific PDF filing.\n"
     "Return ONE tab-separated line only:\n"
-    "Company<TAB>Impact tag<TAB>≤30-word summary<TAB>Price-move range<TAB>≤20-word rationale\n"
+    "Company<TAB>Impact tag<TAB>60–75 word summary<TAB>Price-move range<TAB>≤20-word rationale\n"
     "Impact tag = STRONGLY POSITIVE / POSITIVE / NEUTRAL / NEGATIVE / STRONGLY NEGATIVE / "
     "BEAT / MATCHED / MISSED; use N/A if immaterial.\n"
     "\n"
