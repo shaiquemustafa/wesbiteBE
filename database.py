@@ -298,3 +298,27 @@ def _ensure_tables(conn):
                 ON watchlist_notifications (created_at);
             """
         )
+
+        # User events table (track website visits, etc.)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_events (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+                event_type VARCHAR(50) NOT NULL DEFAULT 'page_visit',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_events_user_id
+                ON user_events (user_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_events_created
+                ON user_events (created_at);
+            """
+        )

@@ -684,6 +684,30 @@ def verify_otp(body: VerifyOTPRequest):
     }
 
 
+@app.post("/api/events/visit", summary="Record a page visit event")
+def record_visit(authorization: Optional[str] = Header(None)):
+    """
+    Records a page visit event for the logged-in user.
+    Called by the frontend each time the website is opened.
+    """
+    decoded = _get_current_user(authorization)
+    user_id = decoded.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Invalid token.")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_events (user_id, event_type) VALUES (%s, 'page_visit')",
+                    (user_id,),
+                )
+    except Exception as e:
+        logger.warning("Failed to record visit event for user %s: %s", user_id, e)
+
+    return {"ok": True}
+
+
 @app.get("/api/auth/me", summary="Get current logged-in user")
 def get_me(authorization: Optional[str] = Header(None)):
     """
