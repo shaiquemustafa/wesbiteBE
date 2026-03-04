@@ -691,19 +691,23 @@ def record_visit(authorization: Optional[str] = Header(None)):
     Called by the frontend each time the website is opened.
     """
     decoded = _get_current_user(authorization)
-    user_id = decoded.get("user_id")
-    if not user_id:
+    phone = decoded.get("phone")
+    if not phone:
         raise HTTPException(status_code=400, detail="Invalid token.")
 
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO user_events (user_id, event_type) VALUES (%s, 'page_visit')",
-                    (user_id,),
-                )
+                # Look up current user_id by phone (JWT user_id can be stale)
+                cur.execute("SELECT id FROM users WHERE phone = %s", (phone,))
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        "INSERT INTO user_events (user_id, event_type) VALUES (%s, 'page_visit')",
+                        (row[0],),
+                    )
     except Exception as e:
-        logger.warning("Failed to record visit event for user %s: %s", user_id, e)
+        logger.warning("Failed to record visit event for %s: %s", phone, e)
 
     return {"ok": True}
 
