@@ -25,7 +25,9 @@ class NotificationService:
 
     def notify_all_users(self, enriched_item: dict) -> dict:
         """
-        Sends a market update notification to users who should receive it:
+        Sends a market update notification using WATI's broadcast API (v2).
+
+        Targets:
         - Users who have this stock in their watchlist
         - Users who have receive_all_updates = TRUE
         - Users who haven't completed onboarding yet (they get everything)
@@ -37,8 +39,6 @@ class NotificationService:
             {"total_users": int, "sent": int, "failed": int}
         """
         company = enriched_item.get("company_name", "Unknown")
-
-        # Try to get scrip code to do targeted notifications
         scrip_cd = enriched_item.get("scrip_cd") or enriched_item.get("SCRIP_CD")
 
         if scrip_cd:
@@ -46,10 +46,8 @@ class NotificationService:
                 scrip_cd = int(scrip_cd)
                 phones = self.watchlist_service.get_users_to_notify(scrip_cd)
             except (ValueError, TypeError):
-                # Fallback: send to all active users
                 phones = self._get_all_active_phones()
         else:
-            # No scrip code available — send to all
             phones = self._get_all_active_phones()
 
         if not phones:
@@ -57,23 +55,15 @@ class NotificationService:
             return {"total_users": 0, "sent": 0, "failed": 0}
 
         logger.info(
-            "  📢 Sending market update for '%s' (scrip=%s) to %d user(s)...",
+            "  📢 Sending market update for '%s' (scrip=%s) to %d user(s) via broadcast API...",
             company, scrip_cd, len(phones),
         )
 
-        sent = 0
-        failed = 0
+        # Use the broadcast (v2) API — single HTTP request for all users
+        result = self.whatsapp.send_market_update_broadcast(phones, enriched_item)
 
-        for phone in phones:
-            try:
-                success = self.whatsapp.send_market_update(phone, enriched_item)
-                if success:
-                    sent += 1
-                else:
-                    failed += 1
-            except Exception as e:
-                logger.error("  ❌ Failed to notify %s: %s", phone, e)
-                failed += 1
+        sent = result.get("sent", 0)
+        failed = result.get("failed", 0)
 
         logger.info(
             "  📢 Notification complete for '%s': %d sent, %d failed out of %d users.",

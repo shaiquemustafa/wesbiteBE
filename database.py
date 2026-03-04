@@ -238,6 +238,21 @@ def _ensure_tables(conn):
                 ON user_watchlist (user_id);
             """
         )
+        # Fast lookup: "which users watch this stock?" — used when news arrives
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_watchlist_scrip
+                ON user_watchlist (bse_scrip_code);
+            """
+        )
+        # Fast lookup: "who wants all updates?" — used when news arrives
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_receive_all
+                ON users (id)
+                WHERE receive_all_updates = TRUE AND is_active = TRUE;
+            """
+        )
         # Add receive_all_updates column to users (default TRUE for new users)
         cur.execute(
             """
