@@ -227,8 +227,8 @@ class AuthService:
                     is_new_user = True
                     cur.execute(
                         """
-                        INSERT INTO users (phone, name, created_at, last_login_at)
-                        VALUES (%s, %s, NOW(), NOW())
+                        INSERT INTO users (phone, name, receive_all_updates, created_at, last_login_at)
+                        VALUES (%s, %s, TRUE, NOW(), NOW())
                         RETURNING id, phone, name, created_at
                         """,
                         (phone, clean_name),

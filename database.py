@@ -260,6 +260,13 @@ def _ensure_tables(conn):
                 ADD COLUMN IF NOT EXISTS receive_all_updates BOOLEAN DEFAULT TRUE;
             """
         )
+        # Ensure the default is TRUE (may have been created with FALSE previously)
+        cur.execute(
+            """
+            ALTER TABLE users
+                ALTER COLUMN receive_all_updates SET DEFAULT TRUE;
+            """
+        )
         # Track whether user has completed stock selection onboarding
         cur.execute(
             """
