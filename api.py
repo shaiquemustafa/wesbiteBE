@@ -51,8 +51,15 @@ def _cleanup_old_records():
                 pred_del = cur.rowcount
                 cur.execute("DELETE FROM ui_data WHERE news_time < %s", (cutoff,))
                 ui_del = cur.rowcount
-        if raw_del or pred_del or ui_del:
-            logger.info("Cleanup (>48h): deleted %s raw, %s predictions, %s ui_data.", raw_del, pred_del, ui_del)
+                cur.execute("DELETE FROM watchlist_notifications WHERE created_at < %s", (cutoff,))
+                wl_del = cur.rowcount
+                cur.execute("DELETE FROM otp_requests WHERE expires_at < NOW() - INTERVAL '1 hour'")
+                otp_del = cur.rowcount
+        if raw_del or pred_del or ui_del or wl_del or otp_del:
+            logger.info(
+                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s expired OTPs.",
+                raw_del, pred_del, ui_del, wl_del, otp_del,
+            )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
 
@@ -327,7 +334,8 @@ def _pipeline_sync(
     total = len(filtered_df)
     total_predictions = 0
     total_ui = 0
-    items_to_notify = []  # Collect enriched items to notify users about
+    items_to_notify = []           # Impactful items → notify all relevant users
+    watchlist_only_items = []      # Low-impact items → notify only watchlist users
 
     logger.info("  [Analyse] Processing %s PDFs one-by-one ...", total)
 
@@ -365,51 +373,108 @@ def _pipeline_sync(
         pred_df["Impact_Score"] = pred_df["Impact"].apply(
             lambda t: _impact_map.get(t.upper(), 0)
         )
-        # Drop NEUTRAL/MATCHED
-        if pred_df.iloc[0]["Impact"] in ("NEUTRAL", "MATCHED"):
-            logger.info("  [%s/%s] %s: filtered out (NEUTRAL/MATCHED).", i, total, newsid)
-            continue
 
-        pred_df["Mid_%"] = 0.0  # placeholder
-        pred_df["Rank"] = 0
-        pred_df["SCRIP_CD"] = pred_df["SCRIP_CD"].astype(str)
+        is_low_impact = pred_df.iloc[0]["Impact"] in ("NEUTRAL", "MATCHED", "N/A")
 
-        try:
-            inserted = announcement_service.create_predictions(
-                pred_df, "predictions", force=force
-            )
-            if inserted:
-                total_predictions += len(inserted)
-                logger.info("  [%s/%s] ✅ Prediction saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
-        except Exception as e:
-            logger.warning("  [%s/%s] Failed to save prediction: %s", i, total, e)
+        if not is_low_impact:
+            # === IMPACTFUL: full enrichment via Indian API + store in ui_data ===
+            pred_df["Mid_%"] = 0.0
+            pred_df["Rank"] = 0
+            pred_df["SCRIP_CD"] = pred_df["SCRIP_CD"].astype(str)
 
-        # 2d) Enrich & store in ui_data
-        try:
-            enriched = enrich_prediction(result)
-            ui_count = ui_service.bulk_store_enriched([enriched])
-            if ui_count:
-                total_ui += ui_count
-                items_to_notify.append(enriched)
-                logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
-        except Exception as e:
-            logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
+            try:
+                inserted = announcement_service.create_predictions(
+                    pred_df, "predictions", force=force
+                )
+                if inserted:
+                    total_predictions += len(inserted)
+                    logger.info("  [%s/%s] ✅ Prediction saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
+            except Exception as e:
+                logger.warning("  [%s/%s] Failed to save prediction: %s", i, total, e)
+
+            # Enrich with Indian API data & store in ui_data (shown on website)
+            try:
+                enriched = enrich_prediction(result)
+                ui_count = ui_service.bulk_store_enriched([enriched])
+                if ui_count:
+                    total_ui += ui_count
+                    items_to_notify.append(enriched)
+                    logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
+            except Exception as e:
+                logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
+        else:
+            # === LOW-IMPACT: NO Indian API, store lightweight, notify watchlist only ===
+            logger.info("  [%s/%s] %s: low-impact (%s) — storing for watchlist notification only.",
+                         i, total, newsid, pred_df.iloc[0]["Impact"])
+
+            lightweight_item = {
+                "scrip_cd": str(result.get("SCRIP_CD", "")),
+                "company_name": result.get("Company", "Unknown"),
+                "impact": result.get("Impact", "N/A"),
+                "category": result.get("Category", "General"),
+                "summary": result.get("Summary", ""),
+                "pdf_link": result.get("PDF_Link", ""),
+                "news_time": result.get("News_submission_dt"),
+            }
+
+            # Store in watchlist_notifications table (cleaned up after 48h)
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO watchlist_notifications
+                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                lightweight_item["scrip_cd"],
+                                lightweight_item["company_name"],
+                                lightweight_item["impact"],
+                                lightweight_item["category"],
+                                lightweight_item["summary"],
+                                lightweight_item["pdf_link"],
+                                lightweight_item["news_time"],
+                            ),
+                        )
+                logger.info("  [%s/%s] ✅ Watchlist notification stored for SCRIP %s.",
+                            i, total, row_dict.get("SCRIP_CD"))
+            except Exception as e:
+                logger.warning("  [%s/%s] Failed to store watchlist notification: %s", i, total, e)
+
+            watchlist_only_items.append(lightweight_item)
 
     # --- Step 3: Send WhatsApp notifications for new items ---
     total_notified = 0
+    notif_service = NotificationService()
+
+    # 3a) Impactful items → notify watchlist users + receive_all_updates users
     if items_to_notify:
         try:
-            notif_service = NotificationService()
             notif_result = notif_service.notify_all_users_bulk(items_to_notify)
-            total_notified = notif_result["total_sent"]
+            total_notified += notif_result["total_sent"]
             logger.info(
-                "  📢 Notifications: %d sent, %d failed for %d items.",
+                "  📢 Notifications (impactful): %d sent, %d failed for %d items.",
                 notif_result["total_sent"],
                 notif_result["total_failed"],
                 notif_result["items_processed"],
             )
         except Exception as e:
-            logger.warning("  ⚠️ Notification sending failed: %s", e)
+            logger.warning("  ⚠️ Notification sending failed (impactful): %s", e)
+
+    # 3b) Low-impact items → notify ONLY users who have the stock in their watchlist
+    if watchlist_only_items:
+        try:
+            watchlist_result = notif_service.notify_watchlist_only_bulk(watchlist_only_items)
+            total_notified += watchlist_result["total_sent"]
+            logger.info(
+                "  📢 Notifications (watchlist-only): %d sent, %d failed for %d items.",
+                watchlist_result["total_sent"],
+                watchlist_result["total_failed"],
+                watchlist_result["items_processed"],
+            )
+        except Exception as e:
+            logger.warning("  ⚠️ Notification sending failed (watchlist-only): %s", e)
 
     # --- Step 4: Summary ---
     summary["analyzed"] = total

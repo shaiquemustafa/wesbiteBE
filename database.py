@@ -274,3 +274,27 @@ def _ensure_tables(conn):
                 ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE;
             """
         )
+
+        # Lightweight table for low-impact watchlist notifications
+        # (N/A, NEUTRAL, MATCHED — no Indian API enrichment, just OpenAI summary)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist_notifications (
+                id BIGSERIAL PRIMARY KEY,
+                scrip_cd VARCHAR(20),
+                company_name VARCHAR(255),
+                impact VARCHAR(50),
+                category VARCHAR(100),
+                summary TEXT,
+                pdf_link TEXT,
+                news_time TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_watchlist_notif_created
+                ON watchlist_notifications (created_at);
+            """
+        )

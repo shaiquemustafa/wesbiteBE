@@ -332,9 +332,9 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
     company, imp_tag, summary, price_range, rationale = [p.strip() for p in parts]
     imp_tag = imp_tag.upper()
 
+    # N/A items are still processed (watchlist users get all announcements)
     if imp_tag == "N/A":
-        logger.info("  [%s/%s] SCRIP %s: N/A (immaterial)", index, total, scrip_cd)
-        return None
+        logger.info("  [%s/%s] SCRIP %s: N/A (immaterial) — kept for watchlist users", index, total, scrip_cd)
 
     # 4) Category (cheap call)
     cat_resp = _call_llm(PROMPT_CATEGORY, text, max_tokens=16, temperature=0.0)

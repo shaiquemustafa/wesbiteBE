@@ -72,6 +72,62 @@ class NotificationService:
 
         return {"total_users": len(phones), "sent": sent, "failed": failed}
 
+    def notify_watchlist_only(self, enriched_item: dict) -> dict:
+        """
+        Sends a market update notification ONLY to users who have the stock
+        in their watchlist. Used for low-impact (N/A, NEUTRAL, MATCHED) items.
+        """
+        company = enriched_item.get("company_name", "Unknown")
+        scrip_cd = enriched_item.get("scrip_cd") or enriched_item.get("SCRIP_CD")
+
+        if not scrip_cd:
+            logger.info("  📭 No scrip_cd for '%s', skipping watchlist-only notification.", company)
+            return {"total_users": 0, "sent": 0, "failed": 0}
+
+        try:
+            scrip_cd = int(scrip_cd)
+            phones = self.watchlist_service.get_watchlist_only_users(scrip_cd)
+        except (ValueError, TypeError):
+            logger.warning("  ⚠️ Invalid scrip_cd '%s' for watchlist-only notification.", scrip_cd)
+            return {"total_users": 0, "sent": 0, "failed": 0}
+
+        if not phones:
+            logger.info("  📭 No watchlist users for '%s' (scrip=%s).", company, scrip_cd)
+            return {"total_users": 0, "sent": 0, "failed": 0}
+
+        logger.info(
+            "  📢 Sending watchlist-only update for '%s' (scrip=%s, impact=%s) to %d user(s)...",
+            company, scrip_cd, enriched_item.get("impact", "?"), len(phones),
+        )
+
+        result = self.whatsapp.send_market_update_broadcast(phones, enriched_item)
+        sent = result.get("sent", 0)
+        failed = result.get("failed", 0)
+
+        logger.info(
+            "  📢 Watchlist-only notification for '%s': %d sent, %d failed.",
+            company, sent, failed,
+        )
+        return {"total_users": len(phones), "sent": sent, "failed": failed}
+
+    def notify_watchlist_only_bulk(self, enriched_items: List[dict]) -> dict:
+        """
+        Sends watchlist-only notifications for multiple low-impact items.
+        """
+        total_sent = 0
+        total_failed = 0
+
+        for item in enriched_items:
+            result = self.notify_watchlist_only(item)
+            total_sent += result["sent"]
+            total_failed += result["failed"]
+
+        return {
+            "items_processed": len(enriched_items),
+            "total_sent": total_sent,
+            "total_failed": total_failed,
+        }
+
     def notify_all_users_bulk(self, enriched_items: List[dict]) -> dict:
         """
         Sends market update notifications for multiple items.

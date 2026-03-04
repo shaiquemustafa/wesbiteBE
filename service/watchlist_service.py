@@ -208,3 +208,27 @@ class WatchlistService:
                     (bse_scrip_code,),
                 )
                 return [row[0] for row in cur.fetchall()]
+
+    @staticmethod
+    def get_watchlist_only_users(bse_scrip_code: int) -> List[str]:
+        """
+        Returns phone numbers of users who have this specific scrip in
+        their watchlist. Used for low-impact (N/A, NEUTRAL, MATCHED)
+        announcements — these are only sent to users who explicitly
+        follow the stock, NOT to receive_all_updates users.
+
+        Only active users are included.
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT u.phone
+                    FROM users u
+                    INNER JOIN user_watchlist w ON w.user_id = u.id
+                    WHERE u.is_active = TRUE
+                      AND w.bse_scrip_code = %s
+                    """,
+                    (bse_scrip_code,),
+                )
+                return [row[0] for row in cur.fetchall()]
