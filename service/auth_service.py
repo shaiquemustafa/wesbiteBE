@@ -119,7 +119,7 @@ class AuthService:
     # ──────────────────────────────────────────────────────────────────
     # Verify OTP  →  issue JWT
     # ──────────────────────────────────────────────────────────────────
-    def verify_otp(self, phone: str, otp_code: str) -> dict:
+    def verify_otp(self, phone: str, otp_code: str, name: str | None = None) -> dict:
         """
         Verifies the OTP.  On success, creates/updates the user row
         and returns a JWT token.
@@ -130,6 +130,8 @@ class AuthService:
             {"success": False, "message": "..."}
         """
         phone = self.normalize_phone(phone)
+        # Sanitize name
+        clean_name = name.strip() if name else None
 
         # ── Fetch the latest unverified OTP for this phone ──
         with get_conn() as conn:
@@ -196,11 +198,17 @@ class AuthService:
                 user_row = cur.fetchone()
 
                 if user_row:
-                    # Existing user — update last_login
-                    cur.execute(
-                        "UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE phone = %s",
-                        (phone,),
-                    )
+                    # Existing user — update last_login (and name if provided)
+                    if clean_name:
+                        cur.execute(
+                            "UPDATE users SET name = %s, last_login_at = NOW(), updated_at = NOW() WHERE phone = %s",
+                            (clean_name, phone),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE phone = %s",
+                            (phone,),
+                        )
                     # Fetch onboarding flag
                     cur.execute(
                         "SELECT COALESCE(onboarding_complete, FALSE) FROM users WHERE phone = %s",
@@ -210,20 +218,20 @@ class AuthService:
                     user = {
                         "id": user_row[0],
                         "phone": user_row[1],
-                        "name": user_row[2],
+                        "name": clean_name or user_row[2],
                         "created_at": user_row[3].isoformat() if user_row[3] else None,
                         "onboarding_complete": ob_row[0] if ob_row else False,
                     }
                 else:
-                    # New user — insert
+                    # New user — insert with name
                     is_new_user = True
                     cur.execute(
                         """
-                        INSERT INTO users (phone, created_at, last_login_at)
-                        VALUES (%s, NOW(), NOW())
+                        INSERT INTO users (phone, name, created_at, last_login_at)
+                        VALUES (%s, %s, NOW(), NOW())
                         RETURNING id, phone, name, created_at
                         """,
-                        (phone,),
+                        (phone, clean_name),
                     )
                     new_row = cur.fetchone()
                     user = {

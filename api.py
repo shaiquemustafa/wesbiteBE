@@ -558,6 +558,7 @@ class SendOTPRequest(BaseModel):
 class VerifyOTPRequest(BaseModel):
     phone: str = Field(..., description="Phone number used to request the OTP")
     otp: str = Field(..., min_length=4, max_length=4, description="4-digit OTP received on WhatsApp")
+    name: Optional[str] = Field(None, max_length=100, description="User's display name (collected at login)")
 
 class UpdateNameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="User's display name")
@@ -606,7 +607,7 @@ def verify_otp(body: VerifyOTPRequest):
     and the user object.  Automatically creates the user on first login.
     """
     auth_service = AuthService()
-    result = auth_service.verify_otp(body.phone, body.otp)
+    result = auth_service.verify_otp(body.phone, body.otp, name=body.name)
 
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
