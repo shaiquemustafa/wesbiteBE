@@ -12,6 +12,7 @@ from announcements import fetch_and_filter_announcements
 from results import _process_single_announcement, _impact_map
 from stock_enrichment import enrich_prediction
 from database import connect_to_db, close_db_connection, get_conn
+from psycopg2.extras import Json
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService
 from service.company_service import CompanyService
@@ -19,7 +20,7 @@ from service.auth_service import AuthService
 from service.notification_service import NotificationService
 from service.watchlist_service import WatchlistService
 from entity.ui_data import UIDataItem
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Fixed IST offset (no tzdata dependency)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -39,6 +40,66 @@ logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
 
 
+def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: CompanyService) -> Tuple[bool, Optional[float]]:
+    """
+    Determines if an item should be included in whatsapp_broadcast table.
+    
+    Rules:
+    1. STRONGLY POSITIVE → all companies (any market cap)
+    2. NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
+    3. FINANCIAL RESULTS category → always include (any impact, any market cap)
+    
+    Returns:
+        (should_include: bool, mkt_cap_cr: float | None)
+    """
+    impact = (enriched_item.get("impact") or "").upper()
+    category = (enriched_item.get("category") or "").upper()
+    scrip_cd = enriched_item.get("scrip_cd")
+    
+    # Rule 3: Always include FINANCIAL RESULTS category
+    if "FINANCIAL RESULTS" in category or "FINANCIAL" in category:
+        # Get market cap for record-keeping
+        mkt_cap = None
+        if scrip_cd:
+            try:
+                scrip_int = int(scrip_cd)
+                caps = company_service.get_market_caps([scrip_int])
+                mkt_cap = caps.get(scrip_int)
+            except (ValueError, TypeError):
+                pass
+        return (True, mkt_cap)
+    
+    # Rule 1: STRONGLY POSITIVE → all companies
+    if "STRONGLY POSITIVE" in impact or impact == "BEAT":
+        # Get market cap for record-keeping
+        mkt_cap = None
+        if scrip_cd:
+            try:
+                scrip_int = int(scrip_cd)
+                caps = company_service.get_market_caps([scrip_int])
+                mkt_cap = caps.get(scrip_int)
+            except (ValueError, TypeError):
+                pass
+        return (True, mkt_cap)
+    
+    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
+    if "NEGATIVE" in impact or impact == "MISSED":
+        if not scrip_cd:
+            return (False, None)
+        try:
+            scrip_int = int(scrip_cd)
+            caps = company_service.get_market_caps([scrip_int])
+            mkt_cap = caps.get(scrip_int)
+            if mkt_cap and mkt_cap > 10000:  # > 10K Cr
+                return (True, mkt_cap)
+        except (ValueError, TypeError):
+            pass
+        return (False, None)
+    
+    # Everything else excluded
+    return (False, None)
+
+
 def _cleanup_old_records():
     """Delete records older than 48 hours from all tables to keep the DB lean."""
     cutoff = _now_ist_naive() - timedelta(hours=48)
@@ -53,12 +114,14 @@ def _cleanup_old_records():
                 ui_del = cur.rowcount
                 cur.execute("DELETE FROM watchlist_notifications WHERE created_at < %s", (cutoff,))
                 wl_del = cur.rowcount
+                cur.execute("DELETE FROM whatsapp_broadcast WHERE created_at < %s", (cutoff,))
+                wb_del = cur.rowcount
                 cur.execute("DELETE FROM otp_requests WHERE expires_at < NOW() - INTERVAL '1 hour'")
                 otp_del = cur.rowcount
-        if raw_del or pred_del or ui_del or wl_del or otp_del:
+        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del:
             logger.info(
-                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s expired OTPs.",
-                raw_del, pred_del, ui_del, wl_del, otp_del,
+                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs.",
+                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del,
             )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
@@ -334,7 +397,7 @@ def _pipeline_sync(
     total = len(filtered_df)
     total_predictions = 0
     total_ui = 0
-    items_to_notify = []           # Impactful items → notify all relevant users
+    items_to_notify = []           # WhatsApp broadcast items (filtered: STRONGLY POSITIVE all, NEGATIVE >10K Cr, FINANCIAL RESULTS)
     watchlist_only_items = []      # Low-impact items → notify only watchlist users
 
     logger.info("  [Analyse] Processing %s PDFs one-by-one ...", total)
@@ -405,8 +468,40 @@ def _pipeline_sync(
                 ui_count = ui_service.bulk_store_enriched([enriched])
                 if ui_count:
                     total_ui += ui_count
-                    items_to_notify.append(enriched)
                     logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
+                
+                # Check if this should go to whatsapp_broadcast (stricter filtering)
+                should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(enriched, company_service)
+                if should_broadcast:
+                    try:
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO whatsapp_broadcast
+                                        (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                    """,
+                                    (
+                                        enriched.get("scrip_cd"),
+                                        enriched.get("company_name", "Unknown"),
+                                        enriched.get("impact"),
+                                        enriched.get("category"),
+                                        enriched.get("summary"),
+                                        enriched.get("pdf_link"),
+                                        enriched.get("news_time"),
+                                        mkt_cap_cr,
+                                        Json(enriched),  # Store full enriched data as JSONB
+                                    ),
+                                )
+                        items_to_notify.append(enriched)  # Add to notification queue
+                        logger.info("  [%s/%s] ✅ WhatsApp broadcast entry saved for SCRIP %s (mkt_cap=%.0f Cr).",
+                                    i, total, row_dict.get("SCRIP_CD"), mkt_cap_cr or 0)
+                    except Exception as e:
+                        logger.warning("  [%s/%s] Failed to save whatsapp_broadcast entry: %s", i, total, e)
+                else:
+                    logger.info("  [%s/%s] ⏭️ SCRIP %s excluded from WhatsApp broadcast (doesn't meet criteria).",
+                                i, total, row_dict.get("SCRIP_CD"))
             except Exception as e:
                 logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
         else:
@@ -455,7 +550,9 @@ def _pipeline_sync(
     total_notified = 0
     notif_service = NotificationService()
 
-    # 3a) Impactful items → notify watchlist users + receive_all_updates users
+    # 3a) WhatsApp broadcast items → notify watchlist users + receive_all_updates users
+    # Note: items_to_notify now only contains entries that passed whatsapp_broadcast filtering
+    # (STRONGLY POSITIVE all, NEGATIVE >10K Cr, or FINANCIAL RESULTS category)
     if items_to_notify:
         try:
             notif_result = notif_service.notify_all_users_bulk(items_to_notify)

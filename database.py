@@ -322,3 +322,133 @@ def _ensure_tables(conn):
                 ON user_events (created_at);
             """
         )
+
+        # WhatsApp broadcast table (filtered bulk messages for all users)
+        # Stores only: STRONGLY POSITIVE (all), NEGATIVE/STRONGLY NEGATIVE (>10K Cr), FINANCIAL RESULTS
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS whatsapp_broadcast (
+                id BIGSERIAL PRIMARY KEY,
+                scrip_cd VARCHAR(20),
+                company_name VARCHAR(255),
+                impact VARCHAR(50),
+                category VARCHAR(100),
+                summary TEXT,
+                pdf_link TEXT,
+                news_time TIMESTAMPTZ,
+                mkt_cap_cr NUMERIC,
+                data JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_whatsapp_broadcast_created
+                ON whatsapp_broadcast (created_at);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_whatsapp_broadcast_scrip
+                ON whatsapp_broadcast (scrip_cd);
+            """
+        )
+
+        # Table metadata/documentation (definitions, rules, cutoffs, functions)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS table_metadata (
+                id BIGSERIAL PRIMARY KEY,
+                table_name VARCHAR(100) UNIQUE NOT NULL,
+                description TEXT NOT NULL,
+                cutoff_rule TEXT,
+                filtering_rules TEXT,
+                purpose TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+        # Insert initial metadata for all tables
+        metadata_records = [
+            (
+                "ui_data",
+                "Stores all impactful market news for display on the website. Contains full enrichment data (prices, analyst consensus, quarterly results).",
+                "48 hours - entries older than 48 hours are automatically deleted.",
+                "Includes: POSITIVE, STRONGLY POSITIVE, NEGATIVE, STRONGLY NEGATIVE, BEAT, MISSED. Excludes: NEUTRAL, MATCHED, N/A.",
+                "Website display - shows all impactful news to users browsing the dashboard.",
+            ),
+            (
+                "watchlist_notifications",
+                "Lightweight table for low-impact announcements sent only to users who follow specific stocks.",
+                "48 hours - entries older than 48 hours are automatically deleted.",
+                "Includes: NEUTRAL, MATCHED, N/A, LIKELY NEUTRAL, and other low-impact variations. No Indian API enrichment.",
+                "WhatsApp notifications for watchlist users - ensures users get ALL announcements for stocks they follow, even if immaterial.",
+            ),
+            (
+                "whatsapp_broadcast",
+                "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
+                "48 hours - entries older than 48 hours are automatically deleted.",
+                "Includes: (1) STRONGLY POSITIVE for all companies, (2) NEGATIVE/STRONGLY NEGATIVE only for companies >10K Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap.",
+                "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
+            ),
+            (
+                "user_events",
+                "Tracks user activity events like page visits, interactions, etc.",
+                "No automatic cleanup - kept for analytics and long-term tracking.",
+                "No filtering - all events are recorded.",
+                "Analytics and user behavior tracking - records when users open the website, interact with features, etc.",
+            ),
+            (
+                "users",
+                "User accounts with authentication, preferences, and profile information.",
+                "No automatic cleanup - permanent user data.",
+                "No filtering - all users are stored.",
+                "User management - stores phone numbers, names, notification preferences (receive_all_updates), onboarding status.",
+            ),
+            (
+                "user_watchlist",
+                "Stocks selected by users for personalized notifications.",
+                "No automatic cleanup - permanent user preferences.",
+                "No filtering - all watchlist selections are stored.",
+                "User preferences - tracks which stocks each user follows (min 3, max 15 stocks per user).",
+            ),
+            (
+                "otp_requests",
+                "Temporary OTP codes for WhatsApp login authentication.",
+                "1 hour - expired OTPs older than 1 hour are automatically deleted.",
+                "No filtering - all OTP requests are stored temporarily.",
+                "Authentication - stores OTP codes with 5-minute expiry for secure login via WhatsApp.",
+            ),
+            (
+                "predictions",
+                "Stored predictions/analysis results from BSE announcements (legacy table).",
+                "48 hours - entries older than 48 hours are automatically deleted.",
+                "Excludes: NEUTRAL, MATCHED, N/A. Only impactful predictions are stored.",
+                "Legacy storage - historical predictions data (may be phased out in favor of ui_data).",
+            ),
+            (
+                "raw_bse_announcements",
+                "Raw announcement data fetched from BSE website before processing.",
+                "48 hours - entries older than 48 hours are automatically deleted.",
+                "No filtering - all fetched announcements are stored temporarily.",
+                "Data pipeline - stores raw BSE data before PDF download and analysis.",
+            ),
+        ]
+
+        for record in metadata_records:
+            cur.execute(
+                """
+                INSERT INTO table_metadata (table_name, description, cutoff_rule, filtering_rules, purpose)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (table_name) DO UPDATE SET
+                    description = EXCLUDED.description,
+                    cutoff_rule = EXCLUDED.cutoff_rule,
+                    filtering_rules = EXCLUDED.filtering_rules,
+                    purpose = EXCLUDED.purpose,
+                    updated_at = NOW()
+                """,
+                record,
+            )
