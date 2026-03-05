@@ -186,9 +186,9 @@ async def run_analysis_pipeline(
 ):
     target_date = None
     if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
     # Parse optional start_time / end_time into time objects
@@ -374,7 +374,14 @@ def _pipeline_sync(
             lambda t: _impact_map.get(t.upper(), 0)
         )
 
-        is_low_impact = pred_df.iloc[0]["Impact"] in ("NEUTRAL", "MATCHED", "N/A")
+        _impact_upper = pred_df.iloc[0]["Impact"].upper()
+        is_low_impact = (
+            _impact_upper in ("NEUTRAL", "MATCHED", "N/A")
+            or "NEUTRAL" in _impact_upper   # catches "LIKELY NEUTRAL", "MOSTLY NEUTRAL", etc.
+            or "MATCHED" in _impact_upper
+            or "N/A" in _impact_upper
+            or "IMMATERIAL" in _impact_upper
+        )
 
         if not is_low_impact:
             # === IMPACTFUL: full enrichment via Indian API + store in ui_data ===
