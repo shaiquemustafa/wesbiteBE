@@ -45,6 +45,17 @@ def _fetch_stock_info(stock_name: str) -> Optional[dict]:
         resp.raise_for_status()
         data = resp.json()
 
+        # Extract market cap from stockDetailsReusableData.marketCap
+        stock_details = data.get("stockDetailsReusableData") or {}
+        mkt_cap = None
+        
+        if isinstance(stock_details, dict):
+            mkt_cap = stock_details.get("marketCap")
+        
+        # Log if we found market cap
+        if mkt_cap:
+            logger.info("  ✅ Found market cap in Indian API for '%s': %s Cr", stock_name, mkt_cap)
+
         # Analyst consensus
         analyst_view = data.get("analystView") or []
         consensus = {}
@@ -56,7 +67,7 @@ def _fetch_stock_info(stock_name: str) -> Optional[dict]:
             except (ValueError, TypeError):
                 consensus[rating] = 0
 
-        return {
+        result = {
             "current_price_bse": (data.get("currentPrice") or {}).get("BSE"),
             "current_price_nse": (data.get("currentPrice") or {}).get("NSE"),
             "percent_change": data.get("percentChange"),
@@ -64,6 +75,16 @@ def _fetch_stock_info(stock_name: str) -> Optional[dict]:
             "year_low": data.get("yearLow"),
             "analyst_consensus": consensus or None,
         }
+        
+        # Add market cap if found
+        if mkt_cap:
+            try:
+                # Convert to float (might be string or number)
+                result["mkt_cap_from_api"] = float(mkt_cap)
+            except (ValueError, TypeError):
+                pass
+        
+        return result
     except Exception as e:
         logger.warning("Indian API /stock failed for '%s': %s", stock_name, e)
         return None
@@ -158,23 +179,79 @@ def enrich_prediction(prediction: dict) -> dict:
 
     scrip_cd = str(prediction.get("SCRIP_CD", ""))
     
-    # Fetch market cap from company_master
+    # ---- Stock info (price + analyst consensus + market cap) ----
+    stock_info = _fetch_stock_info(clean_name)
+    
+    # Market cap priority: 1) Indian API, 2) company_master, 3) BSE API fallback
+    # IMPORTANT: Always ensure market cap is fetched and stored for future use
     mkt_cap_cr = None
-    if scrip_cd:
+    company_service = CompanyService()  # Initialize once for reuse
+    
+    # Priority 1: Check if Indian API returned market cap
+    if stock_info and stock_info.get("mkt_cap_from_api"):
+        mkt_cap_cr = stock_info.get("mkt_cap_from_api")
+        logger.info("  ✅ Using market cap from Indian API: %.2f Cr", mkt_cap_cr)
+        # Store in company_master for future use (even if we got it from Indian API)
+        if scrip_cd:
+            try:
+                scrip_int = int(scrip_cd)
+                company_info = company_service.get_company(scrip_int)
+                comp_name = company_info.get("company_name", "") if company_info else company
+                company_service.upsert_company(
+                    bse_scrip_code=scrip_int,
+                    company_name=comp_name,
+                    mkt_cap_full=mkt_cap_cr,
+                )
+            except Exception as e:
+                logger.debug("  Could not store Indian API market cap in company_master: %s", e)
+    
+    # Priority 2: Fetch from company_master (if Indian API didn't have it)
+    if not mkt_cap_cr and scrip_cd:
         try:
             scrip_int = int(scrip_cd)
-            company_service = CompanyService()
             caps = company_service.get_market_caps([scrip_int])
             mkt_cap_cr = caps.get(scrip_int)
+            if mkt_cap_cr:
+                logger.info("  ✅ Using market cap from company_master: %.2f Cr", mkt_cap_cr)
         except (ValueError, TypeError):
             pass
+    
+    # Priority 3: Fallback to BSE API - fetch and store if missing
+    # This ensures market cap is ALWAYS attempted if we have a scrip code
+    if not mkt_cap_cr and scrip_cd:
+        try:
+            scrip_int = int(scrip_cd)
+            mkt_cap_cr = company_service.fetch_mcap_from_bse_api(scrip_int)
+            if mkt_cap_cr:
+                logger.info("  ✅ Using market cap from BSE API: %.2f Cr", mkt_cap_cr)
+                # Store in company_master for future use (upsert to handle both new and existing companies)
+                try:
+                    # Get company name if available
+                    company_info = company_service.get_company(scrip_int)
+                    comp_name = company_info.get("company_name", "") if company_info else company
+                    company_service.upsert_company(
+                        bse_scrip_code=scrip_int,
+                        company_name=comp_name,
+                        mkt_cap_full=mkt_cap_cr,
+                    )
+                    logger.info("  💾 Stored market cap in company_master for SCRIP %s", scrip_int)
+                except Exception as e:
+                    logger.warning("  ⚠️ Failed to store market cap in company_master: %s", e)
+            else:
+                logger.warning("  ⚠️ BSE API returned no market cap for SCRIP %s", scrip_int)
+        except (ValueError, TypeError) as e:
+            logger.warning("  ⚠️ Invalid scrip_cd '%s' for BSE API fallback: %s", scrip_cd, e)
+    
+    # Final check: if still no market cap, log a warning
+    if not mkt_cap_cr:
+        logger.warning("  ⚠️ Could not fetch market cap for '%s' (SCRIP: %s) from any source", company, scrip_cd)
 
     enriched = {
         # ---- From prediction ----
         "scrip_cd": scrip_cd,
         "company_name": company,
         "nse_symbol": nse_symbol or None,
-        "mkt_cap_cr": mkt_cap_cr,  # Market cap in Crores
+        "mkt_cap_cr": mkt_cap_cr,  # Market cap in Crores (from API, company_master, or BSE API)
         "impact": prediction.get("Impact"),
         "impact_score": prediction.get("Impact_Score"),
         "mid_percentage": prediction.get("Mid_%"),
@@ -187,8 +264,7 @@ def enrich_prediction(prediction: dict) -> dict:
         "news_time": prediction.get("News_submission_dt"),
     }
 
-    # ---- Stock info (price + analyst consensus) ----
-    stock_info = _fetch_stock_info(clean_name)
+    # Add stock info fields
     if stock_info:
         enriched["current_price_bse"] = stock_info.get("current_price_bse")
         enriched["current_price_nse"] = stock_info.get("current_price_nse")
