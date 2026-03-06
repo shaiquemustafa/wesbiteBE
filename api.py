@@ -914,3 +914,133 @@ def test_send_market_update():
         "message": "Test notification triggered.",
         "result": result,
     }
+
+
+# =========================================================================
+# Backfill – Populate whatsapp_broadcast from existing ui_data
+# =========================================================================
+
+@app.post("/api/admin/backfill-whatsapp-broadcast", summary="[ADMIN] Backfill whatsapp_broadcast from existing ui_data")
+def backfill_whatsapp_broadcast():
+    """
+    Backfills the whatsapp_broadcast table from existing ui_data records.
+    Applies the same filtering rules:
+    - STRONGLY POSITIVE: all companies
+    - NEGATIVE/STRONGLY NEGATIVE: only if market cap > 10,000 Cr
+    - FINANCIAL RESULTS: always include
+    
+    Skips records that already exist in whatsapp_broadcast (based on scrip_cd + news_time).
+    """
+    logger.info("🔄 Starting whatsapp_broadcast backfill from ui_data...")
+    
+    company_service = CompanyService()
+    ui_service = UIDataService()
+    
+    # Get all ui_data records (no date filter)
+    try:
+        all_ui_data = ui_service.get_latest_ui_data(target_date=None)
+        logger.info("  📊 Found %d records in ui_data", len(all_ui_data))
+    except Exception as e:
+        logger.error("  ❌ Failed to fetch ui_data: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch ui_data: {e}")
+    
+    if not all_ui_data:
+        return {
+            "message": "No ui_data records found.",
+            "processed": 0,
+            "inserted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+    
+    # Get existing whatsapp_broadcast records to avoid duplicates
+    existing_keys = set()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT scrip_cd, news_time FROM whatsapp_broadcast")
+                for row in cur.fetchall():
+                    scrip_cd, news_time = row
+                    if scrip_cd and news_time:
+                        existing_keys.add((str(scrip_cd), str(news_time)))
+        logger.info("  📋 Found %d existing records in whatsapp_broadcast", len(existing_keys))
+    except Exception as e:
+        logger.warning("  ⚠️ Could not fetch existing records: %s", e)
+    
+    inserted_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    # Process each ui_data record
+    for item in all_ui_data:
+        try:
+            # Check if already exists
+            scrip_cd = item.get("scrip_cd")
+            news_time = item.get("news_time")
+            if scrip_cd and news_time:
+                key = (str(scrip_cd), str(news_time))
+                if key in existing_keys:
+                    skipped_count += 1
+                    continue
+            
+            # Apply filtering logic
+            should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(item, company_service)
+            
+            if not should_broadcast:
+                skipped_count += 1
+                continue
+            
+            # Insert into whatsapp_broadcast (check for duplicates manually since no unique constraint)
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        # Check if already exists
+                        cur.execute(
+                            """
+                            SELECT COUNT(*) FROM whatsapp_broadcast
+                            WHERE scrip_cd = %s AND news_time = %s
+                            """,
+                            (scrip_cd, news_time),
+                        )
+                        if cur.fetchone()[0] > 0:
+                            skipped_count += 1
+                            continue
+                        
+                        # Insert new record
+                        cur.execute(
+                            """
+                            INSERT INTO whatsapp_broadcast
+                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                item.get("scrip_cd"),
+                                item.get("company_name", "Unknown"),
+                                item.get("impact"),
+                                item.get("category"),
+                                item.get("summary"),
+                                item.get("pdf_link"),
+                                news_time,
+                                mkt_cap_cr,
+                                Json(item),
+                            ),
+                        )
+                        inserted_count += 1
+                        if scrip_cd and news_time:
+                            existing_keys.add((str(scrip_cd), str(news_time)))
+            except Exception as e:
+                logger.warning("  ⚠️ Failed to insert record for %s: %s", item.get("company_name"), e)
+                error_count += 1
+        except Exception as e:
+            logger.warning("  ⚠️ Error processing record: %s", e)
+            error_count += 1
+    
+    logger.info("  ✅ Backfill complete: %d inserted, %d skipped, %d errors", inserted_count, skipped_count, error_count)
+    
+    return {
+        "message": f"Backfill complete. {inserted_count} records inserted into whatsapp_broadcast.",
+        "processed": len(all_ui_data),
+        "inserted": inserted_count,
+        "skipped": skipped_count,
+        "errors": error_count,
+    }
