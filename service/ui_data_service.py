@@ -145,7 +145,7 @@ class UIDataService:
             #print(find_query)
         # Find all matching documents, sort them by news_time in descending order.
         # We don't limit to 1 anymore, as "latest" now implies a time window.
-        base_query = "SELECT data FROM ui_data"
+        base_query = "SELECT id, data FROM ui_data"
         if target_date:
             base_query += " WHERE news_time >= %s"
             params.append(start_of_query_window)
@@ -154,14 +154,63 @@ class UIDataService:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(base_query, params)
-                items = [row[0] for row in cur.fetchall()]
+                rows = cur.fetchall()
+                items = [row[1] for row in rows]  # Extract data
+                item_ids = {i: row[0] for i, row in enumerate(rows)}  # Map index to ID
 
         # Normalize and backfill fields for UI consumers
-        for item in items:
+        items_to_update = []  # Track items that need DB update
+        for idx, item in enumerate(items):
             # Backfill 'category' from 'Category' or default if missing
             if 'category' not in item or item.get('category') in (None, ""):
                 if 'Category' in item and item.get('Category') not in (None, ""):
                     item['category'] = item['Category']
                 else:
                     item['category'] = "General Investor Info & Clarifications"
+            
+            # Backfill market cap if missing (on-the-fly fetch)
+            if not item.get('mkt_cap_cr') and item.get('scrip_cd'):
+                try:
+                    from service.company_service import CompanyService
+                    company_service = CompanyService()
+                    scrip_int = int(item['scrip_cd'])
+                    
+                    # Try company_master first
+                    caps = company_service.get_market_caps([scrip_int])
+                    mkt_cap = caps.get(scrip_int)
+                    
+                    # If not found, try BSE API
+                    if not mkt_cap:
+                        mkt_cap = company_service.fetch_mcap_from_bse_api(scrip_int)
+                        if mkt_cap:
+                            # Store in company_master for future use
+                            company_info = company_service.get_company(scrip_int)
+                            comp_name = company_info.get("company_name", "") if company_info else item.get('company_name', '')
+                            company_service.upsert_company(
+                                bse_scrip_code=scrip_int,
+                                company_name=comp_name,
+                                mkt_cap_full=mkt_cap,
+                            )
+                    
+                    if mkt_cap:
+                        item['mkt_cap_cr'] = mkt_cap
+                        # Track for batch update
+                        record_id = item_ids.get(idx)
+                        if record_id:
+                            items_to_update.append((record_id, item))
+                except (ValueError, TypeError, Exception) as e:
+                    # Silently fail - don't break the response if market cap fetch fails
+                    pass
+        
+        # Batch update database records with market cap
+        if items_to_update:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for record_id, item in items_to_update:
+                        cur.execute(
+                            "UPDATE ui_data SET data = %s WHERE id = %s",
+                            (Json(item), record_id)
+                        )
+                    conn.commit()
+        
         return items
