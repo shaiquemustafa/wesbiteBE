@@ -391,7 +391,7 @@ def _ensure_tables(conn):
                 "whatsapp_broadcast",
                 "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: (1) STRONGLY POSITIVE for all companies, (2) NEGATIVE/STRONGLY NEGATIVE only for companies >2,500 Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap.",
+                "Includes: (1) STRONGLY POSITIVE for all companies >2,500 Cr, (2) NEGATIVE/STRONGLY NEGATIVE only for companies >10,000 Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap.",
                 "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
             ),
             (

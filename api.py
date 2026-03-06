@@ -45,8 +45,8 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
     Determines if an item should be included in whatsapp_broadcast table.
     
     Rules:
-    1. STRONGLY POSITIVE → all companies (any market cap)
-    2. NEGATIVE/STRONGLY NEGATIVE → only if market cap > 2,500 Cr
+    1. STRONGLY POSITIVE → all companies (any market cap, but must be >2,500 Cr to be in ui_data)
+    2. NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
     3. FINANCIAL RESULTS category → always include (any impact, any market cap)
     
     Returns:
@@ -82,7 +82,7 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
                 pass
         return (True, mkt_cap)
     
-    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 2,500 Cr
+    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
     if "NEGATIVE" in impact or impact == "MISSED":
         if not scrip_cd:
             return (False, None)
@@ -90,7 +90,7 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
             scrip_int = int(scrip_cd)
             caps = company_service.get_market_caps([scrip_int])
             mkt_cap = caps.get(scrip_int)
-            if mkt_cap and mkt_cap > 2500:  # > 2,500 Cr
+            if mkt_cap and mkt_cap > 10000:  # > 10,000 Cr
                 return (True, mkt_cap)
         except (ValueError, TypeError):
             pass
@@ -249,9 +249,9 @@ async def run_analysis_pipeline(
 ):
     target_date = None
     if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
     # Parse optional start_time / end_time into time objects
