@@ -7,6 +7,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from service.company_service import CompanyService
+
 logger = logging.getLogger("uvicorn.error")
 
 INDIAN_API_KEY = os.getenv("INDIAN_API_KEY", "")
@@ -154,11 +156,25 @@ def enrich_prediction(prediction: dict) -> dict:
 
     nse_symbol = prediction.get("NSE_Symbol") or ""
 
+    scrip_cd = str(prediction.get("SCRIP_CD", ""))
+    
+    # Fetch market cap from company_master
+    mkt_cap_cr = None
+    if scrip_cd:
+        try:
+            scrip_int = int(scrip_cd)
+            company_service = CompanyService()
+            caps = company_service.get_market_caps([scrip_int])
+            mkt_cap_cr = caps.get(scrip_int)
+        except (ValueError, TypeError):
+            pass
+
     enriched = {
         # ---- From prediction ----
-        "scrip_cd": str(prediction.get("SCRIP_CD", "")),
+        "scrip_cd": scrip_cd,
         "company_name": company,
         "nse_symbol": nse_symbol or None,
+        "mkt_cap_cr": mkt_cap_cr,  # Market cap in Crores
         "impact": prediction.get("Impact"),
         "impact_score": prediction.get("Impact_Score"),
         "mid_percentage": prediction.get("Mid_%"),
