@@ -46,7 +46,7 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
     
     Rules:
     1. STRONGLY POSITIVE → all companies (any market cap)
-    2. NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
+    2. NEGATIVE/STRONGLY NEGATIVE → only if market cap > 2,500 Cr
     3. FINANCIAL RESULTS category → always include (any impact, any market cap)
     
     Returns:
@@ -82,7 +82,7 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
                 pass
         return (True, mkt_cap)
     
-    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
+    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 2,500 Cr
     if "NEGATIVE" in impact or impact == "MISSED":
         if not scrip_cd:
             return (False, None)
@@ -90,7 +90,7 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
             scrip_int = int(scrip_cd)
             caps = company_service.get_market_caps([scrip_int])
             mkt_cap = caps.get(scrip_int)
-            if mkt_cap and mkt_cap > 10000:  # > 10K Cr
+            if mkt_cap and mkt_cap > 2500:  # > 2,500 Cr
                 return (True, mkt_cap)
         except (ValueError, TypeError):
             pass
@@ -161,7 +161,7 @@ async def _scheduled_analysis_loop():
             try:
                 result = await run_analysis_in_background(
                     target_date=None,       # today
-                    market_cap_start=4000,
+                    market_cap_start=2500,
                     market_cap_end=999999,
                     hours=0,                # full day (no time filter)
                     force=False,            # only NEW announcements get processed
@@ -241,7 +241,7 @@ async def run_analysis_pipeline(
         description="End of time window HH:MM (IST). Use with 'date'. E.g. 17:00",
         pattern=r"^\d{2}:\d{2}(:\d{2})?$",
     ),
-    market_cap_st: int = Query(4000, description="Start of market cap range (Crores)."),
+    market_cap_st: int = Query(2500, description="Start of market cap range (Crores)."),
     market_cap_end: int = Query(999999, description="End of market cap range (Crores)."),
     hours: int = Query(0, description="Lookback window in hours from now. 0 = full day."),
     force: bool = Query(True, description="Reprocess announcements already in DB."),

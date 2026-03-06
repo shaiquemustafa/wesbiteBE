@@ -375,9 +375,9 @@ def _ensure_tables(conn):
         metadata_records = [
             (
                 "ui_data",
-                "Stores all impactful market news for display on the website. Contains full enrichment data (prices, analyst consensus, quarterly results).",
+                "Stores all impactful market news for display on the website. Contains full enrichment data (prices, analyst consensus, quarterly results). Only companies >2,500 Cr market cap are processed.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: POSITIVE, STRONGLY POSITIVE, NEGATIVE, STRONGLY NEGATIVE, BEAT, MISSED. Excludes: NEUTRAL, MATCHED, N/A.",
+                "Includes: POSITIVE, STRONGLY POSITIVE, NEGATIVE, STRONGLY NEGATIVE, BEAT, MISSED (for companies >2,500 Cr). Excludes: NEUTRAL, MATCHED, N/A, and companies <2,500 Cr.",
                 "Website display - shows all impactful news to users browsing the dashboard.",
             ),
             (
@@ -391,7 +391,7 @@ def _ensure_tables(conn):
                 "whatsapp_broadcast",
                 "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: (1) STRONGLY POSITIVE for all companies, (2) NEGATIVE/STRONGLY NEGATIVE only for companies >10K Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap.",
+                "Includes: (1) STRONGLY POSITIVE for all companies, (2) NEGATIVE/STRONGLY NEGATIVE only for companies >2,500 Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap.",
                 "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
             ),
             (
@@ -424,9 +424,9 @@ def _ensure_tables(conn):
             ),
             (
                 "predictions",
-                "Stored predictions/analysis results from BSE announcements (legacy table).",
+                "Stored predictions/analysis results from BSE announcements (legacy table). Only companies >2,500 Cr market cap are processed.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Excludes: NEUTRAL, MATCHED, N/A. Only impactful predictions are stored.",
+                "Excludes: NEUTRAL, MATCHED, N/A, and companies <2,500 Cr. Only impactful predictions are stored.",
                 "Legacy storage - historical predictions data (may be phased out in favor of ui_data).",
             ),
             (
