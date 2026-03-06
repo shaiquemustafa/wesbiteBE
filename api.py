@@ -56,44 +56,29 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
     category = (enriched_item.get("category") or "").upper()
     scrip_cd = enriched_item.get("scrip_cd")
     
-    # Rule 3: Always include FINANCIAL RESULTS category
-    if "FINANCIAL RESULTS" in category or "FINANCIAL" in category:
-        # Get market cap for record-keeping
-        mkt_cap = None
-        if scrip_cd:
-            try:
-                scrip_int = int(scrip_cd)
-                caps = company_service.get_market_caps([scrip_int])
-                mkt_cap = caps.get(scrip_int)
-            except (ValueError, TypeError):
-                pass
-        return (True, mkt_cap)
-    
-    # Rule 1: STRONGLY POSITIVE → all companies
-    if "STRONGLY POSITIVE" in impact or impact == "BEAT":
-        # Get market cap for record-keeping
-        mkt_cap = None
-        if scrip_cd:
-            try:
-                scrip_int = int(scrip_cd)
-                caps = company_service.get_market_caps([scrip_int])
-                mkt_cap = caps.get(scrip_int)
-            except (ValueError, TypeError):
-                pass
-        return (True, mkt_cap)
-    
-    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
-    if "NEGATIVE" in impact or impact == "MISSED":
-        if not scrip_cd:
-            return (False, None)
+    # Get market cap from enriched_item first (already fetched during enrichment)
+    # Fall back to company_master if not in enriched_item
+    mkt_cap = enriched_item.get("mkt_cap_cr")
+    if mkt_cap is None and scrip_cd:
         try:
             scrip_int = int(scrip_cd)
             caps = company_service.get_market_caps([scrip_int])
             mkt_cap = caps.get(scrip_int)
-            if mkt_cap and mkt_cap > 10000:  # > 10,000 Cr
-                return (True, mkt_cap)
         except (ValueError, TypeError):
             pass
+    
+    # Rule 3: Always include FINANCIAL RESULTS category
+    if "FINANCIAL RESULTS" in category or "FINANCIAL" in category:
+        return (True, mkt_cap)
+    
+    # Rule 1: STRONGLY POSITIVE → all companies
+    if "STRONGLY POSITIVE" in impact or impact == "BEAT":
+        return (True, mkt_cap)
+    
+    # Rule 2: NEGATIVE/STRONGLY NEGATIVE → only if market cap > 10,000 Cr
+    if "NEGATIVE" in impact or impact == "MISSED":
+        if mkt_cap and mkt_cap > 10000:  # > 10,000 Cr
+            return (True, mkt_cap)
         return (False, None)
     
     # Everything else excluded
