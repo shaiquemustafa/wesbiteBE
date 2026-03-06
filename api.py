@@ -920,10 +920,10 @@ def test_send_market_update():
 # Backfill – Populate whatsapp_broadcast from existing ui_data
 # =========================================================================
 
-@app.post("/api/admin/backfill-whatsapp-broadcast", summary="[ADMIN] Backfill whatsapp_broadcast from existing ui_data")
+@app.post("/api/admin/backfill-whatsapp-broadcast", summary="[ADMIN] Backfill whatsapp_broadcast from today's ui_data")
 def backfill_whatsapp_broadcast():
     """
-    Backfills the whatsapp_broadcast table from existing ui_data records.
+    Backfills the whatsapp_broadcast table from today's ui_data records only.
     Applies the same filtering rules:
     - STRONGLY POSITIVE: all companies
     - NEGATIVE/STRONGLY NEGATIVE: only if market cap > 10,000 Cr
@@ -931,15 +931,16 @@ def backfill_whatsapp_broadcast():
     
     Skips records that already exist in whatsapp_broadcast (based on scrip_cd + news_time).
     """
-    logger.info("🔄 Starting whatsapp_broadcast backfill from ui_data...")
+    logger.info("🔄 Starting whatsapp_broadcast backfill from today's ui_data...")
     
     company_service = CompanyService()
     ui_service = UIDataService()
     
-    # Get all ui_data records (no date filter)
+    # Get today's ui_data records only
+    target_date = _now_ist_naive()
     try:
-        all_ui_data = ui_service.get_latest_ui_data(target_date=None)
-        logger.info("  📊 Found %d records in ui_data", len(all_ui_data))
+        all_ui_data = ui_service.get_latest_ui_data(target_date=target_date)
+        logger.info("  📊 Found %d records in ui_data for today (%s)", len(all_ui_data), target_date.strftime('%Y-%m-%d'))
     except Exception as e:
         logger.error("  ❌ Failed to fetch ui_data: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to fetch ui_data: {e}")
