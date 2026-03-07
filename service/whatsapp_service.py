@@ -238,11 +238,29 @@ class WhatsAppService:
             success = data.get("result", False)
 
             if success:
+                # Parse individual receiver responses to get accurate sent/failed counts
+                receivers = data.get("receivers", [])
+                sent_count = 0
+                failed_count = 0
+                
+                for receiver in receivers:
+                    is_valid = receiver.get("isValidWhatsAppNumber", False)
+                    errors = receiver.get("errors", [])
+                    if is_valid and not errors:
+                        sent_count += 1
+                    else:
+                        failed_count += 1
+                        logger.warning(
+                            "  ⚠️ Invalid WhatsApp number: %s (errors: %s)",
+                            receiver.get("waId", "unknown"),
+                            errors if errors else "invalid number"
+                        )
+                
                 logger.info(
-                    "  ✅ Broadcast '%s' accepted by WATI for %d contacts",
-                    broadcast_name, len(phones),
+                    "  ✅ Broadcast '%s' accepted by WATI: %d sent, %d failed out of %d contacts",
+                    broadcast_name, sent_count, failed_count, len(phones),
                 )
-                return {"sent": len(phones), "failed": 0}
+                return {"sent": sent_count, "failed": failed_count}
             else:
                 error_info = data.get("info", "Unknown error")
                 logger.warning("  ❌ Broadcast failed: %s", error_info)

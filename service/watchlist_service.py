@@ -215,28 +215,32 @@ class WatchlistService:
 
         Uses the denormalized users_receive_all_updates table for instant lookup.
         """
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # Get all users who want all updates (instant lookup from denormalized table)
-                cur.execute("SELECT phone FROM users_receive_all_updates")
-                all_updates_phones = [row[0] for row in cur.fetchall()]
-                
-                # Get users who have this stock in their watchlist
-                cur.execute(
-                    """
-                    SELECT DISTINCT u.phone
-                    FROM users u
-                    INNER JOIN user_watchlist w ON w.user_id = u.id
-                    WHERE u.is_active = TRUE
-                      AND w.bse_scrip_code = %s
-                    """,
-                    (bse_scrip_code,),
-                )
-                watchlist_phones = [row[0] for row in cur.fetchall()]
-                
-                # Combine and deduplicate
-                all_phones = list(set(all_updates_phones + watchlist_phones))
-                return all_phones
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # Get all users who want all updates (instant lookup from denormalized table)
+                    cur.execute("SELECT phone FROM users_receive_all_updates")
+                    all_updates_phones = [row[0] for row in cur.fetchall()]
+                    
+                    # Get users who have this stock in their watchlist
+                    cur.execute(
+                        """
+                        SELECT DISTINCT u.phone
+                        FROM users u
+                        INNER JOIN user_watchlist w ON w.user_id = u.id
+                        WHERE u.is_active = TRUE
+                          AND w.bse_scrip_code = %s
+                        """,
+                        (bse_scrip_code,),
+                    )
+                    watchlist_phones = [row[0] for row in cur.fetchall()]
+                    
+                    # Combine and deduplicate
+                    all_phones = list(set(all_updates_phones + watchlist_phones))
+                    return all_phones
+        except Exception as e:
+            logger.error("Error in get_users_to_notify for scrip %s: %s", bse_scrip_code, e)
+            return []
 
     @staticmethod
     def get_watchlist_only_users(bse_scrip_code: int) -> List[str]:

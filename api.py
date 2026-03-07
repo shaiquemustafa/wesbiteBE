@@ -1262,3 +1262,105 @@ def send_pending_broadcasts():
         "sent": total_sent,
         "failed": total_failed,
     }
+
+
+@app.post("/api/admin/send-last-broadcast", summary="[ADMIN] Manually send the last entry from whatsapp_broadcast")
+def send_last_broadcast():
+    """
+    Gets the most recent entry from whatsapp_broadcast and sends notifications
+    to all eligible users. This will resend even if sent_at is already set.
+    
+    Returns:
+        {"message": str, "entry": dict, "sent": int, "failed": int}
+    """
+    logger.info("🔄 Starting send-last-broadcast...")
+    
+    # Get the last entry from whatsapp_broadcast
+    last_entry = None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                       news_time, mkt_cap_cr, data, created_at
+                FROM whatsapp_broadcast
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            
+            if not row:
+                logger.info("  ✅ No entries found in whatsapp_broadcast")
+                return {
+                    "message": "No entries found in whatsapp_broadcast",
+                    "entry": None,
+                    "sent": 0,
+                    "failed": 0,
+                }
+            
+            last_entry = {
+                "id": row[0],
+                "scrip_cd": str(row[1]) if row[1] else None,
+                "company_name": row[2],
+                "impact": row[3],
+                "category": row[4],
+                "summary": row[5],
+                "pdf_link": row[6],
+                "news_time": row[7],
+                "mkt_cap_cr": float(row[8]) if row[8] else None,
+                "created_at": row[10].isoformat() if row[10] else None,
+            }
+            
+            # Merge data from JSONB if available
+            if row[9]:
+                data_dict = row[9] if isinstance(row[9], dict) else {}
+                last_entry.update(data_dict)
+    
+    logger.info("  📋 Found last entry: %s (ID: %s, created: %s)", 
+                last_entry.get("company_name"), last_entry.get("id"), last_entry.get("created_at"))
+    
+    # Send notifications
+    notif_service = NotificationService()
+    try:
+        result = notif_service.notify_all_users(last_entry)
+        sent = result.get("sent", 0)
+        failed = result.get("failed", 0)
+        
+        # Mark as sent (update sent_at even if it was already set)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE whatsapp_broadcast
+                    SET sent_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (last_entry["id"],),
+                )
+        
+        logger.info("  ✅ Send-last-broadcast complete: %d sent, %d failed", sent, failed)
+        
+        return {
+            "message": f"Sent notification for '{last_entry.get('company_name')}': {sent} sent, {failed} failed",
+            "entry": {
+                "id": last_entry.get("id"),
+                "company_name": last_entry.get("company_name"),
+                "scrip_cd": last_entry.get("scrip_cd"),
+                "impact": last_entry.get("impact"),
+                "created_at": last_entry.get("created_at"),
+            },
+            "sent": sent,
+            "failed": failed,
+        }
+    except Exception as e:
+        logger.error("  ❌ Failed to send notification: %s", e)
+        return {
+            "message": f"Failed to send notification: {str(e)}",
+            "entry": {
+                "id": last_entry.get("id"),
+                "company_name": last_entry.get("company_name"),
+            },
+            "sent": 0,
+            "failed": 0,
+        }
