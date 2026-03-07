@@ -40,6 +40,23 @@ logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
 
 
+def _make_json_serializable(obj):
+    """
+    Recursively convert pandas Timestamp and datetime objects to ISO format strings
+    for JSON serialization.
+    """
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_make_json_serializable(item) for item in obj]
+    else:
+        return obj
+
+
 def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: CompanyService) -> Tuple[bool, Optional[float]]:
     """
     Determines if an item should be included in whatsapp_broadcast table.
@@ -477,7 +494,7 @@ def _pipeline_sync(
                                         enriched.get("pdf_link"),
                                         enriched.get("news_time"),
                                         mkt_cap_cr,
-                                        Json(enriched),  # Store full enriched data as JSONB
+                                        Json(_make_json_serializable(enriched)),  # Store full enriched data as JSONB (convert Timestamps to strings)
                                     ),
                                 )
                         items_to_notify.append(enriched)  # Add to notification queue
@@ -1023,7 +1040,7 @@ def backfill_whatsapp_broadcast():
                                 item.get("pdf_link"),
                                 news_time,
                                 mkt_cap_cr,
-                                Json(item),
+                                Json(_make_json_serializable(item)),  # Convert Timestamps to strings
                             ),
                         )
                         inserted_count += 1
