@@ -381,13 +381,8 @@ def _ensure_tables(conn):
                 ON whatsapp_broadcast (scrip_cd);
             """
         )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_whatsapp_broadcast_sent
-                ON whatsapp_broadcast (sent_at) WHERE sent_at IS NULL;
-            """
-        )
         # Add sent_at column if it doesn't exist (migration for existing tables)
+        # MUST be done before creating index on sent_at
         cur.execute("""
             DO $$ 
             BEGIN
@@ -400,6 +395,13 @@ def _ensure_tables(conn):
                 END IF;
             END $$;
         """)
+        # Create index on sent_at AFTER ensuring the column exists
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_whatsapp_broadcast_sent
+                ON whatsapp_broadcast (sent_at) WHERE sent_at IS NULL;
+            """
+        )
 
         # Table metadata/documentation (definitions, rules, cutoffs, functions)
         cur.execute(
