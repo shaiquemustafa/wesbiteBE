@@ -141,6 +141,13 @@ class WatchlistService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Get user's phone number first (needed for sync table)
+                cur.execute("SELECT phone FROM users WHERE id = %s", (user_id,))
+                user_row = cur.fetchone()
+                if not user_row:
+                    return {"success": False, "message": "User not found"}
+                phone = user_row[0]
+                
                 # Update user preferences
                 cur.execute(
                     """
@@ -152,6 +159,25 @@ class WatchlistService:
                     """,
                     (receive_all_updates, user_id),
                 )
+
+                # Sync users_receive_all_updates table
+                if receive_all_updates:
+                    # Add to the denormalized table
+                    cur.execute(
+                        """
+                        INSERT INTO users_receive_all_updates (phone, user_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (phone) DO UPDATE 
+                        SET updated_at = NOW()
+                        """,
+                        (phone, user_id),
+                    )
+                else:
+                    # Remove from the denormalized table
+                    cur.execute(
+                        "DELETE FROM users_receive_all_updates WHERE user_id = %s",
+                        (user_id,),
+                    )
 
                 # Delete old watchlist
                 cur.execute(
@@ -185,29 +211,32 @@ class WatchlistService:
         Returns phone numbers of users who should receive a notification
         for the given scrip code. This includes:
         1. Users who have this scrip in their watchlist
-        2. Users who have receive_all_updates = TRUE
+        2. Users who have receive_all_updates = TRUE (from denormalized table)
 
-        Only active users are included.
+        Uses the denormalized users_receive_all_updates table for instant lookup.
         """
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Get all users who want all updates (instant lookup from denormalized table)
+                cur.execute("SELECT phone FROM users_receive_all_updates")
+                all_updates_phones = [row[0] for row in cur.fetchall()]
+                
+                # Get users who have this stock in their watchlist
                 cur.execute(
                     """
                     SELECT DISTINCT u.phone
                     FROM users u
+                    INNER JOIN user_watchlist w ON w.user_id = u.id
                     WHERE u.is_active = TRUE
-                      AND (
-                          u.receive_all_updates = TRUE
-                          OR u.id IN (
-                              SELECT w.user_id
-                              FROM user_watchlist w
-                              WHERE w.bse_scrip_code = %s
-                          )
-                      )
+                      AND w.bse_scrip_code = %s
                     """,
                     (bse_scrip_code,),
                 )
-                return [row[0] for row in cur.fetchall()]
+                watchlist_phones = [row[0] for row in cur.fetchall()]
+                
+                # Combine and deduplicate
+                all_phones = list(set(all_updates_phones + watchlist_phones))
+                return all_phones
 
     @staticmethod
     def get_watchlist_only_users(bse_scrip_code: int) -> List[str]:

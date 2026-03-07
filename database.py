@@ -245,12 +245,38 @@ def _ensure_tables(conn):
                 ON user_watchlist (bse_scrip_code);
             """
         )
-        # Fast lookup: "who wants all updates?" — used when news arrives
+        
+        # ── Denormalized table for users who want all updates ───────────────────
+        # This table provides instant lookup without scanning the entire users table
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_users_receive_all
-                ON users (id)
-                WHERE receive_all_updates = TRUE AND is_active = TRUE;
+            CREATE TABLE IF NOT EXISTS users_receive_all_updates (
+                phone VARCHAR(20) PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_receive_all_phone
+                ON users_receive_all_updates (phone);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_receive_all_user_id
+                ON users_receive_all_updates (user_id);
+            """
+        )
+        
+        # Populate the table with existing users who have receive_all_updates = TRUE
+        cur.execute(
+            """
+            INSERT INTO users_receive_all_updates (phone, user_id)
+            SELECT phone, id FROM users 
+            WHERE is_active = TRUE AND receive_all_updates = TRUE
+            ON CONFLICT (phone) DO NOTHING;
             """
         )
         # Add receive_all_updates column to users (default TRUE for new users)
@@ -338,7 +364,8 @@ def _ensure_tables(conn):
                 news_time TIMESTAMPTZ,
                 mkt_cap_cr NUMERIC,
                 data JSONB,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                sent_at TIMESTAMPTZ
             );
             """
         )
@@ -354,6 +381,25 @@ def _ensure_tables(conn):
                 ON whatsapp_broadcast (scrip_cd);
             """
         )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_whatsapp_broadcast_sent
+                ON whatsapp_broadcast (sent_at) WHERE sent_at IS NULL;
+            """
+        )
+        # Add sent_at column if it doesn't exist (migration for existing tables)
+        cur.execute("""
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'whatsapp_broadcast' 
+                    AND column_name = 'sent_at'
+                ) THEN
+                    ALTER TABLE whatsapp_broadcast ADD COLUMN sent_at TIMESTAMPTZ;
+                END IF;
+            END $$;
+        """)
 
         # Table metadata/documentation (definitions, rules, cutoffs, functions)
         cur.execute(

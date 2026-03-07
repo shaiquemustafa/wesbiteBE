@@ -40,6 +40,85 @@ logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
 
 
+async def _send_pending_broadcasts():
+    """
+    Automatically sends notifications for entries in whatsapp_broadcast
+    that haven't been sent yet (sent_at IS NULL).
+    This runs as a background job to catch any missed notifications.
+    """
+    try:
+        # Get all unsent entries from the last hour (to avoid sending very old entries)
+        unsent_entries = []
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                           news_time, mkt_cap_cr, data
+                    FROM whatsapp_broadcast
+                    WHERE sent_at IS NULL
+                      AND created_at > NOW() - INTERVAL '1 hour'
+                    ORDER BY created_at DESC
+                    LIMIT 50
+                    """
+                )
+                rows = cur.fetchall()
+                
+                for row in rows:
+                    entry = {
+                        "id": row[0],
+                        "scrip_cd": str(row[1]) if row[1] else None,
+                        "company_name": row[2],
+                        "impact": row[3],
+                        "category": row[4],
+                        "summary": row[5],
+                        "pdf_link": row[6],
+                        "news_time": row[7],
+                        "mkt_cap_cr": float(row[8]) if row[8] else None,
+                    }
+                    
+                    # Merge data from JSONB if available
+                    if row[9]:
+                        data_dict = row[9] if isinstance(row[9], dict) else {}
+                        entry.update(data_dict)
+                    
+                    unsent_entries.append(entry)
+        
+        if not unsent_entries:
+            return
+        
+        logger.info("  🔄 Found %d unsent entries in whatsapp_broadcast, sending notifications...", len(unsent_entries))
+        
+        # Send notifications
+        notif_service = NotificationService()
+        sent_count = 0
+        
+        for entry in unsent_entries:
+            try:
+                result = notif_service.notify_all_users(entry)
+                if result["sent"] > 0:
+                    sent_count += 1
+                    # Mark as sent
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE whatsapp_broadcast
+                                SET sent_at = NOW()
+                                WHERE id = %s
+                                """,
+                                (entry["id"],),
+                            )
+                    logger.info("  ✅ Sent notification for %s (entry ID: %s)", entry.get("company_name"), entry["id"])
+            except Exception as e:
+                logger.warning("  ⚠️ Failed to send notification for entry %s: %s", entry.get("id"), e)
+        
+        if sent_count > 0:
+            logger.info("  ✅ Sent %d pending notifications", sent_count)
+    except Exception as e:
+        logger.error("  ❌ Error in _send_pending_broadcasts: %s", e)
+
+
 def _make_json_serializable(obj):
     """
     Recursively convert pandas Timestamp and datetime objects to ISO format strings
@@ -180,6 +259,12 @@ async def _scheduled_analysis_loop():
                 logger.info("-" * 60)
             except Exception as e:
                 logger.error("❌ RUN #%s FAILED: %s", _run_counter, e)
+        
+        # Send any pending notifications that were missed
+        try:
+            await _send_pending_broadcasts()
+        except Exception as e:
+            logger.error("❌ Failed to send pending broadcasts: %s", e)
 
         await asyncio.sleep(interval)
 
@@ -566,6 +651,27 @@ def _pipeline_sync(
                 notif_result["total_failed"],
                 notif_result["items_processed"],
             )
+            
+            # Mark entries as sent in whatsapp_broadcast table
+            if notif_result["total_sent"] > 0:
+                try:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            for item in items_to_notify:
+                                scrip_cd = item.get("scrip_cd")
+                                news_time = item.get("news_time")
+                                if scrip_cd and news_time:
+                                    cur.execute(
+                                        """
+                                        UPDATE whatsapp_broadcast
+                                        SET sent_at = NOW()
+                                        WHERE scrip_cd = %s AND news_time = %s AND sent_at IS NULL
+                                        """,
+                                        (scrip_cd, news_time),
+                                    )
+                    logger.info("  ✅ Marked %d entries as sent in whatsapp_broadcast", len(items_to_notify))
+                except Exception as e:
+                    logger.warning("  ⚠️ Failed to mark entries as sent: %s", e)
         except Exception as e:
             logger.warning("  ⚠️ Notification sending failed (impactful): %s", e)
 
@@ -1061,4 +1167,98 @@ def backfill_whatsapp_broadcast():
         "inserted": inserted_count,
         "skipped": skipped_count,
         "errors": error_count,
+    }
+
+
+@app.post("/api/admin/send-pending-broadcasts", summary="[ADMIN] Send notifications for unsent whatsapp_broadcast entries")
+def send_pending_broadcasts():
+    """
+    Sends WhatsApp notifications for entries in whatsapp_broadcast that haven't been sent yet
+    (where sent_at IS NULL). This is useful if notifications failed during the pipeline run.
+    
+    Returns:
+        {"message": str, "processed": int, "sent": int, "failed": int}
+    """
+    logger.info("🔄 Starting send-pending-broadcasts...")
+    
+    # Get all unsent entries from whatsapp_broadcast
+    unsent_entries = []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                       news_time, mkt_cap_cr, data
+                FROM whatsapp_broadcast
+                WHERE sent_at IS NULL
+                ORDER BY created_at DESC
+                """
+            )
+            rows = cur.fetchall()
+            
+            for row in rows:
+                entry = {
+                    "id": row[0],
+                    "scrip_cd": str(row[1]) if row[1] else None,
+                    "company_name": row[2],
+                    "impact": row[3],
+                    "category": row[4],
+                    "summary": row[5],
+                    "pdf_link": row[6],
+                    "news_time": row[7],
+                    "mkt_cap_cr": float(row[8]) if row[8] else None,
+                }
+                
+                # Merge data from JSONB if available
+                if row[9]:
+                    data_dict = row[9] if isinstance(row[9], dict) else {}
+                    entry.update(data_dict)
+                
+                unsent_entries.append(entry)
+    
+    if not unsent_entries:
+        logger.info("  ✅ No unsent entries found in whatsapp_broadcast")
+        return {
+            "message": "No unsent entries found in whatsapp_broadcast",
+            "processed": 0,
+            "sent": 0,
+            "failed": 0,
+        }
+    
+    logger.info("  📋 Found %d unsent entries in whatsapp_broadcast", len(unsent_entries))
+    
+    # Send notifications
+    notif_service = NotificationService()
+    total_sent = 0
+    total_failed = 0
+    
+    for entry in unsent_entries:
+        try:
+            result = notif_service.notify_all_users(entry)
+            if result["sent"] > 0:
+                total_sent += result["sent"]
+                # Mark as sent
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE whatsapp_broadcast
+                            SET sent_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (entry["id"],),
+                        )
+            else:
+                total_failed += 1
+        except Exception as e:
+            logger.warning("  ⚠️ Failed to send notification for entry %s: %s", entry.get("id"), e)
+            total_failed += 1
+    
+    logger.info("  ✅ Send-pending-broadcasts complete: %d sent, %d failed", total_sent, total_failed)
+    
+    return {
+        "message": f"Processed {len(unsent_entries)} entries. {total_sent} notifications sent, {total_failed} failed.",
+        "processed": len(unsent_entries),
+        "sent": total_sent,
+        "failed": total_failed,
     }

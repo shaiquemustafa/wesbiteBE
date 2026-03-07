@@ -234,8 +234,20 @@ class AuthService:
                         (phone, clean_name),
                     )
                     new_row = cur.fetchone()
+                    user_id = new_row[0]
+                    
+                    # Add to users_receive_all_updates table (new users default to receive_all_updates = TRUE)
+                    cur.execute(
+                        """
+                        INSERT INTO users_receive_all_updates (phone, user_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (phone) DO NOTHING
+                        """,
+                        (phone, user_id),
+                    )
+                    
                     user = {
-                        "id": new_row[0],
+                        "id": user_id,
                         "phone": new_row[1],
                         "name": new_row[2],
                         "created_at": new_row[3].isoformat() if new_row[3] else None,
