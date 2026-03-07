@@ -19,6 +19,7 @@ from service.company_service import CompanyService
 from service.auth_service import AuthService
 from service.notification_service import NotificationService
 from service.watchlist_service import WatchlistService
+from service.whatsapp_service import WhatsAppService
 from entity.ui_data import UIDataItem
 from typing import List, Optional, Tuple
 
@@ -1361,6 +1362,106 @@ def send_last_broadcast():
                 "id": last_entry.get("id"),
                 "company_name": last_entry.get("company_name"),
             },
+            "sent": 0,
+            "failed": 0,
+        }
+
+
+class SendToPhonesRequest(BaseModel):
+    """Request model for sending broadcast to specific phone numbers."""
+    phones: List[str] = Field(..., description="List of phone numbers (with country code, no '+')")
+
+
+@app.post("/api/admin/send-last-broadcast-to-phones", summary="[ADMIN] Send last broadcast entry to specific phone numbers")
+def send_last_broadcast_to_phones(request: SendToPhonesRequest):
+    """
+    Gets the most recent entry from whatsapp_broadcast and sends notifications
+    to the specified phone numbers. Useful for testing.
+    
+    Args:
+        request: JSON body with "phones" array of phone numbers
+        
+    Returns:
+        {"message": str, "entry": dict, "sent": int, "failed": int}
+    """
+    logger.info("🔄 Starting send-last-broadcast-to-phones for %d phone(s)...", len(request.phones))
+    
+    # Get the last entry from whatsapp_broadcast
+    last_entry = None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                       news_time, mkt_cap_cr, data, created_at
+                FROM whatsapp_broadcast
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            
+            if not row:
+                logger.info("  ✅ No entries found in whatsapp_broadcast")
+                return {
+                    "message": "No entries found in whatsapp_broadcast",
+                    "entry": None,
+                    "sent": 0,
+                    "failed": 0,
+                }
+            
+            last_entry = {
+                "id": row[0],
+                "scrip_cd": str(row[1]) if row[1] else None,
+                "company_name": row[2],
+                "impact": row[3],
+                "category": row[4],
+                "summary": row[5],
+                "pdf_link": row[6],
+                "news_time": row[7],
+                "mkt_cap_cr": float(row[8]) if row[8] else None,
+                "created_at": row[10].isoformat() if row[10] else None,
+            }
+            
+            # Merge data from JSONB if available
+            if row[9]:
+                data_dict = row[9] if isinstance(row[9], dict) else {}
+                last_entry.update(data_dict)
+    
+    logger.info("  📋 Found last entry: %s (ID: %s, created: %s)", 
+                last_entry.get("company_name"), last_entry.get("id"), last_entry.get("created_at"))
+    
+    # Send notifications to specified phones using WhatsApp service directly
+    whatsapp_service = WhatsAppService()
+    try:
+        result = whatsapp_service.send_market_update_broadcast(request.phones, last_entry)
+        sent = result.get("sent", 0)
+        failed = result.get("failed", 0)
+        
+        logger.info("  ✅ Send-last-broadcast-to-phones complete: %d sent, %d failed", sent, failed)
+        
+        return {
+            "message": f"Sent notification for '{last_entry.get('company_name')}' to {len(request.phones)} phone(s): {sent} sent, {failed} failed",
+            "entry": {
+                "id": last_entry.get("id"),
+                "company_name": last_entry.get("company_name"),
+                "scrip_cd": last_entry.get("scrip_cd"),
+                "impact": last_entry.get("impact"),
+                "created_at": last_entry.get("created_at"),
+            },
+            "phones_requested": len(request.phones),
+            "sent": sent,
+            "failed": failed,
+        }
+    except Exception as e:
+        logger.error("  ❌ Failed to send notification: %s", e)
+        return {
+            "message": f"Failed to send notification: {str(e)}",
+            "entry": {
+                "id": last_entry.get("id"),
+                "company_name": last_entry.get("company_name"),
+            },
+            "phones_requested": len(request.phones),
             "sent": 0,
             "failed": 0,
         }
