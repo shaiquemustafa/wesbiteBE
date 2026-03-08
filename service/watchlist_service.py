@@ -6,7 +6,7 @@ from database import get_conn
 
 logger = logging.getLogger("uvicorn.error")
 
-MIN_WATCHLIST = 3
+MIN_WATCHLIST = 4
 MAX_WATCHLIST = 15
 
 
