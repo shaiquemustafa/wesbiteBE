@@ -158,30 +158,30 @@ class WhatsAppService:
         # Parameter 1: Just "user" (not personalized)
         param1 = "user"
         
-        # Parameter 2: Company name with context (with punctuation for better readability)
+        # Parameter 2: Company name with context (with emoji for visual appeal)
         if is_watchlist:
-            param2 = f"Your watchlist; {company_name}"
+            param2 = f"Your watchlist; 📊 {company_name}"
         else:
-            param2 = f"High-impact; {company_name}"
+            param2 = f"High-impact; 📊 {company_name}"
         
-        # Parameter 3: Category and impact combined with "and" (better formatting)
+        # Parameter 3: Category and impact with color-coded emojis
         category = item.get("category", "General")
         impact_raw = (item.get("impact") or "UNKNOWN").upper()
         
-        # Format impact for display
+        # Format impact with color-coded emojis (like WATI had)
         impact_emoji_map = {
-            "POSITIVE": "Positive",
-            "STRONGLY POSITIVE": "Strongly Positive",
-            "BEAT": "Beat",
-            "NEGATIVE": "Negative",
-            "STRONGLY NEGATIVE": "Strongly Negative",
-            "MISSED": "Missed",
-            "NEUTRAL": "Neutral",
+            "POSITIVE": "🟢 Positive",
+            "STRONGLY POSITIVE": "🟢 Strongly Positive",
+            "BEAT": "🟢 Beat",
+            "NEGATIVE": "🔴 Negative",
+            "STRONGLY NEGATIVE": "🔴 Strongly Negative",
+            "MISSED": "🔴 Missed",
+            "NEUTRAL": "⚪ Neutral",
         }
-        impact_display = impact_emoji_map.get(impact_raw, impact_raw)
+        impact_display = impact_emoji_map.get(impact_raw, f"⚪ {impact_raw}")
         
-        # Combine category and impact with "and" for better readability
-        param3 = f"{category} and {impact_display}"
+        # Combine category and impact with emoji for better visual impact
+        param3 = f"{category} {impact_display}"
         
         # Parameter 4: Summary
         param4 = item.get("summary", "No details available.")
