@@ -158,11 +158,11 @@ class WhatsAppService:
         # Parameter 1: Just "user" (not personalized)
         param1 = "user"
         
-        # Parameter 2: Company name with context (with emoji for visual appeal)
+        # Parameter 2: Company name with context (with emoji and bold formatting for visual appeal)
         if is_watchlist:
-            param2 = f"Your watchlist; 📊 {company_name}"
+            param2 = f"Your watchlist; 📊 *{company_name}*"
         else:
-            param2 = f"High-impact; 📊 {company_name}"
+            param2 = f"*High-impact*; 📊 *{company_name}*"
         
         # Parameter 3: Category and impact with color-coded emojis
         category = item.get("category", "General")
