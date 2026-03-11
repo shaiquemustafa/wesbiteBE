@@ -59,8 +59,8 @@ class NotificationService:
             company, scrip_cd, len(phones),
         )
 
-        # Use the broadcast (v2) API — single HTTP request for all users
-        result = self.whatsapp.send_market_update_broadcast(phones, enriched_item)
+        # Use the broadcast API — sends to all users (regular broadcast, not watchlist-only)
+        result = self.whatsapp.send_market_update_broadcast(phones, enriched_item, is_watchlist=False)
 
         sent = result.get("sent", 0)
         failed = result.get("failed", 0)
@@ -100,7 +100,7 @@ class NotificationService:
             company, scrip_cd, enriched_item.get("impact", "?"), len(phones),
         )
 
-        result = self.whatsapp.send_market_update_broadcast(phones, enriched_item)
+        result = self.whatsapp.send_market_update_broadcast(phones, enriched_item, is_watchlist=True)
         sent = result.get("sent", 0)
         failed = result.get("failed", 0)
 

@@ -20,8 +20,8 @@ GUPSHUP_APP_NAME = "RITI01"  # Your app name
 OTP_TEMPLATE_ID = "0c9997c6-a0da-4294-b215-62b75e7fab61"
 OTP_TEMPLATE_NAME = "auth_user_1"
 
-# Template for market update notifications
-MARKET_UPDATE_TEMPLATE = os.getenv("GUPSHUP_MARKET_TEMPLATE", "market_update_1")
+# Template for market update notifications (WhatsApp broadcast)
+MARKET_UPDATE_TEMPLATE_ID = "109c6887-f03c-4617-a4d3-efd0c8c59ddf"
 
 # RITO website URL (used in notification messages)
 RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "rito.co.in")
@@ -141,24 +141,52 @@ class WhatsAppService:
             logger.error("  ❌ Failed to update contact attributes for %s: %s", phone, e)
             return False
 
-    def _build_market_update_params(self, item: dict) -> list:
+    def _build_market_update_params(self, item: dict, is_watchlist: bool = False) -> list:
         """
         Builds the template parameters list for a market update item.
-        Returns list of {"name": ..., "value": ...} dicts.
+        Returns list of 5 parameters for Gupshup template.
+        
+        Args:
+            item: Enriched prediction dict
+            is_watchlist: True if this is a watchlist-only notification, False for regular broadcast
+        
+        Returns:
+            List of 5 parameter values: [user, company_context, category_impact, summary, time]
         """
+        company_name = item.get("company_name", "Unknown")
+        
+        # Parameter 1: Just "user" (not personalized)
+        param1 = "user"
+        
+        # Parameter 2: Company name with context
+        if is_watchlist:
+            param2 = f"Your watchlist {company_name}"
+        else:
+            param2 = f"High-impact {company_name}"
+        
+        # Parameter 3: Category and impact combined with "and"
+        category = item.get("category", "General")
         impact_raw = (item.get("impact") or "UNKNOWN").upper()
+        
+        # Format impact for display
         impact_emoji_map = {
-            "POSITIVE": "🟢 POSITIVE",
-            "STRONGLY POSITIVE": "🟢 STRONGLY POSITIVE",
-            "BEAT": "🟢 BEAT",
-            "NEGATIVE": "🔴 NEGATIVE",
-            "STRONGLY NEGATIVE": "🔴 STRONGLY NEGATIVE",
-            "MISSED": "🔴 MISSED",
-            "NEUTRAL": "⚪ NEUTRAL",
+            "POSITIVE": "Positive",
+            "STRONGLY POSITIVE": "Strongly Positive",
+            "BEAT": "Beat",
+            "NEGATIVE": "Negative",
+            "STRONGLY NEGATIVE": "Strongly Negative",
+            "MISSED": "Missed",
+            "NEUTRAL": "Neutral",
         }
-        impact_display = impact_emoji_map.get(impact_raw, f"⚪ {impact_raw}")
-
-        # Format news_time nicely
+        impact_display = impact_emoji_map.get(impact_raw, impact_raw)
+        
+        # Combine category and impact with "and"
+        param3 = f"{category} and {impact_display}"
+        
+        # Parameter 4: Summary
+        param4 = item.get("summary", "No details available.")
+        
+        # Parameter 5: Time (exact time with minutes)
         news_time = item.get("news_time", "")
         if news_time:
             try:
@@ -169,19 +197,19 @@ class WhatsAppService:
                 else:
                     dt = None
                 if dt:
-                    news_time = dt.strftime("%-d %b, %I:%M %p")
+                    # Format as "12.17 p.m." or "3.45 a.m." style (exact time with minutes)
+                    hour = dt.strftime("%-I")  # Hour without leading zero (1-12)
+                    minute = dt.strftime("%M")  # Minutes (00-59)
+                    am_pm = dt.strftime("%p").lower()  # AM/PM in lowercase
+                    param5 = f"{hour}.{minute} {am_pm}."  # e.g., "12.17 p.m.", "3.45 a.m."
+                else:
+                    param5 = str(news_time)
             except Exception:
-                news_time = str(news_time)
-
-        return [
-            {"name": "shop_name", "value": item.get("company_name", "Unknown")},
-            {"name": "first_name", "value": item.get("category", "General")},
-            {"name": "last_name", "value": impact_display},
-            {"name": "product_details", "value": item.get("summary", "No details available.")},
-            {"name": "tracking_number", "value": str(news_time)},
-            {"name": "catalog_checkout_url_partial_variable", "value": RITO_WEBSITE_URL},
-            {"name": "tracking_url_partial_variable", "value": RITO_MANAGE_URL},
-        ]
+                param5 = str(news_time)
+        else:
+            param5 = "N/A"
+        
+        return [param1, param2, param3, param4, param5]
 
     def send_market_update(self, phone: str, item: dict) -> bool:
         """
@@ -226,16 +254,14 @@ class WhatsAppService:
             logger.error("  ❌ WhatsApp API error for %s: %s", phone, e)
             return False
 
-    def send_market_update_broadcast(self, phones: list, item: dict) -> dict:
+    def send_market_update_broadcast(self, phones: list, item: dict, is_watchlist: bool = False) -> dict:
         """
-        Sends a market update to MULTIPLE users in a single API call
-        using WATI's broadcast API (/api/v2/sendTemplateMessages).
-
-        This is the scalable approach — 1 HTTP request for 1000+ users.
+        Sends a market update to MULTIPLE users using Gupshup API.
 
         Args:
             phones: List of phone numbers (with country code, no '+')
-            item:   Enriched prediction dict
+            item: Enriched prediction dict
+            is_watchlist: True if this is a watchlist-only notification, False for regular broadcast
 
         Returns:
             {"sent": int, "failed": int}
@@ -243,104 +269,89 @@ class WhatsAppService:
         if not phones:
             return {"sent": 0, "failed": 0}
 
-        params = self._build_market_update_params(item)
-        scrip = item.get("scrip_cd", "x")
-        broadcast_name = f"market_{scrip}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        # Build receivers list — each gets the same params for this stock
-        receivers = []
-        for phone in phones:
-            receivers.append({
-                "whatsappNumber": phone,
-                "customParams": params,
-            })
-
-        url = f"{self.base_url}/api/v2/sendTemplateMessages"
-        payload = {
-            "template_name": MARKET_UPDATE_TEMPLATE,
-            "broadcast_name": broadcast_name,
-            "receivers": receivers,
+        # Build parameters for Gupshup template
+        params = self._build_market_update_params(item, is_watchlist)
+        
+        # Gupshup API endpoint for template messages
+        url = f"{self.base_url}/template/msg"
+        
+        # Build template object
+        template_obj = {
+            "id": MARKET_UPDATE_TEMPLATE_ID,
+            "params": params  # 5 parameters as array
         }
-
-        try:
-            logger.info(
-                "  📤 WATI v2 broadcast: template=%s | broadcast=%s | receivers=%d",
-                MARKET_UPDATE_TEMPLATE, broadcast_name, len(receivers),
-            )
-
-            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
-
-            logger.info("  📥 WATI broadcast response status: %s", response.status_code)
-            logger.info("  📥 WATI broadcast response body: %s", response.text[:500] if response.text else "(empty)")
-
-            if not response.text or not response.text.strip():
-                logger.error("  ❌ WATI broadcast returned empty response (status %s)", response.status_code)
-                return {"sent": 0, "failed": len(phones)}
-
-            data = response.json()
-            success = data.get("result", False)
-
-            if success:
-                # Parse individual receiver responses to get accurate sent/failed counts
-                receivers = data.get("receivers", [])
-                sent_count = 0
-                failed_count = 0
+        
+        sent_count = 0
+        failed_count = 0
+    
+        # Gupshup doesn't have a bulk API like WATI, so we send individually
+        logger.info(
+            "  📤 Gupshup broadcast: template=%s | receivers=%d | watchlist=%s",
+            MARKET_UPDATE_TEMPLATE_ID, len(phones), is_watchlist,
+        )
+        
+        for phone in phones:
+            try:
+                payload = {
+                    "channel": "whatsapp",
+                    "source": GUPSHUP_SOURCE_NUMBER,  # 919187624274
+                    "destination": phone,  # Recipient phone number
+                    "src.name": GUPSHUP_APP_NAME,  # RITI01
+                    "template": json.dumps(template_obj),  # Template as JSON string
+                }
                 
-                for receiver in receivers:
-                    is_valid = receiver.get("isValidWhatsAppNumber", False)
-                    errors = receiver.get("errors", [])
-                    if is_valid and not errors:
-                        sent_count += 1
-                    else:
-                        failed_count += 1
-                        logger.warning(
-                            "  ⚠️ Invalid WhatsApp number: %s (errors: %s)",
-                            receiver.get("waId", "unknown"),
-                            errors if errors else "invalid number"
-                        )
+                response = requests.post(url, data=payload, headers=self.headers, timeout=15)
                 
-                logger.info(
-                    "  ✅ Broadcast '%s' accepted by WATI: %d sent, %d failed out of %d contacts",
-                    broadcast_name, sent_count, failed_count, len(phones),
-                )
-                return {"sent": sent_count, "failed": failed_count}
-            else:
-                error_info = data.get("info", "Unknown error")
-                logger.warning("  ❌ Broadcast failed: %s", error_info)
-
-                # Fallback: try sending one by one via v1 API
-                logger.info("  🔄 Falling back to v1 single-send for %d contacts...", len(phones))
-                sent = 0
-                failed = 0
-                for phone in phones:
-                    try:
-                        ok = self.send_market_update(phone, item)
-                        if ok:
-                            sent += 1
-                        else:
-                            failed += 1
-                    except Exception as e:
-                        logger.error("  ❌ v1 fallback failed for %s: %s", phone, e)
-                        failed += 1
-                return {"sent": sent, "failed": failed}
-
-        except Exception as e:
-            logger.error("  ❌ WATI broadcast API error: %s", e)
-            # Fallback to v1
-            logger.info("  🔄 Falling back to v1 single-send for %d contacts...", len(phones))
-            sent = 0
-            failed = 0
-            for phone in phones:
+                if not response.text or not response.text.strip():
+                    logger.warning("  ⚠️ Gupshup returned empty response (status %s) for %s", response.status_code, phone)
+                    failed_count += 1
+                    continue
+                
+                # Check response
                 try:
-                    ok = self.send_market_update(phone, item)
-                    if ok:
-                        sent += 1
+                    data = response.json()
+                except ValueError:
+                    if response.status_code == 200:
+                        sent_count += 1
+                        continue
                     else:
-                        failed += 1
-                except Exception as ex:
-                    logger.error("  ❌ v1 fallback failed for %s: %s", phone, ex)
-                    failed += 1
-            return {"sent": sent, "failed": failed}
+                        logger.warning("  ⚠️ Gupshup non-JSON response (status %s) for %s: %s", response.status_code, phone, response.text[:200])
+                        failed_count += 1
+                        continue
+                
+                # Check for success
+                status = data.get("status", "").lower()
+                if isinstance(data.get("response"), dict):
+                    response_status = data.get("response", {}).get("status", "")
+                    status = status or response_status.lower()
+                
+                success = (
+                    status in ["success", "submitted", "accepted"] or 
+                    response.status_code == 200 or
+                    data.get("accepted", False)
+                )
+                
+                if success:
+                    sent_count += 1
+                else:
+                    failed_count += 1
+                    error_msg = (
+                        data.get("message") or 
+                        data.get("error") or 
+                        data.get("response", {}).get("message", "") if isinstance(data.get("response"), dict) else "" or
+                        "Unknown error"
+                    )
+                    logger.warning("  ⚠️ Failed to send to %s: %s", phone, error_msg)
+                    
+            except Exception as e:
+                logger.error("  ❌ Gupshup API error for %s: %s", phone, e)
+                failed_count += 1
+        
+        logger.info(
+            "  ✅ Gupshup broadcast complete: %d sent, %d failed out of %d contacts",
+            sent_count, failed_count, len(phones),
+        )
+        return {"sent": sent_count, "failed": failed_count}
 
     def send_template_message(self, phone: str, template_name: str, parameters: list = None) -> bool:
         """

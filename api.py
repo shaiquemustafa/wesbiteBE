@@ -1434,7 +1434,8 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
     # Send notifications to specified phones using WhatsApp service directly
     whatsapp_service = WhatsAppService()
     try:
-        result = whatsapp_service.send_market_update_broadcast(request.phones, last_entry)
+        # Regular broadcast (not watchlist-only) since it's from whatsapp_broadcast table
+        result = whatsapp_service.send_market_update_broadcast(request.phones, last_entry, is_watchlist=False)
         sent = result.get("sent", 0)
         failed = result.get("failed", 0)
         
