@@ -1,5 +1,6 @@
-# service/whatsapp_service.py – WATI WhatsApp API integration
+# service/whatsapp_service.py – Gupshup WhatsApp API integration
 import os
+import json
 import logging
 import requests
 from datetime import datetime
@@ -9,16 +10,18 @@ load_dotenv()
 
 logger = logging.getLogger("uvicorn.error")
 
-WATI_BASE_URL = os.getenv("WATI_BASE_URL", "https://live-mt-server.wati.io/10103450")
-WATI_API_TOKEN = os.getenv("WATI_API_TOKEN", "")
+# Gupshup API Configuration - Hardcoded values
+GUPSHUP_BASE_URL = "https://api.gupshup.io/wa/api/v1"
+GUPSHUP_API_KEY = "yaxv5f904hj8saxxdu9enwlhkwvwyyns"
+GUPSHUP_SOURCE_NUMBER = "919187624274"  # Your WhatsApp Business number
+GUPSHUP_APP_NAME = "RITI01"  # Your app name
 
 # Template used for OTP messages (approved authentication template)
-OTP_TEMPLATE_NAME = os.getenv("WATI_OTP_TEMPLATE", "otp_login")
-# The parameter name in your template that holds the OTP value
-OTP_PARAM_NAME = os.getenv("WATI_OTP_PARAM", "1")
+OTP_TEMPLATE_ID = "0c9997c6-a0da-4294-b215-62b75e7fab61"
+OTP_TEMPLATE_NAME = "auth_user_1"
 
 # Template for market update notifications
-MARKET_UPDATE_TEMPLATE = os.getenv("WATI_MARKET_TEMPLATE", "market_update_1")
+MARKET_UPDATE_TEMPLATE = os.getenv("GUPSHUP_MARKET_TEMPLATE", "market_update_1")
 
 # RITO website URL (used in notification messages)
 RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "rito.co.in")
@@ -26,23 +29,19 @@ RITO_MANAGE_URL = os.getenv("RITO_MANAGE_URL", "rito.co.in/#watchlist")
 
 
 class WhatsAppService:
-    """Sends WhatsApp messages via WATI API."""
+    """Sends WhatsApp messages via Gupshup API."""
 
     def __init__(self):
-        self.base_url = WATI_BASE_URL.rstrip("/") if WATI_BASE_URL else ""
-        # Strip "Bearer " prefix if someone pasted the full header value
-        raw_token = (WATI_API_TOKEN or "").strip()
-        if raw_token.lower().startswith("bearer "):
-            raw_token = raw_token[7:].strip()
-        self.token = raw_token
+        self.base_url = GUPSHUP_BASE_URL.rstrip("/")
+        self.api_key = GUPSHUP_API_KEY
         self.headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json-patch+json",
+            "apikey": self.api_key,
+            "Content-Type": "application/x-www-form-urlencoded",
         }
 
     def send_otp(self, phone: str, otp_code: str) -> bool:
         """
-        Sends an OTP to the given phone number via WhatsApp.
+        Sends an OTP to the given phone number via WhatsApp using Gupshup API.
 
         Args:
             phone: Phone number with country code, no '+' (e.g., "919474841416")
@@ -51,33 +50,77 @@ class WhatsAppService:
         Returns:
             True if the message was sent successfully, False otherwise.
         """
-        url = f"{self.base_url}/api/v1/sendTemplateMessage?whatsappNumber={phone}"
-        payload = {
-            "template_name": OTP_TEMPLATE_NAME,
-            "broadcast_name": f"otp_{phone}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            "parameters": [
-                {"name": OTP_PARAM_NAME, "value": otp_code}
-            ],
+        # Gupshup API endpoint for template messages
+        url = f"{self.base_url}/template/msg"
+        
+        # Build template object as per Gupshup API format
+        # Based on your curl, the template expects 2 parameters
+        # Both are set to the OTP code - adjust if your template needs different values
+        template_obj = {
+            "id": OTP_TEMPLATE_ID,
+            "params": [otp_code, otp_code]  # Template has 2 params - both set to OTP code
         }
-
+        
+        # Gupshup expects form-urlencoded data (matching your curl format)
+        payload = {
+            "channel": "whatsapp",
+            "source": GUPSHUP_SOURCE_NUMBER,  # 919187624274
+            "destination": phone,  # Recipient phone number
+            "src.name": GUPSHUP_APP_NAME,  # RITI01
+            "template": json.dumps(template_obj),  # Template as JSON string
+        }
+        
         try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=15)
+            logger.info("  📤 Sending OTP via Gupshup to %s using template ID %s", phone, OTP_TEMPLATE_ID)
+            logger.info("  📤 Template params: %s", template_obj["params"])
+            response = requests.post(url, data=payload, headers=self.headers, timeout=15)
+
+            logger.info("  📥 Gupshup response status: %s", response.status_code)
+            logger.info("  📥 Gupshup response body: %s", response.text[:500] if response.text else "(empty)")
 
             if not response.text or not response.text.strip():
-                logger.error("  ❌ WATI returned empty response (status %s) for %s", response.status_code, phone)
+                logger.error("  ❌ Gupshup returned empty response (status %s) for %s", response.status_code, phone)
                 return False
 
-            data = response.json()
-            success = data.get("result", False)
+            # Gupshup typically returns JSON
+            try:
+                data = response.json()
+            except ValueError:
+                # If response is not JSON, check status code
+                if response.status_code == 200:
+                    logger.info("  ✅ OTP sent to %s via WhatsApp (non-JSON response)", phone)
+                    return True
+                else:
+                    logger.error("  ❌ Gupshup returned non-JSON response (status %s): %s", response.status_code, response.text[:200])
+                    return False
+
+            # Check for success indicators in Gupshup response
+            status = data.get("status", "").lower()
+            if isinstance(data.get("response"), dict):
+                response_status = data.get("response", {}).get("status", "")
+                status = status or response_status.lower()
+            
+            # Also check for "accepted" status
+            success = (
+                status in ["success", "submitted", "accepted"] or 
+                response.status_code == 200 or
+                data.get("accepted", False)
+            )
 
             if success:
-                logger.info("  ✅ OTP sent to %s via WhatsApp", phone)
+                logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup)", phone)
             else:
-                logger.warning("  ❌ Failed to send OTP to %s: %s", phone, data.get("info", "Unknown error"))
+                error_msg = (
+                    data.get("message") or 
+                    data.get("error") or 
+                    data.get("response", {}).get("message", "") if isinstance(data.get("response"), dict) else "" or
+                    "Unknown error"
+                )
+                logger.warning("  ❌ Failed to send OTP to %s: %s", phone, error_msg)
 
             return success
         except Exception as e:
-            logger.error("  ❌ WhatsApp API error sending OTP to %s: %s", phone, e)
+            logger.error("  ❌ Gupshup API error sending OTP to %s: %s", phone, e)
             return False
 
     def _update_contact_attributes(self, phone: str, attributes: list) -> bool:
