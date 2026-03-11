@@ -158,13 +158,13 @@ class WhatsAppService:
         # Parameter 1: Just "user" (not personalized)
         param1 = "user"
         
-        # Parameter 2: Company name with context
+        # Parameter 2: Company name with context (with punctuation for better readability)
         if is_watchlist:
-            param2 = f"Your watchlist {company_name}"
+            param2 = f"Your watchlist; {company_name}"
         else:
-            param2 = f"High-impact {company_name}"
+            param2 = f"High-impact; {company_name}"
         
-        # Parameter 3: Category and impact combined with "and"
+        # Parameter 3: Category and impact combined with "and" (better formatting)
         category = item.get("category", "General")
         impact_raw = (item.get("impact") or "UNKNOWN").upper()
         
@@ -180,13 +180,13 @@ class WhatsAppService:
         }
         impact_display = impact_emoji_map.get(impact_raw, impact_raw)
         
-        # Combine category and impact with "and"
+        # Combine category and impact with "and" for better readability
         param3 = f"{category} and {impact_display}"
         
         # Parameter 4: Summary
         param4 = item.get("summary", "No details available.")
         
-        # Parameter 5: Time (exact time with minutes)
+        # Parameter 5: Time with full date (e.g., "9 Mar, 10:52 PM")
         news_time = item.get("news_time", "")
         if news_time:
             try:
@@ -197,11 +197,10 @@ class WhatsAppService:
                 else:
                     dt = None
                 if dt:
-                    # Format as "12.17 p.m." or "3.45 a.m." style (exact time with minutes)
-                    hour = dt.strftime("%-I")  # Hour without leading zero (1-12)
-                    minute = dt.strftime("%M")  # Minutes (00-59)
-                    am_pm = dt.strftime("%p").lower()  # AM/PM in lowercase
-                    param5 = f"{hour}.{minute} {am_pm}."  # e.g., "12.17 p.m.", "3.45 a.m."
+                    # Format as "9 Mar, 10:52 PM" style (date + time with uppercase PM)
+                    date_str = dt.strftime("%-d %b")  # e.g., "9 Mar"
+                    time_str = dt.strftime("%-I:%M %p")  # e.g., "10:52 PM"
+                    param5 = f"{date_str}, {time_str}"  # e.g., "9 Mar, 10:52 PM"
                 else:
                     param5 = str(news_time)
             except Exception:
