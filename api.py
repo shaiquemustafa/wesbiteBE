@@ -204,13 +204,10 @@ def _cleanup_old_records():
                 status_cutoff = _now_ist_naive() - timedelta(hours=24)
                 cur.execute("DELETE FROM message_delivery_status WHERE timestamp < %s", (status_cutoff,))
                 status_del = cur.rowcount
-                # Cleanup message context older than 24 hours
-                cur.execute("DELETE FROM message_context WHERE created_at < %s", (status_cutoff,))
-                context_del = cur.rowcount
-        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del or status_del or context_del:
+        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del or status_del:
             logger.info(
-                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs, %s message delivery status, %s message context.",
-                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del, status_del, context_del,
+                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs, %s message delivery status.",
+                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del, status_del,
             )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
@@ -1588,28 +1585,30 @@ async def gupshup_delivery_webhook(request: Request):
         if len(phone) == 10:
             phone = "91" + phone
         
-        # Look up user_name and message_title
-        user_name = None
-        message_title = None
+        # Look up existing record to preserve user_name and message_title
+        existing_user_name = None
+        existing_message_title = None
         
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # Get user name from users table
-                    cur.execute("SELECT name FROM users WHERE phone = %s", (phone,))
-                    user_row = cur.fetchone()
-                    if user_row:
-                        user_name = user_row[0]
+                    # Get existing record if it exists
+                    cur.execute("SELECT user_name, message_title FROM message_delivery_status WHERE message_id = %s", (message_id,))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        existing_user_name = existing_row[0]
+                        existing_message_title = existing_row[1]
                     
-                    # Get message title from message_context table
-                    cur.execute("SELECT message_title FROM message_context WHERE message_id = %s", (message_id,))
-                    context_row = cur.fetchone()
-                    if context_row:
-                        message_title = context_row[0]
+                    # If user_name not set, look it up from users table
+                    if not existing_user_name:
+                        cur.execute("SELECT name FROM users WHERE phone = %s", (phone,))
+                        user_row = cur.fetchone()
+                        if user_row:
+                            existing_user_name = user_row[0]
         except Exception as e:
-            logger.warning("  ⚠️ Failed to look up user_name/message_title: %s", e)
+            logger.warning("  ⚠️ Failed to look up existing record or user_name: %s", e)
         
-        # Store in database
+        # Store in database - preserve existing user_name and message_title
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -1625,14 +1624,14 @@ async def gupshup_delivery_webhook(request: Request):
                             timestamp = EXCLUDED.timestamp,
                             updated_at = NOW(),
                             raw_payload = EXCLUDED.raw_payload,
-                            -- Only update user_name and message_title if they're NULL (preserve existing values)
+                            -- Preserve existing user_name and message_title (only set if NULL)
                             user_name = COALESCE(message_delivery_status.user_name, EXCLUDED.user_name),
                             message_title = COALESCE(message_delivery_status.message_title, EXCLUDED.message_title)
                         """,
-                        (message_id, phone, user_name, message_title, status, error_code, error_message, timestamp, Json(payload)),
+                        (message_id, phone, existing_user_name, existing_message_title, status, error_code, error_message, timestamp, Json(payload)),
                     )
             logger.info("  ✅ Stored delivery status: message_id=%s, phone=%s, user=%s, title=%s, status=%s", 
-                       message_id, phone, user_name or "N/A", message_title or "N/A", status)
+                       message_id, phone, existing_user_name or "N/A", existing_message_title or "N/A", status)
         except Exception as e:
             logger.error("  ❌ Failed to store delivery status: %s", e)
         

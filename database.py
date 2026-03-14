@@ -456,23 +456,6 @@ def _ensure_tables(conn):
             END $$;
         """)
         
-        # Message context mapping table (stores message_id -> message_title when sending)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_context (
-                message_id VARCHAR(255) PRIMARY KEY,  -- Gupshup message ID
-                message_title VARCHAR(255) NOT NULL,  -- "OTP" or company name
-                phone VARCHAR(20) NOT NULL,  -- Recipient phone number
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_message_context_phone
-                ON message_context (phone);
-            """
-        )
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_message_delivery_phone

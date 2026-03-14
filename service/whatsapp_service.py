@@ -40,25 +40,35 @@ class WhatsAppService:
             "Content-Type": "application/x-www-form-urlencoded",
         }
     
-    def _store_message_context(self, message_id: str, phone: str, message_title: str):
+    def _store_message_delivery_record(self, message_id: str, phone: str, message_title: str):
         """
-        Stores message context (message_id -> message_title) for webhook lookup.
-        This allows the webhook to know what the message was about (OTP or company name).
+        Stores message delivery record directly in message_delivery_status table.
+        Creates initial record when message is sent with user_name and message_title.
         """
         try:
+            # Look up user name
+            user_name = None
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    cur.execute("SELECT name FROM users WHERE phone = %s", (phone,))
+                    user_row = cur.fetchone()
+                    if user_row:
+                        user_name = user_row[0]
+                    
+                    # Create initial record in message_delivery_status
                     cur.execute(
                         """
-                        INSERT INTO message_context (message_id, phone, message_title)
-                        VALUES (%s, %s, %s)
+                        INSERT INTO message_delivery_status 
+                            (message_id, phone, user_name, message_title, status, timestamp)
+                        VALUES (%s, %s, %s, %s, 'sent', NOW())
                         ON CONFLICT (message_id) DO UPDATE SET
-                            message_title = EXCLUDED.message_title
+                            user_name = COALESCE(message_delivery_status.user_name, EXCLUDED.user_name),
+                            message_title = COALESCE(message_delivery_status.message_title, EXCLUDED.message_title)
                         """,
-                        (message_id, phone, message_title),
+                        (message_id, phone, user_name, message_title),
                     )
         except Exception as e:
-            logger.warning("  ⚠️ Failed to store message context for %s: %s", message_id, e)
+            logger.warning("  ⚠️ Failed to store message delivery record for %s: %s", message_id, e)
 
     def send_otp(self, phone: str, otp_code: str) -> bool:
         """
@@ -132,8 +142,8 @@ class WhatsAppService:
                 # Log message ID if available (for tracking via webhooks)
                 message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
                 if message_id:
-                    # Store message context for webhook lookup
-                    self._store_message_context(message_id, phone, "OTP")
+                    # Store directly in message_delivery_status
+                    self._store_message_delivery_record(message_id, phone, "OTP")
                     logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup) - messageId: %s", phone, message_id)
                 else:
                     logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup)", phone)
@@ -362,9 +372,9 @@ class WhatsAppService:
                     # Log message ID if available (for tracking via webhooks)
                     message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
                     if message_id:
-                        # Store message context with company name
+                        # Store directly in message_delivery_status with company name
                         company_name = item.get("company_name", "Unknown Company")
-                        self._store_message_context(message_id, phone, company_name)
+                        self._store_message_delivery_record(message_id, phone, company_name)
                         logger.info("  ✅ Message sent to %s - messageId: %s", phone, message_id)
                     sent_count += 1
                 else:
