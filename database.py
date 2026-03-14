@@ -423,6 +423,8 @@ def _ensure_tables(conn):
                 id BIGSERIAL PRIMARY KEY,
                 message_id VARCHAR(255) UNIQUE,  -- Gupshup message ID
                 phone VARCHAR(20) NOT NULL,  -- Recipient phone number
+                user_name VARCHAR(100),  -- User name from users table
+                message_title VARCHAR(255),  -- "OTP" or company name for broadcasts
                 status VARCHAR(50) NOT NULL,  -- sent, delivered, read, failed, enqueued
                 error_code VARCHAR(100),  -- Error code if failed
                 error_message TEXT,  -- Error message if failed
@@ -431,6 +433,44 @@ def _ensure_tables(conn):
                 updated_at TIMESTAMPTZ DEFAULT NOW(),
                 raw_payload JSONB  -- Store full webhook payload for debugging
             );
+            """
+        )
+        # Add columns if they don't exist (migration for existing tables)
+        cur.execute("""
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'message_delivery_status' 
+                    AND column_name = 'user_name'
+                ) THEN
+                    ALTER TABLE message_delivery_status ADD COLUMN user_name VARCHAR(100);
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'message_delivery_status' 
+                    AND column_name = 'message_title'
+                ) THEN
+                    ALTER TABLE message_delivery_status ADD COLUMN message_title VARCHAR(255);
+                END IF;
+            END $$;
+        """)
+        
+        # Message context mapping table (stores message_id -> message_title when sending)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_context (
+                message_id VARCHAR(255) PRIMARY KEY,  -- Gupshup message ID
+                message_title VARCHAR(255) NOT NULL,  -- "OTP" or company name
+                phone VARCHAR(20) NOT NULL,  -- Recipient phone number
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_message_context_phone
+                ON message_context (phone);
             """
         )
         cur.execute(

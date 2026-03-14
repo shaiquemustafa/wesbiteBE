@@ -5,6 +5,7 @@ import logging
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
+from database import get_conn
 
 load_dotenv()
 
@@ -38,6 +39,26 @@ class WhatsAppService:
             "apikey": self.api_key,
             "Content-Type": "application/x-www-form-urlencoded",
         }
+    
+    def _store_message_context(self, message_id: str, phone: str, message_title: str):
+        """
+        Stores message context (message_id -> message_title) for webhook lookup.
+        This allows the webhook to know what the message was about (OTP or company name).
+        """
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO message_context (message_id, phone, message_title)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (message_id) DO UPDATE SET
+                            message_title = EXCLUDED.message_title
+                        """,
+                        (message_id, phone, message_title),
+                    )
+        except Exception as e:
+            logger.warning("  ⚠️ Failed to store message context for %s: %s", message_id, e)
 
     def send_otp(self, phone: str, otp_code: str) -> bool:
         """
@@ -111,6 +132,8 @@ class WhatsAppService:
                 # Log message ID if available (for tracking via webhooks)
                 message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
                 if message_id:
+                    # Store message context for webhook lookup
+                    self._store_message_context(message_id, phone, "OTP")
                     logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup) - messageId: %s", phone, message_id)
                 else:
                     logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup)", phone)
@@ -339,6 +362,9 @@ class WhatsAppService:
                     # Log message ID if available (for tracking via webhooks)
                     message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
                     if message_id:
+                        # Store message context with company name
+                        company_name = item.get("company_name", "Unknown Company")
+                        self._store_message_context(message_id, phone, company_name)
                         logger.info("  ✅ Message sent to %s - messageId: %s", phone, message_id)
                     sent_count += 1
                 else:

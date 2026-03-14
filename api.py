@@ -204,10 +204,13 @@ def _cleanup_old_records():
                 status_cutoff = _now_ist_naive() - timedelta(hours=24)
                 cur.execute("DELETE FROM message_delivery_status WHERE timestamp < %s", (status_cutoff,))
                 status_del = cur.rowcount
-        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del or status_del:
+                # Cleanup message context older than 24 hours
+                cur.execute("DELETE FROM message_context WHERE created_at < %s", (status_cutoff,))
+                context_del = cur.rowcount
+        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del or status_del or context_del:
             logger.info(
-                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs, %s message delivery status.",
-                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del, status_del,
+                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs, %s message delivery status, %s message context.",
+                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del, status_del, context_del,
             )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
@@ -1585,6 +1588,27 @@ async def gupshup_delivery_webhook(request: Request):
         if len(phone) == 10:
             phone = "91" + phone
         
+        # Look up user_name and message_title
+        user_name = None
+        message_title = None
+        
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # Get user name from users table
+                    cur.execute("SELECT name FROM users WHERE phone = %s", (phone,))
+                    user_row = cur.fetchone()
+                    if user_row:
+                        user_name = user_row[0]
+                    
+                    # Get message title from message_context table
+                    cur.execute("SELECT message_title FROM message_context WHERE message_id = %s", (message_id,))
+                    context_row = cur.fetchone()
+                    if context_row:
+                        message_title = context_row[0]
+        except Exception as e:
+            logger.warning("  ⚠️ Failed to look up user_name/message_title: %s", e)
+        
         # Store in database
         try:
             with get_conn() as conn:
@@ -1592,19 +1616,23 @@ async def gupshup_delivery_webhook(request: Request):
                     cur.execute(
                         """
                         INSERT INTO message_delivery_status 
-                            (message_id, phone, status, error_code, error_message, timestamp, raw_payload)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (message_id, phone, user_name, message_title, status, error_code, error_message, timestamp, raw_payload)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (message_id) DO UPDATE SET
                             status = EXCLUDED.status,
                             error_code = EXCLUDED.error_code,
                             error_message = EXCLUDED.error_message,
                             timestamp = EXCLUDED.timestamp,
                             updated_at = NOW(),
-                            raw_payload = EXCLUDED.raw_payload
+                            raw_payload = EXCLUDED.raw_payload,
+                            -- Only update user_name and message_title if they're NULL (preserve existing values)
+                            user_name = COALESCE(message_delivery_status.user_name, EXCLUDED.user_name),
+                            message_title = COALESCE(message_delivery_status.message_title, EXCLUDED.message_title)
                         """,
-                        (message_id, phone, status, error_code, error_message, timestamp, Json(payload)),
+                        (message_id, phone, user_name, message_title, status, error_code, error_message, timestamp, Json(payload)),
                     )
-            logger.info("  ✅ Stored delivery status: message_id=%s, phone=%s, status=%s", message_id, phone, status)
+            logger.info("  ✅ Stored delivery status: message_id=%s, phone=%s, user=%s, title=%s, status=%s", 
+                       message_id, phone, user_name or "N/A", message_title or "N/A", status)
         except Exception as e:
             logger.error("  ❌ Failed to store delivery status: %s", e)
         
@@ -1650,6 +1678,8 @@ def get_delivery_status(
                     SELECT 
                         message_id,
                         phone,
+                        user_name,
+                        message_title,
                         status,
                         error_code,
                         error_message,
@@ -1695,11 +1725,13 @@ def get_delivery_status(
                     results.append({
                         "message_id": row[0],
                         "phone": row[1],
-                        "status": row[2],
-                        "error_code": row[3],
-                        "error_message": row[4],
-                        "timestamp": row[5].isoformat() if row[5] else None,
-                        "created_at": row[6].isoformat() if row[6] else None,
+                        "user_name": row[2],
+                        "message_title": row[3],
+                        "status": row[4],
+                        "error_code": row[5],
+                        "error_message": row[6],
+                        "timestamp": row[7].isoformat() if row[7] else None,
+                        "created_at": row[8].isoformat() if row[8] else None,
                     })
                 
                 return {
