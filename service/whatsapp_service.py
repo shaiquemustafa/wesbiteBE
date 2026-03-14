@@ -108,7 +108,12 @@ class WhatsAppService:
             )
 
             if success:
-                logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup)", phone)
+                # Log message ID if available (for tracking via webhooks)
+                message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
+                if message_id:
+                    logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup) - messageId: %s", phone, message_id)
+                else:
+                    logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup)", phone)
             else:
                 error_msg = (
                     data.get("message") or 
@@ -331,6 +336,10 @@ class WhatsAppService:
                 )
                 
                 if success:
+                    # Log message ID if available (for tracking via webhooks)
+                    message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
+                    if message_id:
+                        logger.info("  ✅ Message sent to %s - messageId: %s", phone, message_id)
                     sent_count += 1
                 else:
                     failed_count += 1

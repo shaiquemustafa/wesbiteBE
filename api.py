@@ -200,10 +200,14 @@ def _cleanup_old_records():
                 wb_del = cur.rowcount
                 cur.execute("DELETE FROM otp_requests WHERE expires_at < NOW() - INTERVAL '1 hour'")
                 otp_del = cur.rowcount
-        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del:
+                # Cleanup message delivery status older than 24 hours
+                status_cutoff = _now_ist_naive() - timedelta(hours=24)
+                cur.execute("DELETE FROM message_delivery_status WHERE timestamp < %s", (status_cutoff,))
+                status_del = cur.rowcount
+        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del or status_del:
             logger.info(
-                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs.",
-                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del,
+                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs, %s message delivery status.",
+                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del, status_del,
             )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
@@ -472,7 +476,7 @@ def _pipeline_sync(
         start_datetime=start_dt,
         end_datetime=end_dt,
         force_reprocess=force,
-    )
+        )
     summary["bse_total"] = fetch_stats.get("bse_total", 0)
     summary["new_stored"] = fetch_stats.get("new_stored", 0)
     summary["filtered"] = len(filtered_df)
@@ -1466,3 +1470,232 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
             "sent": 0,
             "failed": 0,
         }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Gupshup Webhook Endpoint for Message Delivery Status
+# ──────────────────────────────────────────────────────────────────────
+
+@app.post("/api/webhooks/gupshup-delivery", summary="Gupshup webhook for message delivery status")
+async def gupshup_delivery_webhook(request: Request):
+    """
+    Receives delivery status updates from Gupshup webhooks.
+    
+    Handles both Gupshup v2 format and Meta v3 format.
+    Stores delivery status (sent, delivered, read, failed) in database.
+    
+    Events received:
+    - sent: Message was sent to WhatsApp
+    - delivered: Message was delivered to user's device
+    - read: Message was read by user
+    - failed: Message failed to send
+    - enqueued: Message is queued for sending
+    """
+    try:
+        # Get raw body to store for debugging
+        body = await request.body()
+        payload = await request.json() if body else {}
+        
+        logger.info("  📥 Received Gupshup webhook: %s", payload)
+        
+        # Handle both Gupshup v2 and Meta v3 formats
+        # Gupshup v2 format: {"type": "message-event", "payload": {...}}
+        # Meta v3 format: {"entry": [{"changes": [{"value": {...}}]}]}
+        
+        message_id = None
+        phone = None
+        status = None
+        error_code = None
+        error_message = None
+        timestamp = None
+        
+        # Try Gupshup v2 format first
+        if payload.get("type") == "message-event":
+            event_payload = payload.get("payload", {})
+            message_id = event_payload.get("messageId") or event_payload.get("id")
+            phone = event_payload.get("destination") or event_payload.get("phone")
+            status = event_payload.get("eventType") or event_payload.get("status", "").lower()
+            error_code = event_payload.get("errorCode")
+            error_message = event_payload.get("errorMessage") or event_payload.get("error")
+            timestamp_str = event_payload.get("timestamp") or event_payload.get("time")
+            if timestamp_str:
+                try:
+                    # Handle Unix timestamp or ISO format
+                    if isinstance(timestamp_str, (int, float)):
+                        timestamp = datetime.fromtimestamp(timestamp_str, tz=timezone.utc)
+                    else:
+                        timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                except Exception:
+                    timestamp = datetime.now(timezone.utc)
+            else:
+                timestamp = datetime.now(timezone.utc)
+        
+        # Try Meta v3 format
+        elif payload.get("entry"):
+            for entry in payload.get("entry", []):
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    if "statuses" in value:
+                        for status_item in value.get("statuses", []):
+                            message_id = status_item.get("id")
+                            phone = status_item.get("recipient_id")
+                            status_raw = status_item.get("status", "").lower()
+                            # Map Meta statuses to our format
+                            status_map = {
+                                "sent": "sent",
+                                "delivered": "delivered",
+                                "read": "read",
+                                "failed": "failed",
+                                "pending": "enqueued",
+                            }
+                            status = status_map.get(status_raw, status_raw)
+                            error_code = status_item.get("errors", [{}])[0].get("code") if status_item.get("errors") else None
+                            error_message = status_item.get("errors", [{}])[0].get("title") if status_item.get("errors") else None
+                            timestamp_int = status_item.get("timestamp")
+                            if timestamp_int:
+                                timestamp = datetime.fromtimestamp(timestamp_int, tz=timezone.utc)
+                            else:
+                                timestamp = datetime.now(timezone.utc)
+        
+        # If we couldn't parse, log and return
+        if not message_id or not phone or not status:
+            logger.warning("  ⚠️ Could not parse webhook payload: %s", payload)
+            return {"status": "ok", "message": "Webhook received but could not parse"}
+        
+        # Normalize phone number (remove +, ensure country code)
+        phone = phone.replace("+", "").replace(" ", "").replace("-", "")
+        if len(phone) == 10:
+            phone = "91" + phone
+        
+        # Store in database
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO message_delivery_status 
+                            (message_id, phone, status, error_code, error_message, timestamp, raw_payload)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (message_id) DO UPDATE SET
+                            status = EXCLUDED.status,
+                            error_code = EXCLUDED.error_code,
+                            error_message = EXCLUDED.error_message,
+                            timestamp = EXCLUDED.timestamp,
+                            updated_at = NOW(),
+                            raw_payload = EXCLUDED.raw_payload
+                        """,
+                        (message_id, phone, status, error_code, error_message, timestamp, Json(payload)),
+                    )
+            logger.info("  ✅ Stored delivery status: message_id=%s, phone=%s, status=%s", message_id, phone, status)
+        except Exception as e:
+            logger.error("  ❌ Failed to store delivery status: %s", e)
+        
+        return {"status": "ok", "message": "Webhook processed successfully"}
+        
+    except Exception as e:
+        logger.error("  ❌ Webhook processing error: %s", e)
+        return {"status": "error", "message": str(e)}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Analytics Endpoint for Message Delivery Status
+# ──────────────────────────────────────────────────────────────────────
+
+class DeliveryStatusQuery(BaseModel):
+    """Query parameters for delivery status analytics."""
+    phone: Optional[str] = Field(None, description="Filter by phone number")
+    status: Optional[str] = Field(None, description="Filter by status (sent, delivered, read, failed)")
+    hours: Optional[int] = Field(24, description="Number of hours to look back (default: 24)")
+    limit: Optional[int] = Field(100, description="Maximum number of records to return")
+
+
+@app.get("/api/admin/message-delivery-status", summary="[ADMIN] Get message delivery status analytics")
+def get_delivery_status(
+    phone: Optional[str] = Query(None, description="Filter by phone number"),
+    status: Optional[str] = Query(None, description="Filter by status (sent, delivered, read, failed)"),
+    hours: int = Query(24, description="Number of hours to look back"),
+    limit: int = Query(100, description="Maximum number of records to return"),
+):
+    """
+    Returns message delivery status analytics.
+    
+    Shows which messages were sent, delivered, read, or failed.
+    Useful for tracking campaign performance.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Build query with filters
+                query = """
+                    SELECT 
+                        message_id,
+                        phone,
+                        status,
+                        error_code,
+                        error_message,
+                        timestamp,
+                        created_at
+                    FROM message_delivery_status
+                    WHERE timestamp >= %s
+                """
+                params = [cutoff]
+                
+                if phone:
+                    query += " AND phone = %s"
+                    params.append(phone)
+                
+                if status:
+                    query += " AND status = %s"
+                    params.append(status.lower())
+                
+                query += " ORDER BY timestamp DESC LIMIT %s"
+                params.append(limit)
+                
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                
+                # Get summary statistics
+                cur.execute(
+                    """
+                    SELECT 
+                        status,
+                        COUNT(*) as count
+                    FROM message_delivery_status
+                    WHERE timestamp >= %s
+                    GROUP BY status
+                    """,
+                    (cutoff,),
+                )
+                stats_rows = cur.fetchall()
+                
+                stats = {row[0]: row[1] for row in stats_rows}
+                
+                results = []
+                for row in rows:
+                    results.append({
+                        "message_id": row[0],
+                        "phone": row[1],
+                        "status": row[2],
+                        "error_code": row[3],
+                        "error_message": row[4],
+                        "timestamp": row[5].isoformat() if row[5] else None,
+                        "created_at": row[6].isoformat() if row[6] else None,
+                    })
+                
+                return {
+                    "total_records": len(results),
+                    "time_range_hours": hours,
+                    "summary": {
+                        "sent": stats.get("sent", 0),
+                        "delivered": stats.get("delivered", 0),
+                        "read": stats.get("read", 0),
+                        "failed": stats.get("failed", 0),
+                        "enqueued": stats.get("enqueued", 0),
+                    },
+                    "records": results,
+                }
+    except Exception as e:
+        logger.error("  ❌ Failed to get delivery status: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

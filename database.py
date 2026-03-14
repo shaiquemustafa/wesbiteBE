@@ -416,6 +416,48 @@ def _ensure_tables(conn):
             END $$;
         """)
 
+        # Message delivery status table (tracks WhatsApp message delivery via Gupshup webhooks)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_delivery_status (
+                id BIGSERIAL PRIMARY KEY,
+                message_id VARCHAR(255) UNIQUE,  -- Gupshup message ID
+                phone VARCHAR(20) NOT NULL,  -- Recipient phone number
+                status VARCHAR(50) NOT NULL,  -- sent, delivered, read, failed, enqueued
+                error_code VARCHAR(100),  -- Error code if failed
+                error_message TEXT,  -- Error message if failed
+                timestamp TIMESTAMPTZ NOT NULL,  -- When status was updated
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                raw_payload JSONB  -- Store full webhook payload for debugging
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_message_delivery_phone
+                ON message_delivery_status (phone);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_message_delivery_status
+                ON message_delivery_status (status);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_message_delivery_timestamp
+                ON message_delivery_status (timestamp);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_message_delivery_message_id
+                ON message_delivery_status (message_id);
+            """
+        )
+
         # Table metadata/documentation (definitions, rules, cutoffs, functions)
         cur.execute(
             """
