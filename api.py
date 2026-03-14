@@ -1537,7 +1537,8 @@ async def gupshup_delivery_webhook(request: Request):
                     value = change.get("value", {})
                     if "statuses" in value:
                         for status_item in value.get("statuses", []):
-                            message_id = status_item.get("id")
+                            # Use gs_id (Gupshup message ID) or meta_msg_id (WhatsApp message ID) or id (Meta ID)
+                            message_id = status_item.get("gs_id") or status_item.get("meta_msg_id") or status_item.get("id")
                             phone = status_item.get("recipient_id")
                             status_raw = status_item.get("status", "").lower()
                             # Map Meta statuses to our format
@@ -1551,9 +1552,26 @@ async def gupshup_delivery_webhook(request: Request):
                             status = status_map.get(status_raw, status_raw)
                             error_code = status_item.get("errors", [{}])[0].get("code") if status_item.get("errors") else None
                             error_message = status_item.get("errors", [{}])[0].get("title") if status_item.get("errors") else None
-                            timestamp_int = status_item.get("timestamp")
-                            if timestamp_int:
-                                timestamp = datetime.fromtimestamp(timestamp_int, tz=timezone.utc)
+                            timestamp_raw = status_item.get("timestamp")
+                            if timestamp_raw:
+                                try:
+                                    # Handle both string and integer timestamps
+                                    # Gupshup sends timestamps as either:
+                                    # - Integer milliseconds: 1773477862554 (13 digits)
+                                    # - String seconds: "1773477864" (10 digits)
+                                    if isinstance(timestamp_raw, str):
+                                        timestamp_val = int(timestamp_raw)
+                                    else:
+                                        timestamp_val = timestamp_raw
+                                    
+                                    # If timestamp is > 1e12, it's in milliseconds, convert to seconds
+                                    if timestamp_val > 1e12:
+                                        timestamp_val = timestamp_val / 1000
+                                    
+                                    timestamp = datetime.fromtimestamp(timestamp_val, tz=timezone.utc)
+                                except (ValueError, TypeError, OSError) as e:
+                                    logger.warning("  ⚠️ Failed to parse timestamp %s: %s", timestamp_raw, e)
+                                    timestamp = datetime.now(timezone.utc)
                             else:
                                 timestamp = datetime.now(timezone.utc)
         
