@@ -22,6 +22,11 @@ OTP_TEMPLATE_ID = "0c9997c6-a0da-4294-b215-62b75e7fab61"
 OTP_TEMPLATE_NAME = "auth_user_1"
 
 # Template for market update notifications (WhatsApp broadcast)
+# Watchlist template: for users who have specific stocks in their watchlist
+WATCHLIST_TEMPLATE_ID = "1f019a3b-1bd3-4af9-91ff-118955cea4a0"
+# High-impact template: for users who opted for high-impact news from all companies
+HIGH_IMPACT_TEMPLATE_ID = "ade884d4-7716-46a0-a371-a234158dd9c1"
+# Legacy template (kept for backward compatibility, but not used)
 MARKET_UPDATE_TEMPLATE_ID = "109c6887-f03c-4617-a4d3-efd0c8c59ddf"
 
 # RITO website URL (used in notification messages)
@@ -196,11 +201,9 @@ class WhatsAppService:
         # Parameter 1: Just "user" (not personalized)
         param1 = "user"
         
-        # Parameter 2: Company name with context (with emoji and bold formatting for visual appeal)
-        if is_watchlist:
-            param2 = f"Your watchlist; 📊 *{company_name}*"
-        else:
-            param2 = f"*High-impact*; 📊 *{company_name}*"
+        # Parameter 2: Company name (templates are clear, no need for prefixes)
+        # Just the company name with formatting for visual appeal
+        param2 = f"📊 *{company_name}*"
         
         # Parameter 3: Category and impact with color-coded emojis
         category = item.get("category", "General")
@@ -322,9 +325,10 @@ class WhatsAppService:
         failed_count = 0
     
         # Gupshup doesn't have a bulk API like WATI, so we send individually
+        template_id = WATCHLIST_TEMPLATE_ID if is_watchlist else HIGH_IMPACT_TEMPLATE_ID
         logger.info(
             "  📤 Gupshup broadcast: template=%s | receivers=%d | watchlist=%s",
-            MARKET_UPDATE_TEMPLATE_ID, len(phones), is_watchlist,
+            template_id, len(phones), is_watchlist,
         )
         
         for phone in phones:
