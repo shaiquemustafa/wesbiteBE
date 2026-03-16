@@ -35,6 +35,23 @@ def _now_ist_naive() -> datetime:
     """Current time in IST as a naive datetime."""
     return datetime.now(IST).replace(tzinfo=None)
 
+def _to_ist(dt) -> datetime:
+    """
+    Converts a datetime to IST timezone.
+    Handles naive datetimes, UTC datetimes, and already IST datetimes.
+    Returns timezone-aware IST datetime.
+    """
+    if dt is None:
+        return None
+    
+    # If already timezone-aware
+    if dt.tzinfo is not None:
+        # Convert to IST
+        return dt.astimezone(IST)
+    else:
+        # If naive, assume it's already in IST and add IST timezone
+        return dt.replace(tzinfo=IST)
+
 
 analysis_lock = asyncio.Lock()
 logger = logging.getLogger("uvicorn.error")
@@ -102,13 +119,15 @@ async def _send_pending_broadcasts():
                     # Mark as sent
                     with get_conn() as conn:
                         with conn.cursor() as cur:
+                            # Set sent_at in IST
+                            sent_at_ist = _now_ist_naive().replace(tzinfo=IST)
                             cur.execute(
                                 """
                                 UPDATE whatsapp_broadcast
-                                SET sent_at = NOW()
+                                SET sent_at = %s
                                 WHERE id = %s
                                 """,
-                                (entry["id"],),
+                                (sent_at_ist, entry["id"]),
                             )
                     logger.info("  ✅ Sent notification for %s (entry ID: %s)", entry.get("company_name"), entry["id"])
             except Exception as e:
@@ -569,11 +588,15 @@ def _pipeline_sync(
                     try:
                         with get_conn() as conn:
                             with conn.cursor() as cur:
+                                # Convert news_time to IST before storing
+                                news_time_ist = _to_ist(enriched.get("news_time")) if enriched.get("news_time") else None
+                                current_time_ist = _now_ist_naive().replace(tzinfo=IST)  # Current time in IST
+                                
                                 cur.execute(
                                     """
                                     INSERT INTO whatsapp_broadcast
-                                        (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                     """,
                                     (
                                         enriched.get("scrip_cd"),
@@ -582,9 +605,10 @@ def _pipeline_sync(
                                         enriched.get("category"),
                                         enriched.get("summary"),
                                         enriched.get("pdf_link"),
-                                        enriched.get("news_time"),
+                                        news_time_ist,
                                         mkt_cap_cr,
                                         Json(_make_json_serializable(enriched)),  # Store full enriched data as JSONB (convert Timestamps to strings)
+                                        current_time_ist,  # Explicitly set created_at in IST
                                     ),
                                 )
                         items_to_notify.append(enriched)  # Add to notification queue
@@ -666,13 +690,17 @@ def _pipeline_sync(
                                 scrip_cd = item.get("scrip_cd")
                                 news_time = item.get("news_time")
                                 if scrip_cd and news_time:
+                                    # Convert news_time to IST for comparison (in case it's not already)
+                                    news_time_ist = _to_ist(news_time) if news_time else None
+                                    # Set sent_at in IST
+                                    sent_at_ist = _now_ist_naive().replace(tzinfo=IST)
                                     cur.execute(
                                         """
                                         UPDATE whatsapp_broadcast
-                                        SET sent_at = NOW()
+                                        SET sent_at = %s
                                         WHERE scrip_cd = %s AND news_time = %s AND sent_at IS NULL
                                         """,
-                                        (scrip_cd, news_time),
+                                        (sent_at_ist, scrip_cd, news_time_ist),
                                     )
                     logger.info("  ✅ Marked %d entries as sent in whatsapp_broadcast", len(items_to_notify))
                 except Exception as e:
@@ -1135,12 +1163,16 @@ def backfill_whatsapp_broadcast():
                             skipped_count += 1
                             continue
                         
+                        # Convert news_time to IST before storing
+                        news_time_ist = _to_ist(news_time) if news_time else None
+                        current_time_ist = _now_ist_naive().replace(tzinfo=IST)  # Current time in IST
+                        
                         # Insert new record
                         cur.execute(
                             """
                             INSERT INTO whatsapp_broadcast
-                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                             (
                                 item.get("scrip_cd"),
@@ -1149,9 +1181,10 @@ def backfill_whatsapp_broadcast():
                                 item.get("category"),
                                 item.get("summary"),
                                 item.get("pdf_link"),
-                                news_time,
+                                news_time_ist,
                                 mkt_cap_cr,
                                 Json(_make_json_serializable(item)),  # Convert Timestamps to strings
+                                current_time_ist,  # Explicitly set created_at in IST
                             ),
                         )
                         inserted_count += 1
@@ -1245,13 +1278,15 @@ def send_pending_broadcasts():
                 # Mark as sent
                 with get_conn() as conn:
                     with conn.cursor() as cur:
+                        # Set sent_at in IST
+                        sent_at_ist = _now_ist_naive().replace(tzinfo=IST)
                         cur.execute(
                             """
                             UPDATE whatsapp_broadcast
-                            SET sent_at = NOW()
+                            SET sent_at = %s
                             WHERE id = %s
                             """,
-                            (entry["id"],),
+                            (sent_at_ist, entry["id"]),
                         )
             else:
                 total_failed += 1
@@ -1335,13 +1370,15 @@ def send_last_broadcast():
         # Mark as sent (update sent_at even if it was already set)
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Set sent_at in IST
+                sent_at_ist = _now_ist_naive().replace(tzinfo=IST)
                 cur.execute(
                     """
                     UPDATE whatsapp_broadcast
-                    SET sent_at = NOW()
+                    SET sent_at = %s
                     WHERE id = %s
                     """,
-                    (last_entry["id"],),
+                    (sent_at_ist, last_entry["id"]),
                 )
         
         logger.info("  ✅ Send-last-broadcast complete: %d sent, %d failed", sent, failed)
