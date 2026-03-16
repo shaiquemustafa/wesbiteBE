@@ -315,9 +315,12 @@ class WhatsAppService:
         # Gupshup API endpoint for template messages
         url = f"{self.base_url}/template/msg"
         
+        # Select template based on message type
+        template_id = WATCHLIST_TEMPLATE_ID if is_watchlist else HIGH_IMPACT_TEMPLATE_ID
+        
         # Build template object
         template_obj = {
-            "id": MARKET_UPDATE_TEMPLATE_ID,
+            "id": template_id,
             "params": params  # 5 parameters as array
         }
         
@@ -325,7 +328,6 @@ class WhatsAppService:
         failed_count = 0
     
         # Gupshup doesn't have a bulk API like WATI, so we send individually
-        template_id = WATCHLIST_TEMPLATE_ID if is_watchlist else HIGH_IMPACT_TEMPLATE_ID
         logger.info(
             "  📤 Gupshup broadcast: template=%s | receivers=%d | watchlist=%s",
             template_id, len(phones), is_watchlist,
