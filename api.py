@@ -360,9 +360,9 @@ async def run_analysis_pipeline(
 ):
     target_date = None
     if date:
-    try:
-        target_date = datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
     
 
@@ -499,7 +499,7 @@ def _pipeline_sync(
     summary["bse_total"] = fetch_stats.get("bse_total", 0)
     summary["new_stored"] = fetch_stats.get("new_stored", 0)
     summary["filtered"] = len(filtered_df)
-        if filtered_df.empty:
+    if filtered_df.empty:
         summary["message"] = "No new announcements to process."
         return summary
 
