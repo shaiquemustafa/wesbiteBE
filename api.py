@@ -360,9 +360,9 @@ async def run_analysis_pipeline(
 ):
     target_date = None
     if date:
-        try:
-            target_date = datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
     
 
@@ -499,7 +499,7 @@ def _pipeline_sync(
     summary["bse_total"] = fetch_stats.get("bse_total", 0)
     summary["new_stored"] = fetch_stats.get("new_stored", 0)
     summary["filtered"] = len(filtered_df)
-    if filtered_df.empty:
+        if filtered_df.empty:
         summary["message"] = "No new announcements to process."
         return summary
 
@@ -1151,13 +1151,14 @@ def backfill_whatsapp_broadcast():
             try:
                 with get_conn() as conn:
                     with conn.cursor() as cur:
-                        # Check if already exists
+                        # Check if already exists (convert news_time to IST for comparison)
+                        news_time_ist_for_check = _to_ist(news_time) if news_time else None
                         cur.execute(
                             """
                             SELECT COUNT(*) FROM whatsapp_broadcast
                             WHERE scrip_cd = %s AND news_time = %s
                             """,
-                            (scrip_cd, news_time),
+                            (scrip_cd, news_time_ist_for_check),
                         )
                         if cur.fetchone()[0] > 0:
                             skipped_count += 1
