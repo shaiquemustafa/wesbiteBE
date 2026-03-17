@@ -350,7 +350,7 @@ def _ensure_tables(conn):
         )
 
         # WhatsApp broadcast table (filtered bulk messages for all users)
-        # Stores only: STRONGLY POSITIVE (all), NEGATIVE/STRONGLY NEGATIVE (>10K Cr), FINANCIAL RESULTS
+        # Stores only: STRONGLY POSITIVE (all >2,500 Cr), STRONGLY NEGATIVE (>10K Cr, ONLY here, NOT ui_data), NEGATIVE (>10K Cr), FINANCIAL RESULTS
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS whatsapp_broadcast (
@@ -503,7 +503,7 @@ def _ensure_tables(conn):
                 "ui_data",
                 "Stores all impactful market news for display on the website. Contains full enrichment data (prices, analyst consensus, quarterly results). Only companies >2,500 Cr market cap are processed.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: POSITIVE, STRONGLY POSITIVE, NEGATIVE, STRONGLY NEGATIVE, BEAT, MISSED (for companies >2,500 Cr). Excludes: NEUTRAL, MATCHED, N/A, and companies <2,500 Cr.",
+                "Includes: POSITIVE, STRONGLY POSITIVE, NEGATIVE, BEAT, MISSED (for companies >2,500 Cr). Excludes: STRONGLY NEGATIVE (only goes to whatsapp_broadcast), NEUTRAL, MATCHED, N/A, and companies <2,500 Cr.",
                 "Website display - shows all impactful news to users browsing the dashboard.",
             ),
             (
@@ -517,7 +517,7 @@ def _ensure_tables(conn):
                 "whatsapp_broadcast",
                 "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: (1) STRONGLY POSITIVE for all companies >2,500 Cr, (2) NEGATIVE/STRONGLY NEGATIVE only for companies >10,000 Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap.",
+                "Includes: (1) STRONGLY POSITIVE for all companies >2,500 Cr, (2) STRONGLY NEGATIVE only for companies >10,000 Cr market cap (ONLY goes here, NOT ui_data), (3) NEGATIVE (not STRONGLY) only for companies >10,000 Cr market cap, (4) All FINANCIAL RESULTS category news regardless of impact/market cap.",
                 "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
             ),
             (
