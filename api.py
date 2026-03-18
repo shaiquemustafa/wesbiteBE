@@ -162,11 +162,12 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
     
     Rules:
     1. STRONGLY POSITIVE → all companies >2,500 Cr (any market cap above threshold)
-    2. STRONGLY NEGATIVE → only if market cap > 10,000 Cr - ONLY goes to whatsapp_broadcast, NOT ui_data
-    3. NEGATIVE (not STRONGLY) → only if market cap > 10,000 Cr
+    2. STRONGLY NEGATIVE → only if market cap > 10,000 Cr
+    3. NEGATIVE (regular, not STRONGLY) → EXCLUDED from whatsapp_broadcast
     4. FINANCIAL RESULTS category → always include (any impact, any market cap)
     
     Note: All news is already filtered to companies >2,500 Cr during processing.
+    Both NEGATIVE and STRONGLY NEGATIVE appear in ui_data, but only STRONGLY NEGATIVE >10K Cr goes to whatsapp_broadcast.
     
     Returns:
         (should_include: bool, mkt_cap_cr: float | None)
@@ -194,16 +195,19 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
     if "STRONGLY POSITIVE" in impact or impact == "BEAT":
         return (True, mkt_cap)
     
-    # Rule 2: STRONGLY NEGATIVE → only if market cap > 10,000 Cr (ONLY goes to whatsapp_broadcast, NOT ui_data)
+    # Rule 2: STRONGLY NEGATIVE → only if market cap > 10,000 Cr
     if "STRONGLY NEGATIVE" in impact:
         if mkt_cap and mkt_cap > 10000:  # > 10,000 Cr
             return (True, mkt_cap)
         return (False, None)
     
-    # Rule 3: NEGATIVE (not STRONGLY) → only if market cap > 10,000 Cr
-    if "NEGATIVE" in impact or impact == "MISSED":
-        if mkt_cap and mkt_cap > 10000:  # > 10,000 Cr
-            return (True, mkt_cap)
+    # Rule 3: Regular NEGATIVE (not STRONGLY) → EXCLUDED from whatsapp_broadcast
+    # Check for NEGATIVE but make sure it's not STRONGLY NEGATIVE
+    if "NEGATIVE" in impact and "STRONGLY NEGATIVE" not in impact:
+        return (False, None)
+    
+    # MISSED is also excluded (it's a form of negative but not strongly negative)
+    if impact == "MISSED":
         return (False, None)
     
     # Everything else excluded
@@ -584,20 +588,13 @@ def _pipeline_sync(
                 logger.warning("  [%s/%s] Failed to save prediction: %s", i, total, e)
 
             # Enrich with Indian API data & store in ui_data (shown on website)
-            # NOTE: STRONGLY NEGATIVE is excluded from ui_data - it only goes to whatsapp_broadcast
+            # All impacts (including STRONGLY NEGATIVE) go to ui_data
             try:
                 enriched = enrich_prediction(result)
-                impact_upper = (enriched.get("impact") or "").upper()
-                
-                # Skip ui_data storage for STRONGLY NEGATIVE (only goes to whatsapp_broadcast)
-                if "STRONGLY NEGATIVE" not in impact_upper:
-                    ui_count = ui_service.bulk_store_enriched([enriched])
-                    if ui_count:
-                        total_ui += ui_count
-                        logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
-                else:
-                    logger.info("  [%s/%s] ⏭️ SCRIP %s excluded from UI data (STRONGLY NEGATIVE → WhatsApp broadcast only).",
-                                i, total, row_dict.get("SCRIP_CD"))
+                ui_count = ui_service.bulk_store_enriched([enriched])
+                if ui_count:
+                    total_ui += ui_count
+                    logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
                 
                 # Check if this should go to whatsapp_broadcast (stricter filtering)
                 should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(enriched, company_service)
@@ -1099,8 +1096,8 @@ def backfill_whatsapp_broadcast():
     Backfills the whatsapp_broadcast table from today's ui_data records only.
     Applies the same filtering rules:
     - STRONGLY POSITIVE: all companies >2,500 Cr
-    - STRONGLY NEGATIVE: only if market cap > 10,000 Cr - NOTE: STRONGLY NEGATIVE won't be in ui_data, so this won't backfill them
-    - NEGATIVE (not STRONGLY): only if market cap > 10,000 Cr
+    - STRONGLY NEGATIVE: only if market cap > 10,000 Cr
+    - NEGATIVE (regular, not STRONGLY): EXCLUDED from whatsapp_broadcast
     - FINANCIAL RESULTS: always include
     
     Skips records that already exist in whatsapp_broadcast (based on scrip_cd + news_time).
