@@ -1,6 +1,8 @@
 import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+import hashlib
+import requests
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -29,6 +31,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Scheduler config (env-overridable)
 SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "2"))
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+META_PIXEL_ID = os.getenv("META_PIXEL_ID", "1245580987757334")
+META_ACCESS_TOKEN = os.getenv(
+    "META_ACCESS_TOKEN",
+    "EAAVKbgAbnP0BQ7R5gQyzD1EcWRRTlhyWF0uUe5vJtFqsqOA9snAQ77JZBeo5ctV2uVpZAFnlzoQdWrFXRMgOnxoGm74MI859Bnv8ZC4WFGV5omm1EciZA0eZCrtRn4GKmxnXoSOh56CoSZCsFCKS8OdxT5l5JRJLzyk6XJtQD5HIadVgMWFSHEPUreISSfqo1qdQZDZD",
+)
+META_TEST_EVENT_CODE = os.getenv("META_TEST_EVENT_CODE", "").strip()
 
 
 def _now_ist_naive() -> datetime:
@@ -888,6 +896,13 @@ class VerifyOTPRequest(BaseModel):
 class UpdateNameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="User's display name")
 
+class MetaEventRequest(BaseModel):
+    event_name: str = Field(..., min_length=1, max_length=100, description="Meta event name")
+    event_id: Optional[str] = Field(None, max_length=200, description="Event ID for deduplication")
+    phone: Optional[str] = Field(None, max_length=20, description="Phone number for event matching")
+    event_source_url: Optional[str] = Field(None, max_length=500, description="Page URL where event happened")
+    action_source: str = Field("website", description="Meta action source")
+
 
 def _get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     """
@@ -970,6 +985,72 @@ def record_visit(authorization: Optional[str] = Header(None)):
         logger.warning("Failed to record visit event for %s: %s", phone, e)
 
     return {"ok": True}
+
+
+def _normalize_phone_for_meta(phone: Optional[str]) -> Optional[str]:
+    if not phone:
+        return None
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    if len(digits) == 10:
+        digits = f"91{digits}"
+    return digits if len(digits) >= 10 else None
+
+
+def _sha256_lower(value: str) -> str:
+    return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
+
+
+@app.post("/api/meta/conversions-event", summary="Send website conversion event to Meta Conversions API")
+def send_meta_conversion_event(body: MetaEventRequest, request: Request):
+    """
+    Server-side event forwarding to Meta Conversions API.
+    Use this endpoint from frontend actions (OTP requested, terms click, etc).
+    """
+    if not META_PIXEL_ID or not META_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Meta Pixel is not configured.")
+
+    user_data = {
+        "client_ip_address": request.client.host if request.client else None,
+        "client_user_agent": request.headers.get("user-agent"),
+    }
+
+    normalized_phone = _normalize_phone_for_meta(body.phone)
+    if normalized_phone:
+        user_data["ph"] = [_sha256_lower(normalized_phone)]
+
+    event_payload = {
+        "event_name": body.event_name,
+        "event_time": int(datetime.now(timezone.utc).timestamp()),
+        "action_source": body.action_source or "website",
+        "user_data": user_data,
+    }
+    if body.event_id:
+        event_payload["event_id"] = body.event_id
+    if body.event_source_url:
+        event_payload["event_source_url"] = body.event_source_url
+
+    payload = {"data": [event_payload]}
+    if META_TEST_EVENT_CODE:
+        payload["test_event_code"] = META_TEST_EVENT_CODE
+
+    url = f"https://graph.facebook.com/v20.0/{META_PIXEL_ID}/events"
+    try:
+        resp = requests.post(
+            url,
+            params={"access_token": META_ACCESS_TOKEN},
+            json=payload,
+            timeout=15,
+        )
+        data = resp.json() if resp.content else {}
+        if not resp.ok:
+            logger.warning("Meta CAPI error: status=%s body=%s", resp.status_code, data)
+            raise HTTPException(status_code=502, detail="Failed to send event to Meta.")
+        return {"ok": True, "meta_response": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Meta CAPI request failed: %s", e)
+        raise HTTPException(status_code=502, detail="Failed to send event to Meta.")
 
 
 @app.get("/api/auth/me", summary="Get current logged-in user")
