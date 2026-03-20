@@ -900,6 +900,9 @@ class MetaEventRequest(BaseModel):
     event_name: str = Field(..., min_length=1, max_length=100, description="Meta event name")
     event_id: Optional[str] = Field(None, max_length=200, description="Event ID for deduplication")
     phone: Optional[str] = Field(None, max_length=20, description="Phone number for event matching")
+    external_id: Optional[str] = Field(None, max_length=200, description="Stable internal user identifier")
+    fbc: Optional[str] = Field(None, max_length=200, description="Facebook click ID token (_fbc)")
+    fbp: Optional[str] = Field(None, max_length=200, description="Facebook browser ID token (_fbp)")
     event_source_url: Optional[str] = Field(None, max_length=500, description="Page URL where event happened")
     action_source: str = Field("website", description="Meta action source")
 
@@ -1004,7 +1007,7 @@ def _sha256_lower(value: str) -> str:
 def send_meta_conversion_event(body: MetaEventRequest, request: Request):
     """
     Server-side event forwarding to Meta Conversions API.
-    Use this endpoint from frontend actions (OTP requested, terms click, etc).
+    Use this endpoint from frontend actions (OTP requested, etc).
     """
     if not META_PIXEL_ID or not META_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="Meta Pixel is not configured.")
@@ -1015,8 +1018,33 @@ def send_meta_conversion_event(body: MetaEventRequest, request: Request):
     }
 
     normalized_phone = _normalize_phone_for_meta(body.phone)
+    resolved_external_id = body.external_id
+
+    # If external_id isn't passed, derive from users.id (best stable identifier) when possible.
+    if not resolved_external_id and normalized_phone:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM users WHERE phone = %s LIMIT 1", (normalized_phone,))
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        resolved_external_id = f"user_{row[0]}"
+        except Exception as e:
+            logger.warning("Meta CAPI external_id lookup failed for phone=%s: %s", normalized_phone, e)
+
+    # Final fallback external_id from phone if user row doesn't exist yet.
+    if not resolved_external_id and normalized_phone:
+        resolved_external_id = f"phone_{normalized_phone}"
+
     if normalized_phone:
         user_data["ph"] = [_sha256_lower(normalized_phone)]
+    if resolved_external_id:
+        # external_id should be hashed before sending to Meta.
+        user_data["external_id"] = [_sha256_lower(resolved_external_id)]
+    if body.fbc:
+        user_data["fbc"] = body.fbc
+    if body.fbp:
+        user_data["fbp"] = body.fbp
 
     event_payload = {
         "event_name": body.event_name,
