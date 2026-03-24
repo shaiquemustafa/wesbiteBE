@@ -1638,7 +1638,7 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
 # Gupshup Webhook Endpoint for Message Delivery Status
 # ──────────────────────────────────────────────────────────────────────
 
-@app.post("/api/webhooks/gupshup-delivery", summary="Gupshup webhook for message delivery status")
+@app.post("/api/webhooks/gupshup-delivery", summary="Gupshup webhook for message delivery status and inbound messages")
 async def gupshup_delivery_webhook(request: Request):
     """
     Receives delivery status updates from Gupshup webhooks.
@@ -1697,6 +1697,60 @@ async def gupshup_delivery_webhook(request: Request):
             for entry in payload.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
+                    # Inbound messages from users
+                    if "messages" in value:
+                        try:
+                            messages = value.get("messages", [])
+                            contacts = value.get("contacts", [])
+                            contact_phone = None
+                            if contacts:
+                                contact_phone = contacts[0].get("wa_id") or contacts[0].get("phone")
+                            for m in messages:
+                                msg_from = m.get("from") or contact_phone
+                                msg_ts_raw = m.get("timestamp")
+                                msg_ts = None
+                                if msg_ts_raw:
+                                    try:
+                                        ts_val = int(msg_ts_raw)
+                                        if ts_val > 1e12:
+                                            ts_val = ts_val / 1000
+                                        msg_ts = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                                    except Exception:
+                                        msg_ts = datetime.now(timezone.utc)
+                                else:
+                                    msg_ts = datetime.now(timezone.utc)
+                                # Extract text body if available
+                                text_body = None
+                                if m.get("text") and isinstance(m.get("text"), dict):
+                                    text_body = m["text"].get("body")
+                                elif m.get("button") and isinstance(m.get("button"), dict):
+                                    text_body = m["button"].get("text")
+                                elif m.get("interactive") and isinstance(m.get("interactive"), dict):
+                                    # Many interactive types; store as a short label
+                                    text_body = m["interactive"].get("type")
+
+                                if msg_from and text_body:
+                                    norm_phone = str(msg_from).replace("+", "").replace(" ", "").replace("-", "")
+                                    if len(norm_phone) == 10:
+                                        norm_phone = "91" + norm_phone
+                                    # Update last incoming message on users
+                                    try:
+                                        with get_conn() as conn:
+                                            with conn.cursor() as cur:
+                                                cur.execute(
+                                                    """
+                                                    UPDATE users
+                                                    SET last_incoming_message_text = %s,
+                                                        last_incoming_message_at = %s,
+                                                        updated_at = NOW()
+                                                    WHERE phone = %s
+                                                    """,
+                                                    (text_body[:2000], msg_ts, norm_phone),
+                                                )
+                                    except Exception as e:
+                                        logger.warning("  ⚠️ Failed to update last incoming message for %s: %s", norm_phone, e)
+                        except Exception as e:
+                            logger.warning("  ⚠️ Failed processing inbound message payload: %s", e)
                     if "statuses" in value:
                         for status_item in value.get("statuses", []):
                             # Use gs_id (Gupshup message ID) or meta_msg_id (WhatsApp message ID) or id (Meta ID)

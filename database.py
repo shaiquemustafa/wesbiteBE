@@ -194,6 +194,14 @@ def _ensure_tables(conn):
             );
             """
         )
+        # Add inbound message tracking columns (idempotent)
+        cur.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_incoming_message_text TEXT,
+            ADD COLUMN IF NOT EXISTS last_incoming_message_at TIMESTAMPTZ;
+            """
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS otp_requests (
