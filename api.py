@@ -1694,6 +1694,7 @@ async def gupshup_delivery_webhook(request: Request):
         
         # Try Meta v3 format
         elif payload.get("entry"):
+            inbound_processed = False
             for entry in payload.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
@@ -1749,6 +1750,7 @@ async def gupshup_delivery_webhook(request: Request):
                                                 )
                                     except Exception as e:
                                         logger.warning("  ⚠️ Failed to update last incoming message for %s: %s", norm_phone, e)
+                            inbound_processed = True
                         except Exception as e:
                             logger.warning("  ⚠️ Failed processing inbound message payload: %s", e)
                     if "statuses" in value:
@@ -1790,6 +1792,10 @@ async def gupshup_delivery_webhook(request: Request):
                                     timestamp = datetime.now(timezone.utc)
                             else:
                                 timestamp = datetime.now(timezone.utc)
+            # If we processed inbound messages, we can return success immediately
+            if inbound_processed and not status:
+                logger.info("  ✅ Inbound message processed and user record updated.")
+                return {"status": "ok", "message": "Inbound message stored"}
         
         # If we couldn't parse, log and return
         if not message_id or not phone or not status:
