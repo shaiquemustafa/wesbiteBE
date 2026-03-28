@@ -240,14 +240,10 @@ def _cleanup_old_records():
                 wb_del = cur.rowcount
                 cur.execute("DELETE FROM otp_requests WHERE expires_at < NOW() - INTERVAL '1 hour'")
                 otp_del = cur.rowcount
-                # Cleanup message delivery status older than 24 hours
-                status_cutoff = _now_ist_naive() - timedelta(hours=24)
-                cur.execute("DELETE FROM message_delivery_status WHERE timestamp < %s", (status_cutoff,))
-                status_del = cur.rowcount
-        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del or status_del:
+        if raw_del or pred_del or ui_del or wl_del or wb_del or otp_del:
             logger.info(
-                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs, %s message delivery status.",
-                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del, status_del,
+                "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs.",
+                raw_del, pred_del, ui_del, wl_del, wb_del, otp_del,
             )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
