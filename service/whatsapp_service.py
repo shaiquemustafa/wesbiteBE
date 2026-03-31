@@ -3,9 +3,12 @@ import os
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from database import get_conn
+
+# Fixed IST offset
+IST = timezone(timedelta(hours=5, minutes=30))
 
 load_dotenv()
 
@@ -60,17 +63,18 @@ class WhatsAppService:
                     if user_row:
                         user_name = user_row[0]
                     
-                    # Create initial record in message_delivery_status
+                    # Create initial record in message_delivery_status (timestamp in IST)
+                    now_ist = datetime.now(IST)
                     cur.execute(
                         """
                         INSERT INTO message_delivery_status 
                             (message_id, phone, user_name, message_title, status, timestamp)
-                        VALUES (%s, %s, %s, %s, 'sent', NOW())
+                        VALUES (%s, %s, %s, %s, 'sent', %s)
                         ON CONFLICT (message_id) DO UPDATE SET
                             user_name = COALESCE(message_delivery_status.user_name, EXCLUDED.user_name),
                             message_title = COALESCE(message_delivery_status.message_title, EXCLUDED.message_title)
                         """,
-                        (message_id, phone, user_name, message_title),
+                        (message_id, phone, user_name, message_title, now_ist),
                     )
         except Exception as e:
             logger.warning("  ⚠️ Failed to store message delivery record for %s: %s", message_id, e)

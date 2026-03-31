@@ -1826,6 +1826,12 @@ async def gupshup_delivery_webhook(request: Request):
         except Exception as e:
             logger.warning("  ⚠️ Failed to look up existing record or user_name: %s", e)
         
+        # Convert timestamp to IST before storing
+        if timestamp:
+            timestamp_ist = timestamp.astimezone(IST) if timestamp.tzinfo else timestamp.replace(tzinfo=IST)
+        else:
+            timestamp_ist = _now_ist_naive().replace(tzinfo=IST)
+        
         # Store in database - preserve existing user_name and message_title
         try:
             with get_conn() as conn:
@@ -1846,7 +1852,7 @@ async def gupshup_delivery_webhook(request: Request):
                             user_name = COALESCE(message_delivery_status.user_name, EXCLUDED.user_name),
                             message_title = COALESCE(message_delivery_status.message_title, EXCLUDED.message_title)
                         """,
-                        (message_id, phone, existing_user_name, existing_message_title, status, error_code, error_message, timestamp, Json(payload)),
+                        (message_id, phone, existing_user_name, existing_message_title, status, error_code, error_message, timestamp_ist, Json(payload)),
                     )
             logger.info("  ✅ Stored delivery status: message_id=%s, phone=%s, user=%s, title=%s, status=%s", 
                        message_id, phone, existing_user_name or "N/A", existing_message_title or "N/A", status)
@@ -1886,7 +1892,7 @@ def get_delivery_status(
     Useful for tracking campaign performance.
     """
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        cutoff = _now_ist_naive().replace(tzinfo=IST) - timedelta(hours=hours)
         
         with get_conn() as conn:
             with conn.cursor() as cur:
