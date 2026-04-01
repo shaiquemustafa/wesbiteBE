@@ -525,7 +525,7 @@ def _ensure_tables(conn):
                 "whatsapp_broadcast",
                 "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: (1) STRONGLY POSITIVE for all companies >2,500 Cr, (2) STRONGLY NEGATIVE only for companies >10,000 Cr market cap, (3) All FINANCIAL RESULTS category news regardless of impact/market cap. Excludes: Regular NEGATIVE (not STRONGLY) - these appear in ui_data but not in whatsapp_broadcast.",
+                "Includes: (1) STRONGLY POSITIVE or BEAT for all companies >2,500 Cr, (2) STRONGLY NEGATIVE only for non-financial categories and market cap >10,000 Cr, (3) Financial Results category only when impact is STRONGLY POSITIVE or BEAT (not plain POSITIVE/NEUTRAL/NEGATIVE). Excludes: regular NEGATIVE, MISSED, etc.",
                 "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
             ),
             (

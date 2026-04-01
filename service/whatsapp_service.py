@@ -211,7 +211,7 @@ class WhatsAppService:
         
         # Parameter 3: Category and impact with color-coded emojis
         category = item.get("category", "General")
-        impact_raw = (item.get("impact") or "UNKNOWN").upper()
+        impact_raw = (item.get("impact") or "UNKNOWN").strip().upper()
         
         # Format impact with color-coded emojis (like WATI had)
         impact_emoji_map = {

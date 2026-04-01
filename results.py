@@ -58,6 +58,8 @@ PROMPT_SCREEN = (
     "  MOST key metrics improve on BOTH YoY AND QoQ.\n"
     "- Give clearly negative tags (NEGATIVE/STRONGLY NEGATIVE/MISSED) when MOST key metrics are weak on\n"
     "  BOTH YoY AND QoQ.\n"
+    "- Use STRONGLY NEGATIVE when weakness is broad and severe (e.g., large YoY+QoQ declines,\n"
+    "  material margin/PAT erosion, or clearly weak guidance/cash-flow trends).\n"
     "- If YoY and QoQ are mixed (some better, some worse), choose a balanced tag (often NEUTRAL or modest\n"
     "  POSITIVE/NEGATIVE) and keep the price-move range moderate.\n"
     "- If you cannot reliably infer BOTH YoY and QoQ performance from the PDF, do NOT give a strong\n"
@@ -165,6 +167,39 @@ _impact_map = {
     "NEGATIVE": 2,
     "STRONGLY NEGATIVE": 1, "MISSED": 1,
 }
+
+
+def _normalize_impact_tag(raw_tag: str) -> str:
+    """Normalize model output to one supported impact tag."""
+    tag = (raw_tag or "").strip().upper()
+    if not tag:
+        return "N/A"
+
+    if tag in _impact_map or tag == "N/A":
+        return tag
+
+    if "STRONGLY NEGATIVE" in tag or "STRONG NEGATIVE" in tag or "HIGHLY NEGATIVE" in tag:
+        return "STRONGLY NEGATIVE"
+    if "STRONGLY POSITIVE" in tag or "STRONG POSITIVE" in tag or "HIGHLY POSITIVE" in tag:
+        return "STRONGLY POSITIVE"
+
+    if "MISS" in tag:
+        return "MISSED"
+    if "BEAT" in tag:
+        return "BEAT"
+    if "MATCH" in tag:
+        return "MATCHED"
+
+    if "NEGATIVE" in tag:
+        return "NEGATIVE"
+    if "POSITIVE" in tag:
+        return "POSITIVE"
+    if "NEUTRAL" in tag:
+        return "NEUTRAL"
+    if "IMMATERIAL" in tag:
+        return "N/A"
+
+    return "N/A"
 
 
 def _download_pdf(url: str) -> Optional[bytes]:
@@ -329,8 +364,8 @@ def _process_single_announcement(row: dict, index: int, total: int) -> Optional[
         logger.info("  [%s/%s] SCRIP %s: LLM returned %s fields, expected 5", index, total, scrip_cd, len(parts))
         return None
 
-    company, imp_tag, summary, price_range, rationale = [p.strip() for p in parts]
-    imp_tag = imp_tag.upper()
+    company, imp_tag_raw, summary, price_range, rationale = [p.strip() for p in parts]
+    imp_tag = _normalize_impact_tag(imp_tag_raw)
 
     # N/A items are still processed (watchlist users get all announcements)
     if imp_tag == "N/A":
