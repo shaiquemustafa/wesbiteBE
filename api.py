@@ -1004,6 +1004,16 @@ def _sha256_lower(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
 
+def _client_ip_for_meta(request: Request) -> Optional[str]:
+    """Real client IP when behind a proxy (Render, Netlify, etc.)."""
+    xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
 @app.post("/api/meta/conversions-event", summary="Send website conversion event to Meta Conversions API")
 def send_meta_conversion_event(body: MetaEventRequest, request: Request):
     """
@@ -1014,7 +1024,7 @@ def send_meta_conversion_event(body: MetaEventRequest, request: Request):
         raise HTTPException(status_code=500, detail="Meta Pixel is not configured.")
 
     user_data = {
-        "client_ip_address": request.client.host if request.client else None,
+        "client_ip_address": _client_ip_for_meta(request),
         "client_user_agent": request.headers.get("user-agent"),
     }
 
