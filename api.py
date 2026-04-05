@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import logging
 
 from announcements import fetch_and_filter_announcements
@@ -1004,6 +1005,31 @@ def _sha256_lower(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
 
+def _rolling_incoming_messages(
+    current_text: Optional[str], new_message: str, max_messages: int = 4
+) -> str:
+    """
+    Store the last `max_messages` inbound WhatsApp texts in one column as a JSON array string.
+    Older rows that hold a single plain-text message are migrated on the next inbound event.
+    """
+    msg = (new_message or "").strip()
+    if len(msg) > 2000:
+        msg = msg[:2000]
+    msgs: List[str] = []
+    if current_text and str(current_text).strip():
+        try:
+            parsed = json.loads(current_text)
+            if isinstance(parsed, list):
+                msgs = [str(x) for x in parsed if x is not None]
+            else:
+                msgs = [str(current_text).strip()]
+        except (json.JSONDecodeError, TypeError):
+            msgs = [str(current_text).strip()]
+    msgs.append(msg)
+    msgs = msgs[-max_messages:]
+    return json.dumps(msgs, ensure_ascii=False)
+
+
 def _client_ip_for_meta(request: Request) -> Optional[str]:
     """Real client IP when behind a proxy (Render, Netlify, etc.)."""
     xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
@@ -1744,10 +1770,17 @@ async def gupshup_delivery_webhook(request: Request):
                                     norm_phone = str(msg_from).replace("+", "").replace(" ", "").replace("-", "")
                                     if len(norm_phone) == 10:
                                         norm_phone = "91" + norm_phone
-                                    # Update last incoming message on users
+                                    # Rolling last 4 inbound messages in last_incoming_message_text (JSON array string)
                                     try:
                                         with get_conn() as conn:
                                             with conn.cursor() as cur:
+                                                cur.execute(
+                                                    "SELECT last_incoming_message_text FROM users WHERE phone = %s",
+                                                    (norm_phone,),
+                                                )
+                                                row = cur.fetchone()
+                                                prev = row[0] if row else None
+                                                combined = _rolling_incoming_messages(prev, text_body, max_messages=4)
                                                 cur.execute(
                                                     """
                                                     UPDATE users
@@ -1756,7 +1789,7 @@ async def gupshup_delivery_webhook(request: Request):
                                                         updated_at = NOW()
                                                     WHERE phone = %s
                                                     """,
-                                                    (text_body[:2000], msg_ts, norm_phone),
+                                                    (combined, msg_ts, norm_phone),
                                                 )
                                     except Exception as e:
                                         logger.warning("  ⚠️ Failed to update last incoming message for %s: %s", norm_phone, e)

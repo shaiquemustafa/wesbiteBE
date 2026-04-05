@@ -540,7 +540,7 @@ def _ensure_tables(conn):
                 "User accounts with authentication, preferences, and profile information.",
                 "No automatic cleanup - permanent user data.",
                 "No filtering - all users are stored.",
-                "User management - stores phone numbers, names, notification preferences (receive_all_updates), onboarding status.",
+                "User management - stores phone numbers, names, notification preferences (receive_all_updates), onboarding status. last_incoming_message_text holds a JSON array string of the last 4 inbound WhatsApp messages.",
             ),
             (
                 "user_watchlist",
