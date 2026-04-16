@@ -229,6 +229,40 @@ def _should_include_in_whatsapp_broadcast(enriched_item: dict, company_service: 
     return (False, None)
 
 
+def _normalize_category_broadcast_key(category: Optional[str]) -> str:
+    """Stable key for dedupe: trim + uppercase."""
+    return (category or "").strip().upper()
+
+
+def _whatsapp_broadcast_has_scrip_and_category(scrip_cd, category: Optional[str]) -> bool:
+    """
+    True if a whatsapp_broadcast row already exists for this scrip and category.
+    Old rows are removed by cleanup (~48h), so a new filing can broadcast again after that.
+    """
+    if scrip_cd is None:
+        return False
+    scrip = str(scrip_cd).strip()
+    if not scrip:
+        return False
+    norm_cat = _normalize_category_broadcast_key(category)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM whatsapp_broadcast
+                    WHERE scrip_cd = %s
+                      AND UPPER(TRIM(COALESCE(category, ''))) = %s
+                    LIMIT 1
+                    """,
+                    (scrip, norm_cat),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("whatsapp_broadcast scrip+category duplicate check failed: %s", e)
+        return False
+
+
 def _cleanup_old_records():
     """Delete records older than 48 hours from all tables to keep the DB lean."""
     cutoff = _now_ist_naive() - timedelta(hours=48)
@@ -610,37 +644,48 @@ def _pipeline_sync(
                 # Check if this should go to whatsapp_broadcast (stricter filtering)
                 should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(enriched, company_service)
                 if should_broadcast:
-                    try:
-                        with get_conn() as conn:
-                            with conn.cursor() as cur:
-                                # Convert news_time to IST before storing
-                                news_time_ist = _to_ist(enriched.get("news_time")) if enriched.get("news_time") else None
-                                current_time_ist = _now_ist_naive().replace(tzinfo=IST)  # Current time in IST
-                                
-                                cur.execute(
-                                    """
-                                    INSERT INTO whatsapp_broadcast
-                                        (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                    """,
-                                    (
-                                        enriched.get("scrip_cd"),
-                                        enriched.get("company_name", "Unknown"),
-                                        enriched.get("impact"),
-                                        enriched.get("category"),
-                                        enriched.get("summary"),
-                                        enriched.get("pdf_link"),
-                                        news_time_ist,
-                                        mkt_cap_cr,
-                                        Json(_make_json_serializable(enriched)),  # Store full enriched data as JSONB (convert Timestamps to strings)
-                                        current_time_ist,  # Explicitly set created_at in IST
-                                    ),
-                                )
-                        items_to_notify.append(enriched)  # Add to notification queue
-                        logger.info("  [%s/%s] ✅ WhatsApp broadcast entry saved for SCRIP %s (mkt_cap=%.0f Cr).",
-                                    i, total, row_dict.get("SCRIP_CD"), mkt_cap_cr or 0)
-                    except Exception as e:
-                        logger.warning("  [%s/%s] Failed to save whatsapp_broadcast entry: %s", i, total, e)
+                    if _whatsapp_broadcast_has_scrip_and_category(
+                        enriched.get("scrip_cd"), enriched.get("category")
+                    ):
+                        logger.info(
+                            "  [%s/%s] ⏭️ WhatsApp broadcast skipped (already have scrip+category in window): SCRIP %s | %s",
+                            i,
+                            total,
+                            row_dict.get("SCRIP_CD"),
+                            enriched.get("category") or "",
+                        )
+                    else:
+                        try:
+                            with get_conn() as conn:
+                                with conn.cursor() as cur:
+                                    # Convert news_time to IST before storing
+                                    news_time_ist = _to_ist(enriched.get("news_time")) if enriched.get("news_time") else None
+                                    current_time_ist = _now_ist_naive().replace(tzinfo=IST)  # Current time in IST
+
+                                    cur.execute(
+                                        """
+                                        INSERT INTO whatsapp_broadcast
+                                            (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        """,
+                                        (
+                                            enriched.get("scrip_cd"),
+                                            enriched.get("company_name", "Unknown"),
+                                            enriched.get("impact"),
+                                            enriched.get("category"),
+                                            enriched.get("summary"),
+                                            enriched.get("pdf_link"),
+                                            news_time_ist,
+                                            mkt_cap_cr,
+                                            Json(_make_json_serializable(enriched)),  # Store full enriched data as JSONB (convert Timestamps to strings)
+                                            current_time_ist,  # Explicitly set created_at in IST
+                                        ),
+                                    )
+                            items_to_notify.append(enriched)  # Add to notification queue
+                            logger.info("  [%s/%s] ✅ WhatsApp broadcast entry saved for SCRIP %s (mkt_cap=%.0f Cr).",
+                                        i, total, row_dict.get("SCRIP_CD"), mkt_cap_cr or 0)
+                        except Exception as e:
+                            logger.warning("  [%s/%s] Failed to save whatsapp_broadcast entry: %s", i, total, e)
                 else:
                     logger.info("  [%s/%s] ⏭️ SCRIP %s excluded from WhatsApp broadcast (doesn't meet criteria).",
                                 i, total, row_dict.get("SCRIP_CD"))
@@ -1245,7 +1290,8 @@ def backfill_whatsapp_broadcast():
     - Other categories: STRONGLY POSITIVE/BEAT (all); STRONGLY NEGATIVE only if market cap > 10,000 Cr
     - Regular NEGATIVE (not STRONGLY), MISSED: excluded
 
-    Skips records that already exist in whatsapp_broadcast (based on scrip_cd + news_time).
+    Skips records already in whatsapp_broadcast (scrip_cd + news_time), or same scrip_cd + category
+    as an existing row (dedupe repeated filings until cleanup removes old rows).
     """
     logger.info("🔄 Starting whatsapp_broadcast backfill from today's ui_data...")
     
@@ -1304,6 +1350,10 @@ def backfill_whatsapp_broadcast():
             should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(item, company_service)
             
             if not should_broadcast:
+                skipped_count += 1
+                continue
+
+            if _whatsapp_broadcast_has_scrip_and_category(scrip_cd, item.get("category")):
                 skipped_count += 1
                 continue
             

@@ -389,6 +389,13 @@ def _ensure_tables(conn):
                 ON whatsapp_broadcast (scrip_cd);
             """
         )
+        # Dedupe lookups: same company + same category (expression matches api.py filter)
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_whatsapp_broadcast_scrip_cat
+                ON whatsapp_broadcast (scrip_cd, (UPPER(TRIM(COALESCE(category, '')))));
+            """
+        )
         # Add sent_at column if it doesn't exist (migration for existing tables)
         # MUST be done before creating index on sent_at
         cur.execute("""
@@ -525,7 +532,7 @@ def _ensure_tables(conn):
                 "whatsapp_broadcast",
                 "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: (1) STRONGLY POSITIVE or BEAT for all companies >2,500 Cr, (2) STRONGLY NEGATIVE only for non-financial categories and market cap >10,000 Cr, (3) Financial Results category only when impact is STRONGLY POSITIVE or BEAT (not plain POSITIVE/NEUTRAL/NEGATIVE). Excludes: regular NEGATIVE, MISSED, etc.",
+                "Includes: (1) STRONGLY POSITIVE or BEAT for all companies >2,500 Cr, (2) STRONGLY NEGATIVE only for non-financial categories and market cap >10,000 Cr, (3) Financial Results category only when impact is STRONGLY POSITIVE or BEAT (not plain POSITIVE/NEUTRAL/NEGATIVE). Excludes: regular NEGATIVE, MISSED, etc. At most one row per scrip_cd + category while data exists (dedupes repeat filings).",
                 "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
             ),
             (
