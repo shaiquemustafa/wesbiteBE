@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 import asyncio
 import json
 import logging
-import time
 
 from announcements import fetch_and_filter_announcements
 from results import _process_single_announcement, _impact_map
@@ -73,9 +72,20 @@ _scheduler_task: asyncio.Task | None = None
 
 async def _send_pending_broadcasts():
     """
+    Async wrapper: runs the (synchronous, network-heavy) pending-broadcast
+    sender on a worker thread so the asyncio event loop stays free. OTPs,
+    signups, and other API calls keep being served while sends are in
+    flight.
+    """
+    await asyncio.to_thread(_send_pending_broadcasts_sync)
+
+
+def _send_pending_broadcasts_sync():
+    """
     Automatically sends notifications for entries in whatsapp_broadcast
-    that haven't been sent yet (sent_at IS NULL).
-    This runs as a background job to catch any missed notifications.
+    that haven't been sent yet (sent_at IS NULL). Each entry is dispatched
+    via WhatsAppService.send_market_update_broadcast which fans out to
+    Gupshup in parallel using the dedicated WhatsApp thread pool.
     """
     try:
         # Get all unsent entries from the last hour (to avoid sending very old entries)
@@ -222,7 +232,12 @@ def _fetch_user_training_recipients() -> list[dict]:
 def _run_user_training_broadcast() -> dict:
     """
     Synchronously sends the 'user_training' utility template to every
-    eligible user. Designed to be invoked from a worker thread.
+    eligible user. Designed to be invoked from a worker thread (via
+    asyncio.to_thread) so the asyncio event loop is never blocked.
+
+    The actual fan-out happens in WhatsAppService's dedicated thread
+    pool (WHATSAPP_PARALLELISM concurrent Gupshup calls), so a 5,000-user
+    blast typically completes in well under a minute instead of hours.
     """
     recipients = _fetch_user_training_recipients()
     if not recipients:
@@ -230,29 +245,23 @@ def _run_user_training_broadcast() -> dict:
         return {"sent": 0, "failed": 0, "total": 0}
 
     svc = WhatsAppService()
-    sent = 0
-    failed = 0
+    payload = [
+        {
+            "phone": r["phone"],
+            "name_label": "user",
+            "watchlist_csv": _format_watchlist_csv(r["watchlist_companies"]),
+            "high_impact_label": _format_high_impact_label(r["receive_all_updates"]),
+        }
+        for r in recipients
+    ]
 
-    logger.info("📚 user_training broadcast: sending to %d users", len(recipients))
-    for r in recipients:
-        try:
-            ok = svc.send_user_training_message(
-                phone=r["phone"],
-                name_label="user",
-                watchlist_csv=_format_watchlist_csv(r["watchlist_companies"]),
-                high_impact_label=_format_high_impact_label(r["receive_all_updates"]),
-            )
-            if ok:
-                sent += 1
-            else:
-                failed += 1
-            time.sleep(0.1)
-        except Exception as e:
-            failed += 1
-            logger.warning("  ⚠️ user_training failed for %s: %s", r.get("phone"), e)
-
-    logger.info("📚 user_training broadcast complete: %d sent, %d failed", sent, failed)
-    return {"sent": sent, "failed": failed, "total": len(recipients)}
+    logger.info("📚 user_training broadcast: sending to %d users (parallel)", len(payload))
+    result = svc.send_user_training_messages(payload)
+    logger.info(
+        "📚 user_training broadcast complete: %d sent, %d failed (total %d)",
+        result.get("sent", 0), result.get("failed", 0), result.get("total", 0),
+    )
+    return result
 
 
 def _claim_scheduled_job(job_name: str, interval_days: int) -> bool:
@@ -544,9 +553,29 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Scheduler is DISABLED (SCHEDULER_ENABLED=false).")
 
+    # Kick the periodic 'user_training' broadcast off immediately on boot so
+    # a fresh deploy doesn't have to wait for the next scheduler tick. The
+    # 15-day claim in scheduled_jobs still guarantees it never double-fires
+    # across restarts.
+    async def _startup_user_training_kick():
+        # Tiny delay so the DB pool / app is fully ready before we fan out.
+        await asyncio.sleep(5)
+        try:
+            await _maybe_run_user_training_broadcast()
+        except Exception as e:
+            logger.error("❌ Startup user_training kick failed: %s", e)
+
+    asyncio.create_task(_startup_user_training_kick())
+
     yield
 
-    # Shutdown: cancel scheduler + close DB
+    # Shutdown: stop accepting new WhatsApp work, then cancel scheduler + close DB
+    try:
+        from service.whatsapp_service import shutdown_whatsapp_executor
+        shutdown_whatsapp_executor(wait=False)
+    except Exception as e:
+        logger.warning("WhatsApp executor shutdown failed: %s", e)
+
     if _scheduler_task:
         _scheduler_task.cancel()
         try:

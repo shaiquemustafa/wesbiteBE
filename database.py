@@ -3,7 +3,7 @@ import json
 from contextlib import contextmanager
 from dotenv import load_dotenv
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import register_default_jsonb
 
 load_dotenv()
@@ -14,16 +14,24 @@ if not DATABASE_URL:
 
 register_default_jsonb(loads=json.loads, globally=True)
 
-_pool: SimpleConnectionPool | None = None
+# Pool sizing — must comfortably exceed WHATSAPP_PARALLELISM since each
+# broadcast worker may grab a connection to record delivery status.
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "30"))
+
+_pool: ThreadedConnectionPool | None = None
 
 
 def connect_to_db():
     """Initializes the Postgres connection pool and ensures tables exist."""
     global _pool
     if _pool is None:
-        _pool = SimpleConnectionPool(
-            1,
-            8,
+        # ThreadedConnectionPool is thread-safe (unlike SimpleConnectionPool).
+        # We need this because broadcasts now fan out across many worker
+        # threads, and each may call get_conn() concurrently.
+        _pool = ThreadedConnectionPool(
+            DB_POOL_MIN,
+            DB_POOL_MAX,
             dsn=DATABASE_URL,
             sslmode="require",
             keepalives=1,
@@ -41,6 +49,15 @@ def close_db_connection():
     if _pool:
         _pool.closeall()
         _pool = None
+
+
+def get_pool_status() -> dict:
+    """Returns basic pool sizing info for diagnostics."""
+    return {
+        "min": DB_POOL_MIN,
+        "max": DB_POOL_MAX,
+        "initialized": _pool is not None,
+    }
 
 
 @contextmanager

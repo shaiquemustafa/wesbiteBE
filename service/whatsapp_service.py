@@ -1,9 +1,14 @@
 # service/whatsapp_service.py – Gupshup WhatsApp API integration
 import os
 import json
+import time
 import logging
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from typing import Iterable, Optional, Sequence
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from database import get_conn
 
@@ -13,6 +18,18 @@ IST = timezone(timedelta(hours=5, minutes=30))
 load_dotenv()
 
 logger = logging.getLogger("uvicorn.error")
+
+# ─────────────────────────────────────────────────────────────────────
+# Concurrency / HTTP tuning
+# ─────────────────────────────────────────────────────────────────────
+# Number of WhatsApp messages we send to Gupshup in parallel during a
+# broadcast. Gupshup's WhatsApp Cloud API tolerates ~80 msg/sec on a
+# verified business number; 20 keeps us comfortably under that while
+# also keeping CPU/memory usage tiny on a Render Starter dyno.
+WHATSAPP_PARALLELISM = int(os.getenv("WHATSAPP_PARALLELISM", "20"))
+WHATSAPP_REQUEST_TIMEOUT = int(os.getenv("WHATSAPP_REQUEST_TIMEOUT", "20"))
+WHATSAPP_MAX_RETRIES = int(os.getenv("WHATSAPP_MAX_RETRIES", "1"))
+WHATSAPP_RETRY_BACKOFF_SEC = float(os.getenv("WHATSAPP_RETRY_BACKOFF_SEC", "1.0"))
 
 # Gupshup API Configuration - Hardcoded values
 GUPSHUP_BASE_URL = "https://api.gupshup.io/wa/api/v1"
@@ -38,6 +55,42 @@ USER_TRAINING_TEMPLATE_ID = "b6082566-52b3-43e4-b13a-3053db1f456b"
 # RITO website URL (used in notification messages)
 RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "rito.co.in")
 RITO_MANAGE_URL = os.getenv("RITO_MANAGE_URL", "rito.co.in/#watchlist")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Module-level singletons: HTTP session (connection pooling) and a
+# dedicated thread pool for parallel WhatsApp sends. Keeping these
+# outside the class means they survive across all WhatsAppService()
+# instances and never compete with the asyncio default thread pool
+# (which serves heavier work like the BSE pipeline via asyncio.to_thread).
+# ─────────────────────────────────────────────────────────────────────
+def _build_gupshup_session() -> requests.Session:
+    sess = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=WHATSAPP_PARALLELISM,
+        pool_maxsize=WHATSAPP_PARALLELISM * 2,
+        max_retries=0,  # we handle retries manually for richer logging
+    )
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+
+_GUPSHUP_SESSION: requests.Session = _build_gupshup_session()
+_WHATSAPP_EXECUTOR: ThreadPoolExecutor = ThreadPoolExecutor(
+    max_workers=WHATSAPP_PARALLELISM,
+    thread_name_prefix="whatsapp-send",
+)
+_EXECUTOR_LOCK = threading.Lock()
+
+
+def shutdown_whatsapp_executor(wait: bool = False) -> None:
+    """Gracefully shut down the WhatsApp worker pool (called on app stop)."""
+    with _EXECUTOR_LOCK:
+        try:
+            _WHATSAPP_EXECUTOR.shutdown(wait=wait, cancel_futures=not wait)
+        except Exception:
+            pass
 
 
 class WhatsAppService:
@@ -81,6 +134,138 @@ class WhatsAppService:
                     )
         except Exception as e:
             logger.warning("  ⚠️ Failed to store message delivery record for %s: %s", message_id, e)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Internal: single-template send with retry on 429/5xx/network err
+    # ─────────────────────────────────────────────────────────────────
+    def _post_template_request(self, phone: str, template_obj: dict) -> tuple[bool, dict | None, int]:
+        """
+        Posts ONE template message to Gupshup with up to WHATSAPP_MAX_RETRIES
+        extra attempts on 429 / 5xx / network errors.
+
+        Returns (success, response_data_or_None, last_status_code).
+        """
+        url = f"{self.base_url}/template/msg"
+        payload = {
+            "channel": "whatsapp",
+            "source": GUPSHUP_SOURCE_NUMBER,
+            "destination": phone,
+            "src.name": GUPSHUP_APP_NAME,
+            "template": json.dumps(template_obj),
+        }
+
+        last_status = 0
+        for attempt in range(1 + WHATSAPP_MAX_RETRIES):
+            try:
+                response = _GUPSHUP_SESSION.post(
+                    url,
+                    data=payload,
+                    headers=self.headers,
+                    timeout=WHATSAPP_REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as e:
+                last_status = -1
+                if attempt < WHATSAPP_MAX_RETRIES:
+                    time.sleep(WHATSAPP_RETRY_BACKOFF_SEC)
+                    continue
+                logger.warning("  ⚠️ Gupshup network error to %s: %s", phone, e)
+                return False, None, last_status
+
+            last_status = response.status_code
+
+            # Retry on rate-limit / transient server errors
+            if (response.status_code == 429 or response.status_code >= 500) and attempt < WHATSAPP_MAX_RETRIES:
+                logger.info(
+                    "  ↻ Gupshup %s for %s — retrying after %.1fs",
+                    response.status_code, phone, WHATSAPP_RETRY_BACKOFF_SEC,
+                )
+                time.sleep(WHATSAPP_RETRY_BACKOFF_SEC)
+                continue
+
+            if not response.text or not response.text.strip():
+                return False, None, last_status
+
+            try:
+                data = response.json()
+            except ValueError:
+                return response.status_code == 200, None, last_status
+
+            status = (data.get("status") or "").lower()
+            if isinstance(data.get("response"), dict):
+                status = status or (data["response"].get("status") or "").lower()
+            success = (
+                status in ("success", "submitted", "accepted")
+                or response.status_code == 200
+                or data.get("accepted", False)
+            )
+            return success, data, last_status
+
+        return False, None, last_status
+
+    def _send_one_template(self, phone: str, template_obj: dict, message_title: str) -> bool:
+        """
+        Sends one template, records delivery status on success. This is the
+        single entry point used by both single-shot calls (OTP) and the
+        parallel broadcast fan-out paths.
+        """
+        try:
+            success, data, status_code = self._post_template_request(phone, template_obj)
+        except Exception as e:
+            logger.error("  ❌ _send_one_template crashed for %s: %s", phone, e)
+            return False
+
+        if success and data:
+            message_id = (
+                data.get("messageId")
+                or data.get("id")
+                or (data.get("response", {}) or {}).get("messageId")
+            )
+            if message_id:
+                try:
+                    self._store_message_delivery_record(message_id, phone, message_title)
+                except Exception as e:
+                    logger.warning("  ⚠️ Failed to store delivery record for %s: %s", phone, e)
+        elif not success:
+            err = None
+            if isinstance(data, dict):
+                err = data.get("message") or data.get("error")
+                if not err and isinstance(data.get("response"), dict):
+                    err = data["response"].get("message")
+            logger.warning(
+                "  ⚠️ Gupshup template send failed phone=%s status=%s err=%s",
+                phone, status_code, err or "unknown",
+            )
+        return success
+
+    def _fan_out_template_sends(
+        self,
+        jobs: Sequence[tuple[str, dict, str]],
+    ) -> dict:
+        """
+        Submits a list of (phone, template_obj, message_title) jobs to the
+        dedicated WhatsApp thread pool and waits for all of them to finish.
+
+        Returns {"sent": int, "failed": int, "total": int}.
+        """
+        if not jobs:
+            return {"sent": 0, "failed": 0, "total": 0}
+
+        sent = 0
+        failed = 0
+        futures = [
+            _WHATSAPP_EXECUTOR.submit(self._send_one_template, phone, tpl, title)
+            for phone, tpl, title in jobs
+        ]
+        for fut in as_completed(futures):
+            try:
+                if fut.result():
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                logger.error("  ❌ WhatsApp send future raised: %s", e)
+        return {"sent": sent, "failed": failed, "total": len(jobs)}
 
     def send_otp(self, phone: str, otp_code: str) -> bool:
         """
@@ -303,12 +488,16 @@ class WhatsAppService:
 
     def send_market_update_broadcast(self, phones: list, item: dict, is_watchlist: bool = False) -> dict:
         """
-        Sends a market update to MULTIPLE users using Gupshup API.
+        Sends a market update to MULTIPLE users via Gupshup, fanning out
+        across the dedicated WhatsApp thread pool (WHATSAPP_PARALLELISM
+        concurrent requests). The asyncio event loop is NOT touched here —
+        callers should invoke this from a worker thread (asyncio.to_thread)
+        so the API stays responsive.
 
         Args:
             phones: List of phone numbers (with country code, no '+')
             item: Enriched prediction dict
-            is_watchlist: True if this is a watchlist-only notification, False for regular broadcast
+            is_watchlist: True if this is a watchlist-only notification
 
         Returns:
             {"sent": int, "failed": int}
@@ -316,167 +505,95 @@ class WhatsAppService:
         if not phones:
             return {"sent": 0, "failed": 0}
 
-        # Build parameters for Gupshup template
         params = self._build_market_update_params(item, is_watchlist)
-        
-        # Gupshup API endpoint for template messages
-        url = f"{self.base_url}/template/msg"
-        
-        # Select template based on message type
         template_id = WATCHLIST_TEMPLATE_ID if is_watchlist else HIGH_IMPACT_TEMPLATE_ID
-        
-        # Build template object
-        template_obj = {
-            "id": template_id,
-            "params": params  # 5 parameters as array
-        }
-        
-        sent_count = 0
-        failed_count = 0
-    
-        # Gupshup doesn't have a bulk API like WATI, so we send individually
+        template_obj = {"id": template_id, "params": params}
+
+        # Dedupe & basic clean-up so we don't send the same person twice
+        unique_phones = []
+        seen = set()
+        for p in phones:
+            if not p:
+                continue
+            p = str(p).strip()
+            if p and p not in seen:
+                seen.add(p)
+                unique_phones.append(p)
+
+        company_name = item.get("company_name", "Unknown Company")
         logger.info(
-            "  📤 Gupshup broadcast: template=%s | receivers=%d | watchlist=%s",
-            template_id, len(phones), is_watchlist,
+            "  📤 Gupshup broadcast: template=%s | receivers=%d | watchlist=%s | parallelism=%d",
+            template_id, len(unique_phones), is_watchlist, WHATSAPP_PARALLELISM,
         )
-        
-        for phone in phones:
-            try:
-                payload = {
-                    "channel": "whatsapp",
-                    "source": GUPSHUP_SOURCE_NUMBER,  # 919187624274
-                    "destination": phone,  # Recipient phone number
-                    "src.name": GUPSHUP_APP_NAME,  # RITI01
-                    "template": json.dumps(template_obj),  # Template as JSON string
-                }
-                
-                response = requests.post(url, data=payload, headers=self.headers, timeout=15)
-                
-                if not response.text or not response.text.strip():
-                    logger.warning("  ⚠️ Gupshup returned empty response (status %s) for %s", response.status_code, phone)
-                    failed_count += 1
-                    continue
-                
-                # Check response
-                try:
-                    data = response.json()
-                except ValueError:
-                    if response.status_code == 200:
-                        sent_count += 1
-                        continue
-                    else:
-                        logger.warning("  ⚠️ Gupshup non-JSON response (status %s) for %s: %s", response.status_code, phone, response.text[:200])
-                        failed_count += 1
-                        continue
-                
-                # Check for success
-                status = data.get("status", "").lower()
-                if isinstance(data.get("response"), dict):
-                    response_status = data.get("response", {}).get("status", "")
-                    status = status or response_status.lower()
-                
-                success = (
-                    status in ["success", "submitted", "accepted"] or 
-                    response.status_code == 200 or
-                    data.get("accepted", False)
-                )
-                
-                if success:
-                    # Log message ID if available (for tracking via webhooks)
-                    message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
-                    if message_id:
-                        # Store directly in message_delivery_status with company name
-                        company_name = item.get("company_name", "Unknown Company")
-                        self._store_message_delivery_record(message_id, phone, company_name)
-                        logger.info("  ✅ Message sent to %s - messageId: %s", phone, message_id)
-                    sent_count += 1
-                else:
-                    failed_count += 1
-                    error_msg = (
-                        data.get("message") or 
-                        data.get("error") or 
-                        data.get("response", {}).get("message", "") if isinstance(data.get("response"), dict) else "" or
-                        "Unknown error"
-                    )
-                    logger.warning("  ⚠️ Failed to send to %s: %s", phone, error_msg)
-                    
-            except Exception as e:
-                logger.error("  ❌ Gupshup API error for %s: %s", phone, e)
-                failed_count += 1
-        
+
+        t0 = time.monotonic()
+        jobs = [(phone, template_obj, company_name) for phone in unique_phones]
+        result = self._fan_out_template_sends(jobs)
+        elapsed = time.monotonic() - t0
+
         logger.info(
-            "  ✅ Gupshup broadcast complete: %d sent, %d failed out of %d contacts",
-            sent_count, failed_count, len(phones),
+            "  ✅ Gupshup broadcast complete: %d sent, %d failed out of %d contacts in %.2fs",
+            result["sent"], result["failed"], result["total"], elapsed,
         )
-        return {"sent": sent_count, "failed": failed_count}
+        return {"sent": result["sent"], "failed": result["failed"]}
 
     def send_user_training_message(
         self, phone: str, name_label: str, watchlist_csv: str, high_impact_label: str
     ) -> bool:
         """
-        Sends the 'user_training' utility template via Gupshup.
-
-        Params:
-          - name_label: literal text after 'Hi ' (e.g., 'user')
-          - watchlist_csv: comma-separated company names (or fallback text)
-          - high_impact_label: 'turned on' / 'turned off'
+        Sends ONE 'user_training' utility template message. For mass sends
+        prefer `send_user_training_messages` which fans out in parallel.
         """
-        url = f"{self.base_url}/template/msg"
         template_obj = {
             "id": USER_TRAINING_TEMPLATE_ID,
             "params": [name_label, watchlist_csv, high_impact_label],
         }
-        payload = {
-            "channel": "whatsapp",
-            "source": GUPSHUP_SOURCE_NUMBER,
-            "destination": phone,
-            "src.name": GUPSHUP_APP_NAME,
-            "template": json.dumps(template_obj),
-        }
-        try:
-            response = requests.post(url, data=payload, headers=self.headers, timeout=15)
-            if not response.text or not response.text.strip():
-                logger.warning(
-                    "  ⚠️ Gupshup empty response for user_training to %s (status %s)",
-                    phone, response.status_code,
-                )
-                return False
-            try:
-                data = response.json()
-            except ValueError:
-                if response.status_code == 200:
-                    return True
-                logger.warning(
-                    "  ⚠️ Gupshup non-JSON response for user_training to %s (status %s): %s",
-                    phone, response.status_code, response.text[:200],
-                )
-                return False
-            status = (data.get("status") or "").lower()
-            if isinstance(data.get("response"), dict):
-                status = status or (data["response"].get("status") or "").lower()
-            success = (
-                status in ("success", "submitted", "accepted")
-                or response.status_code == 200
-                or data.get("accepted", False)
-            )
-            if success:
-                message_id = (
-                    data.get("messageId")
-                    or data.get("id")
-                    or (data.get("response", {}) or {}).get("messageId")
-                )
-                if message_id:
-                    self._store_message_delivery_record(message_id, phone, "User Training")
-            else:
-                logger.warning(
-                    "  ⚠️ user_training send failed for %s: %s",
-                    phone,
-                    data.get("message") or data.get("error") or "Unknown",
-                )
-            return success
-        except Exception as e:
-            logger.error("  ❌ user_training Gupshup error for %s: %s", phone, e)
-            return False
+        return self._send_one_template(phone, template_obj, "User Training")
+
+    def send_user_training_messages(self, recipients: Iterable[dict]) -> dict:
+        """
+        Sends the 'user_training' template to many users in parallel.
+
+        Each `recipient` dict must contain:
+          - phone (str)
+          - name_label (str)
+          - watchlist_csv (str)
+          - high_impact_label (str)
+
+        Returns {"sent": int, "failed": int, "total": int}.
+        """
+        jobs: list[tuple[str, dict, str]] = []
+        seen_phones: set[str] = set()
+        for r in recipients:
+            phone = (r.get("phone") or "").strip()
+            if not phone or phone in seen_phones:
+                continue
+            seen_phones.add(phone)
+            template_obj = {
+                "id": USER_TRAINING_TEMPLATE_ID,
+                "params": [
+                    r.get("name_label", "user"),
+                    r.get("watchlist_csv", "no stocks added yet"),
+                    r.get("high_impact_label", "turned off"),
+                ],
+            }
+            jobs.append((phone, template_obj, "User Training"))
+
+        if not jobs:
+            return {"sent": 0, "failed": 0, "total": 0}
+
+        logger.info(
+            "  📤 Gupshup user_training broadcast: receivers=%d | parallelism=%d",
+            len(jobs), WHATSAPP_PARALLELISM,
+        )
+        t0 = time.monotonic()
+        result = self._fan_out_template_sends(jobs)
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "  ✅ user_training broadcast: %d sent, %d failed out of %d in %.2fs",
+            result["sent"], result["failed"], result["total"], elapsed,
+        )
+        return result
 
     def send_template_message(self, phone: str, template_name: str, parameters: list = None) -> bool:
         """
