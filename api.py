@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import json
 import logging
+import time
 
 from announcements import fetch_and_filter_announcements
 from results import _process_single_announcement, _impact_map
@@ -32,6 +33,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Scheduler config (env-overridable)
 SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "2"))
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+# How often the 'user_training' utility template (feature explainer) is broadcast
+USER_TRAINING_INTERVAL_DAYS = int(os.getenv("USER_TRAINING_INTERVAL_DAYS", "15"))
+USER_TRAINING_JOB_NAME = "user_training_broadcast"
 META_PIXEL_ID = os.getenv("META_PIXEL_ID", "1245580987757334")
 META_ACCESS_TOKEN = os.getenv(
     "META_ACCESS_TOKEN",
@@ -146,6 +150,178 @@ async def _send_pending_broadcasts():
             logger.info("  ✅ Sent %d pending notifications", sent_count)
     except Exception as e:
         logger.error("  ❌ Error in _send_pending_broadcasts: %s", e)
+
+
+# =========================================================================
+#  USER TRAINING BROADCAST
+#  Sends the 'user_training' utility template to every active user every
+#  USER_TRAINING_INTERVAL_DAYS days. Tracks last_run_at in scheduled_jobs
+#  so the cadence survives restarts and is never duplicated.
+# =========================================================================
+def _format_high_impact_label(receive_all_updates: bool) -> str:
+    """'turned on' if user opted into high-impact news, else 'turned off'."""
+    return "turned on" if receive_all_updates else "turned off"
+
+
+def _format_watchlist_csv(company_names: list[str]) -> str:
+    """
+    Joins the user's watchlist company names with commas. Falls back to a
+    polite placeholder when the user has not added any stocks yet (Gupshup
+    template variables cannot be empty).
+    """
+    cleaned = [str(n).strip() for n in (company_names or []) if n and str(n).strip()]
+    if not cleaned:
+        return "no stocks added yet"
+    return ", ".join(cleaned)
+
+
+def _fetch_user_training_recipients() -> list[dict]:
+    """
+    Returns the list of users who should receive the 'user_training' broadcast.
+
+    Each row: {phone, receive_all_updates, watchlist_companies (list[str])}.
+    Only active users with a phone number are included.
+    """
+    recipients: list[dict] = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT u.id,
+                           u.phone,
+                           COALESCE(u.receive_all_updates, FALSE) AS receive_all_updates,
+                           COALESCE(
+                               ARRAY_AGG(c.company_name ORDER BY c.company_name)
+                                   FILTER (WHERE c.company_name IS NOT NULL),
+                               ARRAY[]::TEXT[]
+                           ) AS watchlist_companies
+                    FROM users u
+                    LEFT JOIN user_watchlist w ON w.user_id = u.id
+                    LEFT JOIN company_master c ON c.bse_scrip_code = w.bse_scrip_code
+                    WHERE u.is_active = TRUE
+                      AND u.phone IS NOT NULL
+                      AND TRIM(u.phone) <> ''
+                    GROUP BY u.id, u.phone, u.receive_all_updates
+                    """
+                )
+                for row in cur.fetchall():
+                    recipients.append(
+                        {
+                            "user_id": row[0],
+                            "phone": row[1],
+                            "receive_all_updates": bool(row[2]),
+                            "watchlist_companies": list(row[3] or []),
+                        }
+                    )
+    except Exception as e:
+        logger.error("  ❌ Failed to load user_training recipients: %s", e)
+    return recipients
+
+
+def _run_user_training_broadcast() -> dict:
+    """
+    Synchronously sends the 'user_training' utility template to every
+    eligible user. Designed to be invoked from a worker thread.
+    """
+    recipients = _fetch_user_training_recipients()
+    if not recipients:
+        logger.info("📚 user_training broadcast: no eligible recipients")
+        return {"sent": 0, "failed": 0, "total": 0}
+
+    svc = WhatsAppService()
+    sent = 0
+    failed = 0
+
+    logger.info("📚 user_training broadcast: sending to %d users", len(recipients))
+    for r in recipients:
+        try:
+            ok = svc.send_user_training_message(
+                phone=r["phone"],
+                name_label="user",
+                watchlist_csv=_format_watchlist_csv(r["watchlist_companies"]),
+                high_impact_label=_format_high_impact_label(r["receive_all_updates"]),
+            )
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+            time.sleep(0.1)
+        except Exception as e:
+            failed += 1
+            logger.warning("  ⚠️ user_training failed for %s: %s", r.get("phone"), e)
+
+    logger.info("📚 user_training broadcast complete: %d sent, %d failed", sent, failed)
+    return {"sent": sent, "failed": failed, "total": len(recipients)}
+
+
+def _claim_scheduled_job(job_name: str, interval_days: int) -> bool:
+    """
+    Atomically claims a periodic job slot. Returns True iff the caller now
+    owns the run (i.e. enough days have elapsed since last_run_at). The
+    timestamp is updated *before* the job runs so concurrent scheduler
+    iterations never double-fire.
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO scheduled_jobs (job_name, last_run_at, last_status, updated_at)
+                    VALUES (%s, NOW(), 'running', NOW())
+                    ON CONFLICT (job_name) DO UPDATE
+                        SET last_run_at = NOW(),
+                            last_status = 'running',
+                            updated_at = NOW()
+                        WHERE scheduled_jobs.last_run_at IS NULL
+                           OR scheduled_jobs.last_run_at <= NOW() - (%s || ' days')::INTERVAL
+                    RETURNING last_run_at
+                    """,
+                    (job_name, str(interval_days)),
+                )
+                row = cur.fetchone()
+                return row is not None
+    except Exception as e:
+        logger.error("  ❌ _claim_scheduled_job(%s) failed: %s", job_name, e)
+        return False
+
+
+def _record_scheduled_job_result(job_name: str, status: str, meta: dict | None = None) -> None:
+    """Records the outcome (success/failure + counts) of a periodic job run."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE scheduled_jobs
+                    SET last_status = %s,
+                        last_meta = %s,
+                        updated_at = NOW()
+                    WHERE job_name = %s
+                    """,
+                    (status, Json(meta or {}), job_name),
+                )
+    except Exception as e:
+        logger.warning("  ⚠️ Failed to record result for job %s: %s", job_name, e)
+
+
+async def _maybe_run_user_training_broadcast() -> None:
+    """
+    Checks if the periodic user_training broadcast is due and, if so,
+    runs it in a worker thread (so we don't block the asyncio loop).
+    """
+    if not _claim_scheduled_job(USER_TRAINING_JOB_NAME, USER_TRAINING_INTERVAL_DAYS):
+        return
+    logger.info(
+        "📚 user_training broadcast is due (every %d days) — starting…",
+        USER_TRAINING_INTERVAL_DAYS,
+    )
+    try:
+        result = await asyncio.to_thread(_run_user_training_broadcast)
+        _record_scheduled_job_result(USER_TRAINING_JOB_NAME, "success", result)
+    except Exception as e:
+        logger.error("❌ user_training broadcast failed: %s", e)
+        _record_scheduled_job_result(USER_TRAINING_JOB_NAME, "failed", {"error": str(e)})
 
 
 def _make_json_serializable(obj):
@@ -347,6 +523,12 @@ async def _scheduled_analysis_loop():
             await _send_pending_broadcasts()
         except Exception as e:
             logger.error("❌ Failed to send pending broadcasts: %s", e)
+
+        # Periodic 'user_training' utility broadcast (every USER_TRAINING_INTERVAL_DAYS days)
+        try:
+            await _maybe_run_user_training_broadcast()
+        except Exception as e:
+            logger.error("❌ user_training periodic broadcast errored: %s", e)
 
         await asyncio.sleep(interval)
 
@@ -1417,6 +1599,138 @@ def backfill_whatsapp_broadcast():
         "skipped": skipped_count,
         "errors": error_count,
     }
+
+
+@app.post(
+    "/api/admin/send-user-training",
+    summary="[ADMIN] Send the 'user_training' utility template (feature explainer) to all active users",
+)
+async def send_user_training(
+    dry_run: bool = Query(False, description="If true, return the recipient list without sending."),
+    force: bool = Query(False, description="If true, bypass the 15-day cadence and send immediately."),
+):
+    """
+    Sends the 'user_training' WhatsApp utility template (Gupshup ID
+    b6082566-52b3-43e4-b13a-3053db1f456b) to every active user.
+
+    Template params per user:
+      {{1}} = "user"               (literal — the body reads "Hi user,")
+      {{2}} = comma-separated list of company names in the user's watchlist
+              (or "no stocks added yet" if the watchlist is empty)
+      {{3}} = "turned on"  if receive_all_updates = TRUE
+              "turned off" otherwise
+
+    Cadence: this endpoint is also driven automatically every
+    USER_TRAINING_INTERVAL_DAYS days by the background scheduler. Use
+    `force=true` to bypass the cadence check and send right now.
+    """
+    if dry_run:
+        recipients = _fetch_user_training_recipients()
+        sample = [
+            {
+                "phone": r["phone"],
+                "watchlist_csv": _format_watchlist_csv(r["watchlist_companies"]),
+                "high_impact_label": _format_high_impact_label(r["receive_all_updates"]),
+            }
+            for r in recipients[:25]
+        ]
+        return {
+            "message": "Dry run – no messages sent.",
+            "total_recipients": len(recipients),
+            "sample": sample,
+        }
+
+    if force:
+        # Bypass cadence: still update last_run_at so the next periodic
+        # tick doesn't re-fire for another USER_TRAINING_INTERVAL_DAYS days.
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO scheduled_jobs (job_name, last_run_at, last_status, updated_at)
+                        VALUES (%s, NOW(), 'running', NOW())
+                        ON CONFLICT (job_name) DO UPDATE
+                            SET last_run_at = NOW(),
+                                last_status = 'running',
+                                updated_at = NOW()
+                        """,
+                        (USER_TRAINING_JOB_NAME,),
+                    )
+        except Exception as e:
+            logger.warning("  ⚠️ force send: failed to stamp scheduled_jobs: %s", e)
+        try:
+            result = await asyncio.to_thread(_run_user_training_broadcast)
+            _record_scheduled_job_result(USER_TRAINING_JOB_NAME, "success", result)
+            return {"message": "user_training broadcast sent (forced).", **result}
+        except Exception as e:
+            _record_scheduled_job_result(USER_TRAINING_JOB_NAME, "failed", {"error": str(e)})
+            raise HTTPException(status_code=500, detail=f"user_training broadcast failed: {e}")
+
+    if not _claim_scheduled_job(USER_TRAINING_JOB_NAME, USER_TRAINING_INTERVAL_DAYS):
+        return {
+            "message": (
+                f"Skipped — last user_training broadcast is less than "
+                f"{USER_TRAINING_INTERVAL_DAYS} days old. Use force=true to override."
+            ),
+            "sent": 0,
+            "failed": 0,
+            "total": 0,
+        }
+
+    try:
+        result = await asyncio.to_thread(_run_user_training_broadcast)
+        _record_scheduled_job_result(USER_TRAINING_JOB_NAME, "success", result)
+        return {"message": "user_training broadcast sent.", **result}
+    except Exception as e:
+        _record_scheduled_job_result(USER_TRAINING_JOB_NAME, "failed", {"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"user_training broadcast failed: {e}")
+
+
+@app.get(
+    "/api/admin/user-training-status",
+    summary="[ADMIN] Last run timestamp + status for the user_training broadcast",
+)
+def user_training_status():
+    """Returns last_run_at, last_status, and the next scheduled run for the user_training job."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT last_run_at, last_status, last_meta, updated_at
+                    FROM scheduled_jobs
+                    WHERE job_name = %s
+                    """,
+                    (USER_TRAINING_JOB_NAME,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return {
+                "job_name": USER_TRAINING_JOB_NAME,
+                "interval_days": USER_TRAINING_INTERVAL_DAYS,
+                "last_run_at": None,
+                "next_run_at": "due now",
+                "last_status": None,
+                "last_meta": None,
+            }
+        last_run_at, last_status, last_meta, updated_at = row
+        next_run_at = (
+            (last_run_at + timedelta(days=USER_TRAINING_INTERVAL_DAYS)).isoformat()
+            if last_run_at
+            else "due now"
+        )
+        return {
+            "job_name": USER_TRAINING_JOB_NAME,
+            "interval_days": USER_TRAINING_INTERVAL_DAYS,
+            "last_run_at": last_run_at.isoformat() if last_run_at else None,
+            "next_run_at": next_run_at,
+            "last_status": last_status,
+            "last_meta": last_meta,
+            "updated_at": updated_at.isoformat() if updated_at else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read user_training status: {e}")
 
 
 @app.post("/api/admin/send-pending-broadcasts", summary="[ADMIN] Send notifications for unsent whatsapp_broadcast entries")

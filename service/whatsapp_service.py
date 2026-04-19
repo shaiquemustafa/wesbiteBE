@@ -31,6 +31,9 @@ WATCHLIST_TEMPLATE_ID = "1f019a3b-1bd3-4af9-91ff-118955cea4a0"
 HIGH_IMPACT_TEMPLATE_ID = "ade884d4-7716-46a0-a371-a234158dd9c1"
 # Legacy template (kept for backward compatibility, but not used)
 MARKET_UPDATE_TEMPLATE_ID = "109c6887-f03c-4617-a4d3-efd0c8c59ddf"
+# Periodic user education template (utility, approved as 'user_training')
+# Params: [name_label, watchlist_companies_csv, high_impact_status_label]
+USER_TRAINING_TEMPLATE_ID = "b6082566-52b3-43e4-b13a-3053db1f456b"
 
 # RITO website URL (used in notification messages)
 RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "rito.co.in")
@@ -406,6 +409,74 @@ class WhatsAppService:
             sent_count, failed_count, len(phones),
         )
         return {"sent": sent_count, "failed": failed_count}
+
+    def send_user_training_message(
+        self, phone: str, name_label: str, watchlist_csv: str, high_impact_label: str
+    ) -> bool:
+        """
+        Sends the 'user_training' utility template via Gupshup.
+
+        Params:
+          - name_label: literal text after 'Hi ' (e.g., 'user')
+          - watchlist_csv: comma-separated company names (or fallback text)
+          - high_impact_label: 'turned on' / 'turned off'
+        """
+        url = f"{self.base_url}/template/msg"
+        template_obj = {
+            "id": USER_TRAINING_TEMPLATE_ID,
+            "params": [name_label, watchlist_csv, high_impact_label],
+        }
+        payload = {
+            "channel": "whatsapp",
+            "source": GUPSHUP_SOURCE_NUMBER,
+            "destination": phone,
+            "src.name": GUPSHUP_APP_NAME,
+            "template": json.dumps(template_obj),
+        }
+        try:
+            response = requests.post(url, data=payload, headers=self.headers, timeout=15)
+            if not response.text or not response.text.strip():
+                logger.warning(
+                    "  ⚠️ Gupshup empty response for user_training to %s (status %s)",
+                    phone, response.status_code,
+                )
+                return False
+            try:
+                data = response.json()
+            except ValueError:
+                if response.status_code == 200:
+                    return True
+                logger.warning(
+                    "  ⚠️ Gupshup non-JSON response for user_training to %s (status %s): %s",
+                    phone, response.status_code, response.text[:200],
+                )
+                return False
+            status = (data.get("status") or "").lower()
+            if isinstance(data.get("response"), dict):
+                status = status or (data["response"].get("status") or "").lower()
+            success = (
+                status in ("success", "submitted", "accepted")
+                or response.status_code == 200
+                or data.get("accepted", False)
+            )
+            if success:
+                message_id = (
+                    data.get("messageId")
+                    or data.get("id")
+                    or (data.get("response", {}) or {}).get("messageId")
+                )
+                if message_id:
+                    self._store_message_delivery_record(message_id, phone, "User Training")
+            else:
+                logger.warning(
+                    "  ⚠️ user_training send failed for %s: %s",
+                    phone,
+                    data.get("message") or data.get("error") or "Unknown",
+                )
+            return success
+        except Exception as e:
+            logger.error("  ❌ user_training Gupshup error for %s: %s", phone, e)
+            return False
 
     def send_template_message(self, phone: str, template_name: str, parameters: list = None) -> bool:
         """

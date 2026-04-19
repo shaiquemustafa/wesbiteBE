@@ -357,6 +357,20 @@ def _ensure_tables(conn):
             """
         )
 
+        # Scheduled jobs table — tracks last_run_at for periodic background jobs
+        # (e.g. the 'user_training_broadcast' that goes out every 15 days)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                job_name VARCHAR(100) PRIMARY KEY,
+                last_run_at TIMESTAMPTZ,
+                last_status VARCHAR(50),
+                last_meta JSONB,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
         # WhatsApp broadcast table (filtered bulk messages for all users)
         # Stores only: STRONGLY POSITIVE (all >2,500 Cr), STRONGLY NEGATIVE (>10K Cr), FINANCIAL RESULTS. Regular NEGATIVE is excluded.
         cur.execute(
@@ -548,6 +562,13 @@ def _ensure_tables(conn):
                 "No automatic cleanup - permanent user data.",
                 "No filtering - all users are stored.",
                 "User management - stores phone numbers, names, notification preferences (receive_all_updates), onboarding status. last_incoming_message_text holds a JSON array string of the last 4 inbound WhatsApp messages.",
+            ),
+            (
+                "scheduled_jobs",
+                "Tracks last_run_at for periodic background jobs (e.g. user_training_broadcast every 15 days).",
+                "No automatic cleanup - one row per job_name.",
+                "No filtering - one row per job_name.",
+                "Background scheduler bookkeeping - guarantees periodic broadcasts run on cadence and are not duplicated on restart.",
             ),
             (
                 "user_watchlist",
