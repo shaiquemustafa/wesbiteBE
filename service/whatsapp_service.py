@@ -376,6 +376,50 @@ class WhatsAppService:
             logger.error("  ❌ Failed to update contact attributes for %s: %s", phone, e)
             return False
 
+    def _lookup_nse_symbol(self, item: dict) -> Optional[str]:
+        """
+        Best-effort NSE symbol resolution for a broadcast item.
+
+        Order of preference:
+          1. item['nse_symbol']        (set by stock_enrichment for new items)
+          2. item['NSE_Symbol']        (legacy key from results.py)
+          3. company_master.nse_symbol via scrip_cd  (fallback for older
+             whatsapp_broadcast rows that pre-date enrichment)
+
+        Runs at most one tiny indexed SELECT per news item (NOT per
+        recipient), so it does not add any per-user overhead during fan-out.
+        """
+        for key in ("nse_symbol", "NSE_Symbol"):
+            val = item.get(key)
+            if val is None:
+                continue
+            val = str(val).strip()
+            if val and val.lower() != "none":
+                return val
+
+        scrip = item.get("scrip_cd") or item.get("SCRIP_CD")
+        if not scrip:
+            return None
+        try:
+            scrip_int = int(str(scrip).strip())
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT nse_symbol FROM company_master WHERE bse_scrip_code = %s",
+                        (scrip_int,),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        sym = str(row[0]).strip()
+                        return sym or None
+        except Exception as e:
+            logger.warning("  ⚠️ NSE symbol lookup failed for scrip=%s: %s", scrip_int, e)
+        return None
+
     def _build_market_update_params(self, item: dict, is_watchlist: bool = False) -> list:
         """
         Builds the template parameters list for a market update item.
@@ -393,9 +437,19 @@ class WhatsAppService:
         # Parameter 1: Just "user" (not personalized)
         param1 = "user"
         
-        # Parameter 2: Company name (templates are clear, no need for prefixes)
-        # Just the company name with formatting for visual appeal
-        param2 = f"📊 *{company_name}*"
+        # Parameter 2: Company name. For the HIGH-IMPACT broadcast we also
+        # append the NSE symbol in brackets when available (e.g.
+        # "📊 *Wipro Limited (WIPRO)*") so recipients can instantly pull
+        # the stock up in their trading app. Watchlist users already know
+        # the symbol, so we keep that template unchanged.
+        if not is_watchlist:
+            nse_symbol = self._lookup_nse_symbol(item)
+            if nse_symbol:
+                param2 = f"📊 *{company_name} ({nse_symbol})*"
+            else:
+                param2 = f"📊 *{company_name}*"
+        else:
+            param2 = f"📊 *{company_name}*"
         
         # Parameter 3: Category and impact with color-coded emojis
         category = item.get("category", "General")
