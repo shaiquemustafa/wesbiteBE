@@ -1139,6 +1139,145 @@ def company_master_count():
     return {"total": company_service.get_count()}
 
 
+@app.get(
+    "/api/admin/industry-stats",
+    summary="[ADMIN] Industry distribution in company_master",
+)
+def admin_industry_stats():
+    """Returns total rows, uncategorized count, and a per-industry breakdown."""
+    company_service = CompanyService()
+    total = company_service.get_count()
+    uncategorized = company_service.count_uncategorized()
+    breakdown = company_service.count_by_industry()
+    return {
+        "total": total,
+        "categorized": total - uncategorized,
+        "uncategorized": uncategorized,
+        "by_industry": breakdown,
+    }
+
+
+@app.post(
+    "/api/admin/backfill-industries",
+    summary="[ADMIN] Classify all uncategorized rows in company_master",
+)
+def admin_backfill_industries(
+    limit: int = Query(
+        500,
+        ge=1,
+        le=5000,
+        description="Max rows to process in this call (run again to continue).",
+    ),
+    use_llm: bool = Query(
+        False,
+        description="Use gpt-4.1-nano fallback for rows the deterministic cascade can't classify.",
+    ),
+    fetch_api_industry: bool = Query(
+        True,
+        description=(
+            "Call Indian API /stock?name=<nse_symbol or company_name> for each row "
+            "to enrich with the api_industry field. Costs API quota."
+        ),
+    ),
+):
+    """
+    Backfill the `industry` column in `company_master` for rows where it is
+    NULL. Idempotent: safe to call repeatedly. Already-classified rows are
+    never touched.
+
+    Cascade per row:
+      1. Indian API /stock → companyProfile.industry → 24-label map
+      2. Keyword cascade on company_name
+      3. (optional) gpt-4.1-nano LLM fallback
+    """
+    from service.industry_classifier import (
+        CANON_NAMES,
+        classify as classify_industry,
+        classify_with_llm,
+    )
+    # Lazy local import to avoid a hard dependency on stock_enrichment when
+    # this endpoint isn't called.
+    from stock_enrichment import _fetch_stock_info
+
+    company_service = CompanyService()
+    rows = company_service.fetch_uncategorized_batch(limit)
+    if not rows:
+        return {
+            "message": "Nothing to do — every row already has an industry.",
+            "processed": 0,
+            "classified_indian_api": 0,
+            "classified_keyword": 0,
+            "classified_llm": 0,
+            "still_unknown": 0,
+            "remaining_uncategorized": 0,
+        }
+
+    n_api = 0
+    n_keyword = 0
+    n_unknown = 0
+    unresolved: list[dict] = []
+    api_calls = 0
+
+    for row in rows:
+        scrip = row["bse_scrip_code"]
+        name = (row.get("company_name") or "").strip()
+        nse = (row.get("nse_symbol") or "").strip()
+
+        api_industry: Optional[str] = None
+        if fetch_api_industry:
+            # Prefer NSE symbol — bulletproof key for Indian API.
+            query = nse if nse else name
+            if query:
+                try:
+                    info = _fetch_stock_info(query)
+                    api_calls += 1
+                    if info:
+                        api_industry = info.get("api_industry")
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Indian API failed for SCRIP %s ('%s'): %s", scrip, query, e)
+
+        label, source = classify_industry(name, api_industry)
+        if label:
+            company_service.update_industry(scrip, label, source)
+            if source == "indian_api":
+                n_api += 1
+            else:
+                n_keyword += 1
+        else:
+            unresolved.append({
+                "id": int(scrip),
+                "company_name": name,
+                "api_industry": api_industry,
+            })
+
+    n_llm = 0
+    if use_llm and unresolved:
+        llm_hits = classify_with_llm(unresolved)
+        for scrip_id, label in llm_hits.items():
+            if label in CANON_NAMES:
+                company_service.update_industry(int(scrip_id), label, "llm")
+                n_llm += 1
+        # Anything still unresolved after LLM
+        n_unknown = len(unresolved) - n_llm
+    else:
+        n_unknown = len(unresolved)
+
+    remaining = company_service.count_uncategorized()
+    return {
+        "processed": len(rows),
+        "classified_indian_api": n_api,
+        "classified_keyword": n_keyword,
+        "classified_llm": n_llm,
+        "still_unknown": n_unknown,
+        "indian_api_calls": api_calls,
+        "remaining_uncategorized": remaining,
+        "unresolved_sample": [
+            {"bse_scrip_code": u["id"], "company_name": u["company_name"]}
+            for u in unresolved[:10]
+        ],
+    }
+
+
 # =========================================================================
 # Auth – WhatsApp OTP Login
 # =========================================================================

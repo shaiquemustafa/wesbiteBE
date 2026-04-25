@@ -161,24 +161,120 @@ class CompanyService:
         nse_symbol: Optional[str] = None,
         mkt_cap_full: Optional[float] = None,
         isin: Optional[str] = None,
+        industry: Optional[str] = None,
+        industry_source: Optional[str] = None,
     ):
-        """Insert or update a single company in company_master."""
+        """
+        Insert or update a single company in company_master.
+
+        `industry` (canonical 24-label string) is set ONLY when the row is
+        new or the existing value is NULL — repeated upserts will not
+        clobber an existing classification. To force a re-classification
+        use update_industry().
+        """
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO company_master (bse_scrip_code, isin, company_name, nse_symbol, mkt_cap_full)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO company_master (
+                        bse_scrip_code, isin, company_name, nse_symbol,
+                        mkt_cap_full, industry, industry_source,
+                        industry_updated_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        CASE WHEN %s IS NOT NULL THEN NOW() ELSE NULL END
+                    )
                     ON CONFLICT (bse_scrip_code) DO UPDATE SET
                         company_name = CASE WHEN EXCLUDED.company_name != '' THEN EXCLUDED.company_name
                                             ELSE company_master.company_name END,
                         nse_symbol = COALESCE(EXCLUDED.nse_symbol, company_master.nse_symbol),
                         mkt_cap_full = COALESCE(EXCLUDED.mkt_cap_full, company_master.mkt_cap_full),
                         isin = COALESCE(EXCLUDED.isin, company_master.isin),
+                        industry = COALESCE(company_master.industry, EXCLUDED.industry),
+                        industry_source = COALESCE(company_master.industry_source, EXCLUDED.industry_source),
+                        industry_updated_at = CASE
+                            WHEN company_master.industry IS NULL AND EXCLUDED.industry IS NOT NULL
+                                THEN NOW()
+                            ELSE company_master.industry_updated_at
+                        END,
                         updated_at = NOW()
                     """,
-                    (bse_scrip_code, isin, company_name, nse_symbol, mkt_cap_full),
+                    (
+                        bse_scrip_code, isin, company_name, nse_symbol,
+                        mkt_cap_full, industry, industry_source,
+                        industry,
+                    ),
                 )
+
+    # ------------------------------------------------------------------
+    # Industry-classification helpers (used by backfill admin endpoint)
+    # ------------------------------------------------------------------
+    def update_industry(
+        self,
+        bse_scrip_code: int,
+        industry: str,
+        industry_source: str,
+    ):
+        """Force-set industry for a row regardless of current value."""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE company_master
+                    SET industry = %s,
+                        industry_source = %s,
+                        industry_updated_at = NOW()
+                    WHERE bse_scrip_code = %s
+                    """,
+                    (industry, industry_source, bse_scrip_code),
+                )
+
+    def count_uncategorized(self) -> int:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM company_master WHERE industry IS NULL"
+                )
+                return cur.fetchone()[0]
+
+    def count_by_industry(self) -> dict[str, int]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(industry, '(uncategorized)') AS ind,
+                           COUNT(*) AS n
+                    FROM company_master
+                    GROUP BY ind
+                    ORDER BY n DESC
+                    """
+                )
+                return {row[0]: int(row[1]) for row in cur.fetchall()}
+
+    def fetch_uncategorized_batch(self, limit: int) -> list[dict]:
+        """Return up to `limit` rows that have no industry yet."""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bse_scrip_code, company_name, nse_symbol
+                    FROM company_master
+                    WHERE industry IS NULL
+                    ORDER BY mkt_cap_full DESC NULLS LAST
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return [
+                    {
+                        "bse_scrip_code": r[0],
+                        "company_name": r[1],
+                        "nse_symbol": r[2],
+                    }
+                    for r in cur.fetchall()
+                ]
 
     # ------------------------------------------------------------------
     # Update NSE symbol for a company

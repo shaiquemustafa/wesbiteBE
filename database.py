@@ -196,6 +196,24 @@ def _ensure_tables(conn):
                 WHERE nse_symbol IS NOT NULL;
             """
         )
+        # Industry classification columns (24-label canonical taxonomy).
+        # Backfilled by POST /api/admin/backfill-industries; populated for
+        # new companies inside CompanyService.upsert_company().
+        cur.execute(
+            """
+            ALTER TABLE company_master
+                ADD COLUMN IF NOT EXISTS industry TEXT,
+                ADD COLUMN IF NOT EXISTS industry_source TEXT,
+                ADD COLUMN IF NOT EXISTS industry_updated_at TIMESTAMPTZ;
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_company_master_industry
+                ON company_master (industry)
+                WHERE industry IS NOT NULL;
+            """
+        )
 
         # ── Auth tables ──────────────────────────────────────────────
         cur.execute(

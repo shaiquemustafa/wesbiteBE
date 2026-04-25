@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 from service.company_service import CompanyService
+from service.industry_classifier import classify as classify_industry
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -74,6 +75,9 @@ def _fetch_stock_info(stock_name: str) -> Optional[dict]:
             "year_high": data.get("yearHigh"),
             "year_low": data.get("yearLow"),
             "analyst_consensus": consensus or None,
+            # Indian API's free-form industry string (e.g. "Iron & Steel"),
+            # used by industry_classifier to map into our 24-label taxonomy.
+            "api_industry": data.get("industry"),
         }
         
         # Add market cap if found
@@ -181,6 +185,16 @@ def enrich_prediction(prediction: dict) -> dict:
     
     # ---- Stock info (price + analyst consensus + market cap) ----
     stock_info = _fetch_stock_info(clean_name)
+
+    # Resolve canonical industry label from the Indian API response (used
+    # only when we end up creating a new company_master row below).
+    api_industry = stock_info.get("api_industry") if stock_info else None
+    industry_label, industry_source = (None, None)
+    if scrip_cd:
+        try:
+            industry_label, industry_source = classify_industry(company, api_industry)
+        except Exception as e:
+            logger.debug("  industry classify failed for '%s': %s", company, e)
     
     # Market cap priority: 1) Indian API, 2) company_master, 3) BSE API fallback
     # IMPORTANT: Always ensure market cap is fetched and stored for future use
@@ -201,6 +215,8 @@ def enrich_prediction(prediction: dict) -> dict:
                     bse_scrip_code=scrip_int,
                     company_name=comp_name,
                     mkt_cap_full=mkt_cap_cr,
+                    industry=industry_label,
+                    industry_source=industry_source,
                 )
             except Exception as e:
                 logger.debug("  Could not store Indian API market cap in company_master: %s", e)
@@ -233,6 +249,8 @@ def enrich_prediction(prediction: dict) -> dict:
                         bse_scrip_code=scrip_int,
                         company_name=comp_name,
                         mkt_cap_full=mkt_cap_cr,
+                        industry=industry_label,
+                        industry_source=industry_source,
                     )
                     logger.info("  💾 Stored market cap in company_master for SCRIP %s", scrip_int)
                 except Exception as e:
