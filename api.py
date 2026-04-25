@@ -1179,6 +1179,12 @@ def admin_backfill_industries(
             "to enrich with the api_industry field. Costs API quota."
         ),
     ),
+    parallelism: int = Query(
+        16,
+        ge=1,
+        le=32,
+        description="Concurrent Indian API workers (only used if fetch_api_industry=true).",
+    ),
 ):
     """
     Backfill the `industry` column in `company_master` for rows where it is
@@ -1190,6 +1196,7 @@ def admin_backfill_industries(
       2. Keyword cascade on company_name
       3. (optional) gpt-4.1-nano LLM fallback
     """
+    from concurrent.futures import ThreadPoolExecutor
     from service.industry_classifier import (
         CANON_NAMES,
         classify as classify_industry,
@@ -1218,23 +1225,36 @@ def admin_backfill_industries(
     unresolved: list[dict] = []
     api_calls = 0
 
-    for row in rows:
-        scrip = row["bse_scrip_code"]
-        name = (row.get("company_name") or "").strip()
-        nse = (row.get("nse_symbol") or "").strip()
-
-        api_industry: Optional[str] = None
-        if fetch_api_industry:
-            # Prefer NSE symbol — bulletproof key for Indian API.
+    # ----- Parallel Indian API fan-out --------------------------------
+    # Calling /stock 200x sequentially burns 5+ minutes; with 16 workers
+    # the same batch finishes in ~15s. Indian API tolerates the burst.
+    api_industry_by_scrip: dict[int, Optional[str]] = {}
+    if fetch_api_industry:
+        def _query_one(row: dict) -> Tuple[int, Optional[str]]:
+            scrip = int(row["bse_scrip_code"])
+            name = (row.get("company_name") or "").strip()
+            nse = (row.get("nse_symbol") or "").strip()
             query = nse if nse else name
-            if query:
-                try:
-                    info = _fetch_stock_info(query)
-                    api_calls += 1
-                    if info:
-                        api_industry = info.get("api_industry")
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("Indian API failed for SCRIP %s ('%s'): %s", scrip, query, e)
+            if not query:
+                return scrip, None
+            try:
+                info = _fetch_stock_info(query)
+                if info:
+                    return scrip, info.get("api_industry")
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Indian API failed for SCRIP %s ('%s'): %s", scrip, query, e)
+            return scrip, None
+
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            for scrip, ind in pool.map(_query_one, rows):
+                api_industry_by_scrip[scrip] = ind
+                api_calls += 1
+
+    # ----- Sequential classify + DB write -----------------------------
+    for row in rows:
+        scrip = int(row["bse_scrip_code"])
+        name = (row.get("company_name") or "").strip()
+        api_industry = api_industry_by_scrip.get(scrip)
 
         label, source = classify_industry(name, api_industry)
         if label:
