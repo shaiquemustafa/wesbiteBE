@@ -1234,20 +1234,22 @@ def admin_backfill_industries(
             scrip = int(row["bse_scrip_code"])
             name = (row.get("company_name") or "").strip()
             nse = (row.get("nse_symbol") or "").strip()
-            # Prefer NSE symbol; fall back to a cleaned company name (Indian
-            # API can't find "LARSEN & TOUBRO LTD." but does find
-            # "LARSEN & TOUBRO").
-            query = nse if nse else _clean_stock_name(name)
+            # Indian API quirks observed against company_master:
+            #   - "LARSEN & TOUBRO LTD." (uppercase + ampersand) → 15s timeout
+            #     "Larsen & Toubro" (title-case) → fast 200 with industry.
+            #   - "Zomato Limited" → not found (renamed to Eternal).
+            #   - "MOTHERSON SUMI SYSTEMS LTD." → not found (renamed).
+            # So: prefer NSE symbol, otherwise title-case + strip suffixes.
+            if nse:
+                query = nse
+            else:
+                query = _clean_stock_name(name).title()
             if not query:
                 return scrip, None
             try:
                 info = _fetch_stock_info(query)
                 if info and info.get("api_industry"):
                     return scrip, info["api_industry"]
-                # Retry once with a more aggressively trimmed name (drops
-                # trailing "& CO", "INDIA LTD", trailing periods, etc.).
-                if not nse and query != name:
-                    return scrip, None
             except Exception as e:  # noqa: BLE001
                 logger.debug("Indian API failed for SCRIP %s ('%s'): %s", scrip, query, e)
             return scrip, None
