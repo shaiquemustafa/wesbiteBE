@@ -1185,6 +1185,10 @@ def admin_backfill_industries(
         le=32,
         description="Concurrent Indian API workers (only used if fetch_api_industry=true).",
     ),
+    debug: bool = Query(
+        False,
+        description="Include per-row diagnostics (query sent + raw Indian API result) in response.",
+    ),
 ):
     """
     Backfill the `industry` column in `company_master` for rows where it is
@@ -1229,8 +1233,9 @@ def admin_backfill_industries(
     # Calling /stock 200x sequentially burns 5+ minutes; with 16 workers
     # the same batch finishes in ~15s. Indian API tolerates the burst.
     api_industry_by_scrip: dict[int, Optional[str]] = {}
+    debug_rows: list[dict] = []
     if fetch_api_industry:
-        def _query_one(row: dict) -> Tuple[int, Optional[str]]:
+        def _query_one(row: dict) -> Tuple[int, Optional[str], str, str]:
             scrip = int(row["bse_scrip_code"])
             name = (row.get("company_name") or "").strip()
             nse = (row.get("nse_symbol") or "").strip()
@@ -1245,19 +1250,29 @@ def admin_backfill_industries(
             else:
                 query = _clean_stock_name(name).title()
             if not query:
-                return scrip, None
+                return scrip, None, query, "empty-query"
             try:
                 info = _fetch_stock_info(query)
-                if info and info.get("api_industry"):
-                    return scrip, info["api_industry"]
+                if info is None:
+                    return scrip, None, query, "fetch-returned-none"
+                if info.get("api_industry"):
+                    return scrip, info["api_industry"], query, "ok"
+                return scrip, None, query, "no-industry-field"
             except Exception as e:  # noqa: BLE001
                 logger.debug("Indian API failed for SCRIP %s ('%s'): %s", scrip, query, e)
-            return scrip, None
+                return scrip, None, query, f"exc:{type(e).__name__}"
 
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
-            for scrip, ind in pool.map(_query_one, rows):
+            for scrip, ind, q, status in pool.map(_query_one, rows):
                 api_industry_by_scrip[scrip] = ind
                 api_calls += 1
+                if debug:
+                    debug_rows.append({
+                        "bse_scrip_code": scrip,
+                        "query_sent": q,
+                        "api_industry": ind,
+                        "status": status,
+                    })
 
     # ----- Sequential classify + DB write -----------------------------
     for row in rows:
@@ -1292,7 +1307,7 @@ def admin_backfill_industries(
         n_unknown = len(unresolved)
 
     remaining = company_service.count_uncategorized()
-    return {
+    response = {
         "processed": len(rows),
         "classified_indian_api": n_api,
         "classified_keyword": n_keyword,
@@ -1305,6 +1320,10 @@ def admin_backfill_industries(
             for u in unresolved[:10]
         ],
     }
+    if debug:
+        # Per-row diagnostics: query string sent + status from Indian API.
+        response["debug"] = debug_rows[:30]
+    return response
 
 
 # =========================================================================
