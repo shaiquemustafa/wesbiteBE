@@ -111,6 +111,9 @@ _INDIAN_API_INDUSTRY_MAP: Dict[str, str] = {
     "scientific & technical instruments": "Information Technology & Software",
     "semiconductors": "Information Technology & Software",
     "office equipment": "Information Technology & Software",
+    # Indian listings classified under "Business Services" are overwhelmingly
+    # BPM / IT-enabled services (Sagility, eClerx, Affle, Quess, etc.).
+    "business services": "Information Technology & Software",
     # Telecom
     "communications services": "Telecommunications & Connectivity",
     "communications equipment": "Telecommunications & Connectivity",
@@ -122,6 +125,12 @@ _INDIAN_API_INDUSTRY_MAP: Dict[str, str] = {
     "advertising": "Media, Entertainment & Gaming",
     "casinos & gaming": "Media, Entertainment & Gaming",
     "recreational activities": "Media, Entertainment & Gaming",
+    "toys": "Consumer Durables & Discretionary",
+    "toys & games": "Consumer Durables & Discretionary",
+    # Education — not its own bucket in our 24-label taxonomy. Most Indian
+    # listed "Schools" rows are IT-training / edtech (NIIT, Aptech).
+    "schools": "Information Technology & Software",
+    "education services": "Information Technology & Software",
     # Financial Services
     "regional banks": "Financial Services",
     "money center banks": "Financial Services",
@@ -158,10 +167,22 @@ _INDIAN_API_INDUSTRY_MAP: Dict[str, str] = {
     "industrial conglomerate": "Industrial Manufacturing & Engineering",
     "machinery (industrial)": "Industrial Manufacturing & Engineering",
     "machinery & equipment": "Industrial Manufacturing & Engineering",
+    # Indian API "Electronic Instr. & Controls" covers electrical equipment
+    # makers (ABB, Siemens, Polycab cables, KEI cables, Apar Industries) —
+    # almost entirely industrial electrical equipment.
+    "electronic instr. & controls": "Industrial Manufacturing & Engineering",
+    "electronic instruments & controls": "Industrial Manufacturing & Engineering",
+    "electronic instruments": "Industrial Manufacturing & Engineering",
+    # Paper / packaging — capital-intensive industrial goods.
+    "paper & paper products": "Industrial Manufacturing & Engineering",
+    "containers & packaging": "Chemicals & Materials",
     # Auto
     "auto & truck manufacturers": "Automobiles & Mobility",
     "auto & truck parts": "Automobiles & Mobility",
     "tires": "Automobiles & Mobility",
+    # Indian listings tagged "Recreational Products" are TVS Motor / Bajaj
+    # two-wheelers / leisure vehicles — map to Automobiles.
+    "recreational products": "Automobiles & Mobility",
     # Aerospace / Defence
     "aerospace & defense": "Aerospace & Defence",
     # Transport / Logistics
@@ -210,12 +231,14 @@ _INDIAN_API_INDUSTRY_MAP: Dict[str, str] = {
     "fish/livestock": "Food, Beverage & Consumer Staples",
     "tobacco": "Food, Beverage & Consumer Staples",
     "personal & household products": "Food, Beverage & Consumer Staples",
+    "personal & household prods.": "Food, Beverage & Consumer Staples",
     # Consumer Durables / Discretionary
     "appliances & tools": "Consumer Durables & Discretionary",
     "audio & video equipment": "Consumer Durables & Discretionary",
     "jewelry & silverware": "Consumer Durables & Discretionary",
     "photography": "Consumer Durables & Discretionary",
     "furniture & fixtures": "Consumer Durables & Discretionary",
+    "office supplies": "Consumer Durables & Discretionary",
     # Retail / E-Commerce
     "retail (apparel)": "Retail & E-Commerce",
     "retail (department & discount)": "Retail & E-Commerce",
@@ -225,6 +248,8 @@ _INDIAN_API_INDUSTRY_MAP: Dict[str, str] = {
     "retail (catalog & mail order)": "Retail & E-Commerce",
     "retail (technology)": "Retail & E-Commerce",
     "retail (home improvement)": "Retail & E-Commerce",
+    "retail (restaurants)": "Retail & E-Commerce",
+    "restaurants": "Retail & E-Commerce",
     # Healthcare
     "biotechnology & drugs": "Healthcare & Life Sciences",
     "major drugs": "Healthcare & Life Sciences",
