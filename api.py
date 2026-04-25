@@ -1204,7 +1204,7 @@ def admin_backfill_industries(
     )
     # Lazy local import to avoid a hard dependency on stock_enrichment when
     # this endpoint isn't called.
-    from stock_enrichment import _fetch_stock_info
+    from stock_enrichment import _fetch_stock_info, _clean_stock_name
 
     company_service = CompanyService()
     rows = company_service.fetch_uncategorized_batch(limit)
@@ -1234,13 +1234,20 @@ def admin_backfill_industries(
             scrip = int(row["bse_scrip_code"])
             name = (row.get("company_name") or "").strip()
             nse = (row.get("nse_symbol") or "").strip()
-            query = nse if nse else name
+            # Prefer NSE symbol; fall back to a cleaned company name (Indian
+            # API can't find "LARSEN & TOUBRO LTD." but does find
+            # "LARSEN & TOUBRO").
+            query = nse if nse else _clean_stock_name(name)
             if not query:
                 return scrip, None
             try:
                 info = _fetch_stock_info(query)
-                if info:
-                    return scrip, info.get("api_industry")
+                if info and info.get("api_industry"):
+                    return scrip, info["api_industry"]
+                # Retry once with a more aggressively trimmed name (drops
+                # trailing "& CO", "INDIA LTD", trailing periods, etc.).
+                if not nse and query != name:
+                    return scrip, None
             except Exception as e:  # noqa: BLE001
                 logger.debug("Indian API failed for SCRIP %s ('%s'): %s", scrip, query, e)
             return scrip, None
