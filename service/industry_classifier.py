@@ -596,17 +596,24 @@ def classify(
 # Layer 3: LLM fallback (optional). Used by backfill admin endpoint when
 # the deterministic cascade produces None for a row.
 # ---------------------------------------------------------------------------
+# Show only the labels (no descriptions) in the prompt's valid-labels block to
+# stop the model from echoing back "<label> — <description>".
+_TAXONOMY_LABELS_LIST = "\n".join(f"  - {name}" for name in CANON_NAMES)
+
 _LLM_SYSTEM_PROMPT = f"""You classify Indian-listed companies into a FIXED industry taxonomy.
 
-TAXONOMY (use the EXACT label strings; any other string is invalid):
+VALID LABELS — return EXACTLY one of these strings, character-for-character:
+{_TAXONOMY_LABELS_LIST}
+
+Hints (descriptions for context only, DO NOT include in the output):
 {TAXONOMY_TEXT}
 
 Rules:
   - For each item, pick exactly ONE industry — the most relevant.
   - Prefer the most specific industry over general ones.
   - Use "Diversified Conglomerates / Holding Companies" ONLY for true holdcos / multi-sector plays where no single industry dominates.
-  - NEVER invent new labels. NEVER return a label that is not in the list above.
-  - Return ONLY the canonical strings verbatim.
+  - NEVER invent new labels. NEVER return a label that is not in the VALID LABELS list above.
+  - The "industry" field must be ONLY the label string. Do NOT append descriptions, em-dashes, or any other text.
 
 Output: a JSON object with key "classifications" whose value is an ARRAY.
 Each element must be an object with:
@@ -614,6 +621,117 @@ Each element must be an object with:
 
 Return one entry per input item, preserving ids. No extra keys, no prose.
 """
+
+
+# Normalisation table for common LLM-invented labels → canonical equivalents.
+# Keys must be lowercase. Used by _coerce_to_canon().
+_LLM_LABEL_ALIASES: Dict[str, str] = {
+    "jewellery, gems & watches": "Consumer Durables & Discretionary",
+    "jewelry, gems & watches": "Consumer Durables & Discretionary",
+    "gems & jewellery": "Consumer Durables & Discretionary",
+    "gems and jewellery": "Consumer Durables & Discretionary",
+    "paper & packaging": "Industrial Manufacturing & Engineering",
+    "packaging": "Chemicals & Materials",
+    "paper": "Industrial Manufacturing & Engineering",
+    "education": "Information Technology & Software",
+    "education services": "Information Technology & Software",
+    "edtech": "Information Technology & Software",
+    "business services": "Information Technology & Software",
+    "professional services": "Information Technology & Software",
+    "consulting": "Information Technology & Software",
+    "logistics": "Transportation & Logistics",
+    "shipping": "Transportation & Logistics",
+    "ports": "Transportation & Logistics",
+    "utilities": "Energy",
+    "power": "Energy",
+    "renewables": "Energy",
+    "telecom": "Telecommunications & Connectivity",
+    "telecommunications": "Telecommunications & Connectivity",
+    "media": "Media, Entertainment & Gaming",
+    "entertainment": "Media, Entertainment & Gaming",
+    "gaming": "Media, Entertainment & Gaming",
+    "real estate": "Real Estate & Property Services",
+    "reit": "Real Estate & Property Services",
+    "construction": "Infrastructure & Construction",
+    "infrastructure": "Infrastructure & Construction",
+    "automobiles": "Automobiles & Mobility",
+    "auto": "Automobiles & Mobility",
+    "defence": "Aerospace & Defence",
+    "defense": "Aerospace & Defence",
+    "aerospace": "Aerospace & Defence",
+    "aviation": "Aviation & Travel",
+    "travel": "Aviation & Travel",
+    "hospitality": "Aviation & Travel",
+    "energy": "Energy",
+    "oil & gas": "Energy",
+    "chemicals": "Chemicals & Materials",
+    "specialty chemicals": "Chemicals & Materials",
+    "metals": "Metals & Mining",
+    "mining": "Metals & Mining",
+    "metals & mining": "Metals & Mining",
+    "cement": "Building Materials",
+    "building materials": "Building Materials",
+    "agriculture": "Agriculture & Agribusiness",
+    "agribusiness": "Agriculture & Agribusiness",
+    "food": "Food, Beverage & Consumer Staples",
+    "beverages": "Food, Beverage & Consumer Staples",
+    "consumer staples": "Food, Beverage & Consumer Staples",
+    "fmcg": "Food, Beverage & Consumer Staples",
+    "consumer durables": "Consumer Durables & Discretionary",
+    "consumer discretionary": "Consumer Durables & Discretionary",
+    "retail": "Retail & E-Commerce",
+    "e-commerce": "Retail & E-Commerce",
+    "ecommerce": "Retail & E-Commerce",
+    "healthcare": "Healthcare & Life Sciences",
+    "pharmaceuticals": "Healthcare & Life Sciences",
+    "pharma": "Healthcare & Life Sciences",
+    "life sciences": "Healthcare & Life Sciences",
+    "biotechnology": "Healthcare & Life Sciences",
+    "textiles": "Textiles, Apparel & Luxury Goods",
+    "apparel": "Textiles, Apparel & Luxury Goods",
+    "luxury goods": "Textiles, Apparel & Luxury Goods",
+    "environmental services": "Environmental & Waste Services",
+    "waste management": "Environmental & Waste Services",
+    "conglomerate": "Diversified Conglomerates / Holding Companies",
+    "conglomerates": "Diversified Conglomerates / Holding Companies",
+    "holding company": "Diversified Conglomerates / Holding Companies",
+    "diversified": "Diversified Conglomerates / Holding Companies",
+    "financials": "Financial Services",
+    "banking": "Financial Services",
+    "banks": "Financial Services",
+    "insurance services": "Insurance",
+    "information technology": "Information Technology & Software",
+    "it": "Information Technology & Software",
+    "software": "Information Technology & Software",
+    "technology": "Information Technology & Software",
+}
+
+
+def _coerce_to_canon(raw: str) -> Optional[str]:
+    """
+    Best-effort normalisation of an LLM 'industry' field back to a canonical
+    24-label name. Handles three failure modes seen in practice:
+
+      1. Exact match — returns as-is.
+      2. "<label> — <description>" — the model echoed the prompt; strip
+         the em-dash / hyphen tail and re-check.
+      3. Invented label not in CANON_SET — fall back to a hand-curated alias
+         table (above) keyed on lowercased label.
+    """
+    if not raw:
+        return None
+    if raw in CANON_SET:
+        return raw
+
+    # Strip "— description" / "- description" tails ("Label — words").
+    for sep in (" — ", " – ", " - "):
+        if sep in raw:
+            head = raw.split(sep, 1)[0].strip()
+            if head in CANON_SET:
+                return head
+
+    # Lowercased alias lookup.
+    return _LLM_LABEL_ALIASES.get(raw.strip().lower())
 
 
 def classify_with_llm(
@@ -674,8 +792,9 @@ def classify_with_llm(
                         vid = int(v.get("id"))
                     except (TypeError, ValueError):
                         continue
-                    label = (v.get("industry") or "").strip()
-                    if label in CANON_SET:
+                    raw = (v.get("industry") or "").strip()
+                    label = _coerce_to_canon(raw)
+                    if label:
                         out[vid] = label
                 break
             except Exception as e:  # noqa: BLE001
