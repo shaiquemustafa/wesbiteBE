@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 import hashlib
 import requests
-from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks, Header, Request
+from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks, Header, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -24,7 +24,7 @@ from service.notification_service import NotificationService
 from service.watchlist_service import WatchlistService
 from service.whatsapp_service import WhatsAppService
 from entity.ui_data import UIDataItem
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Fixed IST offset (no tzdata dependency)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -1154,6 +1154,76 @@ def admin_industry_stats():
         "categorized": total - uncategorized,
         "uncategorized": uncategorized,
         "by_industry": breakdown,
+    }
+
+
+@app.get(
+    "/api/admin/uncategorized",
+    summary="[ADMIN] List all rows in company_master with industry IS NULL",
+)
+def admin_list_uncategorized(
+    limit: int = Query(500, ge=1, le=10000),
+):
+    """Return the bse_scrip_code, nse_symbol, and company_name for every
+    uncategorized row, capped at `limit`. Used to manually classify the
+    long-tail residue the LLM cascade can't resolve."""
+    company_service = CompanyService()
+    rows = company_service.fetch_uncategorized_batch(limit)
+    return {
+        "count": len(rows),
+        "rows": [
+            {
+                "bse_scrip_code": int(r["bse_scrip_code"]),
+                "nse_symbol": r.get("nse_symbol"),
+                "company_name": r.get("company_name"),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post(
+    "/api/admin/set-industries",
+    summary="[ADMIN] Bulk-apply manual industry classifications",
+)
+def admin_set_industries(
+    payload: Dict[str, str] = Body(
+        ...,
+        description=(
+            "Mapping of {bse_scrip_code: industry_label}. Each label must be "
+            "one of the 24 canonical names. Source is recorded as 'manual'."
+        ),
+        example={"500001": "Energy", "500002": "Industrial Manufacturing & Engineering"},
+    ),
+):
+    """Idempotent: overwrites whatever was there. Returns per-row status."""
+    from service.industry_classifier import CANON_NAMES
+
+    company_service = CompanyService()
+    canon_set = set(CANON_NAMES)
+    applied: list[dict] = []
+    rejected: list[dict] = []
+    for scrip_str, label in payload.items():
+        try:
+            scrip = int(scrip_str)
+        except (TypeError, ValueError):
+            rejected.append({"bse_scrip_code": scrip_str, "reason": "non-integer scrip"})
+            continue
+        if label not in canon_set:
+            rejected.append({"bse_scrip_code": scrip, "reason": f"invalid label: {label!r}"})
+            continue
+        try:
+            company_service.update_industry(scrip, label, "manual")
+            applied.append({"bse_scrip_code": scrip, "industry": label})
+        except Exception as e:  # noqa: BLE001
+            rejected.append({"bse_scrip_code": scrip, "reason": f"{type(e).__name__}: {e}"})
+
+    return {
+        "applied_count": len(applied),
+        "rejected_count": len(rejected),
+        "applied": applied,
+        "rejected": rejected,
+        "remaining_uncategorized": company_service.count_uncategorized(),
     }
 
 
