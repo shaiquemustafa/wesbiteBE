@@ -545,6 +545,142 @@ def _ensure_tables(conn):
             """
         )
 
+        # Daily RSS briefing (news_scratch pipeline) — stored for internal review;
+        # no UI/comms wiring yet. Times are naive IST wall clock in *_ist columns.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_briefing_runs (
+                id BIGSERIAL PRIMARY KEY,
+                cycle VARCHAR(20) NOT NULL
+                    CHECK (cycle IN ('pre_market', 'during_market', 'post_market')),
+                briefing_date_ist DATE NOT NULL,
+                run_at_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                window_start_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                window_end_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'completed',
+                error_message TEXT,
+                stock_news_rows INT NOT NULL DEFAULT 0,
+                industry_insight_rows INT NOT NULL DEFAULT 0,
+                all_items_rows INT NOT NULL DEFAULT 0,
+                cross_cycle_skipped INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_briefing_runs_date
+                ON news_briefing_runs (briefing_date_ist DESC);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_briefing_runs_cycle_date
+                ON news_briefing_runs (cycle, briefing_date_ist);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_briefing_industry_insights (
+                id BIGSERIAL PRIMARY KEY,
+                run_id BIGINT NOT NULL REFERENCES news_briefing_runs(id) ON DELETE CASCADE,
+                insight_tier VARCHAR(10) NOT NULL DEFAULT 'full',
+                sort_order INT NOT NULL DEFAULT 0,
+                industry TEXT,
+                n_items INT,
+                direction TEXT,
+                headline TEXT,
+                bullets TEXT,
+                key_numbers TEXT,
+                key_stocks TEXT,
+                key_themes TEXT
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_briefing_ins_run
+                ON news_briefing_industry_insights (run_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_briefing_stock_news (
+                id BIGSERIAL PRIMARY KEY,
+                run_id BIGINT NOT NULL REFERENCES news_briefing_runs(id) ON DELETE CASCADE,
+                sort_order INT NOT NULL,
+                affected_stocks TEXT,
+                bse_scrip_code TEXT,
+                nse_symbol TEXT,
+                isin TEXT,
+                market_cap_cr TEXT,
+                score DOUBLE PRECISION,
+                direction TEXT,
+                industry_primary TEXT,
+                affected_industries TEXT,
+                ai_summary TEXT,
+                implication TEXT,
+                key_numbers TEXT,
+                category TEXT,
+                source TEXT,
+                published_at_ist TIMESTAMP WITHOUT TIME ZONE,
+                title TEXT,
+                link TEXT,
+                story_fingerprint CHAR(64) NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_briefing_sn_run
+                ON news_briefing_stock_news (run_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_briefing_all_items (
+                id BIGSERIAL PRIMARY KEY,
+                run_id BIGINT NOT NULL REFERENCES news_briefing_runs(id) ON DELETE CASCADE,
+                sort_order INT NOT NULL,
+                industry_primary TEXT,
+                affected_stocks TEXT,
+                bse_scrip_code TEXT,
+                nse_symbol TEXT,
+                isin TEXT,
+                market_cap_cr TEXT,
+                score DOUBLE PRECISION,
+                direction TEXT,
+                category TEXT,
+                ai_summary TEXT,
+                implication TEXT,
+                key_numbers TEXT,
+                source TEXT,
+                published_at_ist TIMESTAMP WITHOUT TIME ZONE,
+                title TEXT,
+                link TEXT,
+                story_fingerprint CHAR(64) NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_briefing_ai_run
+                ON news_briefing_all_items (run_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_briefing_seen_stories (
+                briefing_date_ist DATE NOT NULL,
+                story_fingerprint CHAR(64) NOT NULL,
+                first_seen_run_id BIGINT REFERENCES news_briefing_runs(id) ON DELETE SET NULL,
+                first_seen_cycle VARCHAR(20),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (briefing_date_ist, story_fingerprint)
+            );
+            """
+        )
+
         # Table metadata/documentation (definitions, rules, cutoffs, functions)
         cur.execute(
             """
@@ -632,6 +768,42 @@ def _ensure_tables(conn):
                 "48 hours - entries older than 48 hours are automatically deleted.",
                 "No filtering - all fetched announcements are stored temporarily.",
                 "Data pipeline - stores raw BSE data before PDF download and analysis.",
+            ),
+            (
+                "news_briefing_runs",
+                "One row per RSS briefing job (pre_market / during_market / post_market). "
+                "Stores IST window boundaries and row counts; children hold sheet payloads.",
+                "Older same-cycle rows for the previous IST calendar day are deleted when a new run succeeds.",
+                "Cron-triggered news_scratch pipeline output for internal review (no UI yet).",
+                "Internal daily digest storage.",
+            ),
+            (
+                "news_briefing_industry_insights",
+                "Industry-level LLM bullets for a briefing run (full + small tiers).",
+                "Deleted when parent news_briefing_runs row is deleted (ON DELETE CASCADE).",
+                "Mirrors industry_insights + industry_small Excel sheets.",
+                "Sector narrative archive per run.",
+            ),
+            (
+                "news_briefing_stock_news",
+                "Stock-focused briefing rows with BSE/NSE/ISIN/market cap columns.",
+                "Deleted when parent run is deleted.",
+                "Cross-cycle dedupe uses news_briefing_seen_stories + story_fingerprint.",
+                "Stock-level RSS digest archive.",
+            ),
+            (
+                "news_briefing_all_items",
+                "All items by primary industry for a briefing run.",
+                "Deleted when parent run is deleted.",
+                "Cross-cycle dedupe by story_fingerprint per briefing_date_ist.",
+                "Full funnel survivor list per run.",
+            ),
+            (
+                "news_briefing_seen_stories",
+                "Per trading-day IST fingerprints of stories already stored (stock_news + all_items).",
+                "Optional cleanup of rows older than ~14 days can be done by the job.",
+                "Prevents duplicate link/title across the three daily cycles.",
+                "Cross-cycle dedupe index.",
             ),
         ]
 

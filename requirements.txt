@@ -11,3 +11,10 @@ python-dotenv
 psycopg2-binary
 tzdata
 PyJWT
+feedparser
+requests
+python-dateutil
+rapidfuzz
+truststore
+trafilatura
+ftfy

@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import requests
 from fastapi import FastAPI, Query, Path, HTTPException, BackgroundTasks, Header, Request, Body
@@ -68,6 +68,8 @@ def _to_ist(dt) -> datetime:
 analysis_lock = asyncio.Lock()
 logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
+_news_briefing_scheduler_task: asyncio.Task | None = None
+_news_briefing_job_lock = asyncio.Lock()
 
 
 async def _send_pending_broadcasts():
@@ -542,9 +544,117 @@ async def _scheduled_analysis_loop():
         await asyncio.sleep(interval)
 
 
+# ---------------------------------------------------------------------------
+# Auto news-briefing (IST) — sleeps until the next slot; low CPU vs polling
+# ---------------------------------------------------------------------------
+NEWS_BRIEFING_AUTO_SCHEDULE = os.getenv("NEWS_BRIEFING_AUTO_SCHEDULE", "true").lower() == "true"
+NEWS_BRIEFING_SLOT_GRACE_MIN = int(os.getenv("NEWS_BRIEFING_SLOT_GRACE_MIN", "12"))
+_NEWS_BRIEFING_IST_SLOTS: Tuple[Tuple[str, int, int], ...] = (
+    ("pre_market", 8, 30),
+    ("during_market", 15, 30),
+    ("post_market", 22, 0),
+)
+
+
+def _next_news_slot_strictly_after(now_ist: datetime) -> Tuple[datetime, str]:
+    """Earliest slot time strictly after `now_ist` (IST naive); else tomorrow 08:30 pre."""
+    d = now_ist.date()
+    candidates: List[Tuple[datetime, str]] = []
+    for cycle, hh, mm in _NEWS_BRIEFING_IST_SLOTS:
+        t = datetime.combine(d, time(hh, mm, 0))
+        if t > now_ist:
+            candidates.append((t, cycle))
+    if candidates:
+        return min(candidates, key=lambda x: x[0])
+    nxt = datetime.combine(d + timedelta(days=1), time(8, 30, 0))
+    return nxt, "pre_market"
+
+
+def _news_briefing_run_completed_today(cycle: str, briefing_day: date) -> bool:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM news_briefing_runs
+                    WHERE cycle = %s
+                      AND briefing_date_ist = %s
+                      AND status = 'completed'
+                    LIMIT 1
+                    """,
+                    (cycle, briefing_day),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("news_briefing DB probe failed: %s", e)
+        return False
+
+
+def _run_news_briefing_sync_safe(cycle: str) -> None:
+    try:
+        from jobs.news_briefing_runner import run_pipeline_and_ingest
+
+        out = run_pipeline_and_ingest(cycle)
+        logger.info("news_briefing run OK (%s): %s", cycle, out)
+    except Exception as e:
+        logger.exception("news_briefing run FAILED (%s): %s", cycle, e)
+
+
+async def _news_briefing_scheduler_loop():
+    """
+    - If we're inside [slot, slot+grace] for a cycle today and it hasn't completed,
+      run immediately (covers restart / slight oversleep).
+    - Otherwise sleep until the next slot boundary (minimal wakeups).
+    """
+    grace = timedelta(minutes=max(3, NEWS_BRIEFING_SLOT_GRACE_MIN))
+    logger.info(
+        "News-briefing auto-scheduler ON (sleep-until-slot, grace=%s min IST).",
+        grace.total_seconds() / 60,
+    )
+    await asyncio.sleep(20)
+    while True:
+        try:
+            now = _now_ist_naive()
+            d = now.date()
+            fired = False
+            for cycle, hh, mm in _NEWS_BRIEFING_IST_SLOTS:
+                slot = datetime.combine(d, time(hh, mm, 0))
+                if slot <= now <= slot + grace:
+                    if await asyncio.to_thread(
+                        _news_briefing_run_completed_today, cycle, d
+                    ):
+                        continue
+                    async with _news_briefing_job_lock:
+                        if await asyncio.to_thread(
+                            _news_briefing_run_completed_today, cycle, d
+                        ):
+                            continue
+                        logger.info(
+                            "📰 Auto news_briefing: cycle=%s IST=%s (grace window)",
+                            cycle,
+                            now.strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                        await asyncio.to_thread(_run_news_briefing_sync_safe, cycle)
+                    fired = True
+                    break
+            if fired:
+                await asyncio.sleep(2)
+                continue
+
+            next_t, _ = _next_news_slot_strictly_after(now)
+            delay = (next_t - now).total_seconds()
+            delay = max(5.0, min(delay, 86400 * 2))
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("news_briefing scheduler error: %s", e)
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler_task
+    global _scheduler_task, _news_briefing_scheduler_task
     connect_to_db()
 
     # Start the background scheduler
@@ -552,6 +662,12 @@ async def lifespan(app: FastAPI):
         _scheduler_task = asyncio.create_task(_scheduled_analysis_loop())
     else:
         logger.info("Scheduler is DISABLED (SCHEDULER_ENABLED=false).")
+
+    if NEWS_BRIEFING_AUTO_SCHEDULE:
+        _news_briefing_scheduler_task = asyncio.create_task(_news_briefing_scheduler_loop())
+        logger.info("News-briefing auto-scheduler started (sleep-until-next-slot).")
+    else:
+        logger.info("News-briefing auto-scheduler OFF (NEWS_BRIEFING_AUTO_SCHEDULE=false).")
 
     # Kick the periodic 'user_training' broadcast off immediately on boot so
     # a fresh deploy doesn't have to wait for the next scheduler tick. The
@@ -580,6 +696,12 @@ async def lifespan(app: FastAPI):
         _scheduler_task.cancel()
         try:
             await _scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if _news_briefing_scheduler_task:
+        _news_briefing_scheduler_task.cancel()
+        try:
+            await _news_briefing_scheduler_task
         except asyncio.CancelledError:
             pass
     close_db_connection()
@@ -2669,3 +2791,107 @@ def get_delivery_status(
     except Exception as e:
         logger.error("  ❌ Failed to get delivery status: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# News briefing (RSS → Excel → Postgres) — cron-triggered, no UI/comms yet
+# ---------------------------------------------------------------------------
+NEWS_BRIEFING_JOB_SECRET = os.getenv("NEWS_BRIEFING_JOB_SECRET", "").strip()
+_NEWS_BRIEFING_CYCLES = frozenset({"pre_market", "during_market", "post_market"})
+
+
+def _require_news_briefing_secret(x_secret: Optional[str]) -> None:
+    if not NEWS_BRIEFING_JOB_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="NEWS_BRIEFING_JOB_SECRET is not set — briefing job disabled",
+        )
+    if (x_secret or "").strip() != NEWS_BRIEFING_JOB_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid X-News-Briefing-Secret header")
+
+
+def _news_briefing_background(cycle: str) -> None:
+    """Manual / BackgroundTasks entry point (same body as auto-scheduler)."""
+    _run_news_briefing_sync_safe(cycle)
+
+
+@app.post(
+    "/api/admin/news-briefing/run",
+    summary="[ADMIN] Run RSS briefing pipeline (stores industry + stock + all-items)",
+)
+def admin_news_briefing_run(
+    background_tasks: BackgroundTasks,
+    cycle: str = Query(
+        ...,
+        description="pre_market | during_market | post_market (IST windows in runner)",
+    ),
+    sync: bool = Query(
+        False,
+        description="Run inline (local debug only; Render HTTP may timeout)",
+    ),
+    x_news_briefing_secret: Optional[str] = Header(None, alias="X-News-Briefing-Secret"),
+):
+    """
+    Trigger the full news_scratch funnel for one IST window, then ingest three
+    sheets into Postgres. Set header ``X-News-Briefing-Secret`` to
+    ``NEWS_BRIEFING_JOB_SECRET``.
+
+    By default the server also runs these three windows automatically
+    (``NEWS_BRIEFING_AUTO_SCHEDULE``). Use this endpoint for manual reruns only.
+
+    Optional manual curl:
+      curl -X POST -H \"X-News-Briefing-Secret: $SECRET\" \\
+        \"https://…/api/admin/news-briefing/run?cycle=pre_market\"
+    """
+    _require_news_briefing_secret(x_news_briefing_secret)
+    if cycle not in _NEWS_BRIEFING_CYCLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cycle must be one of: {', '.join(sorted(_NEWS_BRIEFING_CYCLES))}",
+        )
+    if sync:
+        from jobs.news_briefing_runner import run_pipeline_and_ingest
+
+        return run_pipeline_and_ingest(cycle)
+    background_tasks.add_task(_news_briefing_background, cycle)
+    return {"accepted": True, "cycle": cycle, "note": "See server logs for completion"}
+
+
+@app.get(
+    "/api/admin/news-briefing/runs",
+    summary="[ADMIN] Recent news briefing DB rows",
+)
+def admin_news_briefing_runs(
+    limit: int = Query(30, ge=1, le=200),
+    x_news_briefing_secret: Optional[str] = Header(None, alias="X-News-Briefing-Secret"),
+):
+    _require_news_briefing_secret(x_news_briefing_secret)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, cycle, briefing_date_ist, run_at_ist, window_start_ist,
+                       window_end_ist, status, error_message, stock_news_rows,
+                       industry_insight_rows, all_items_rows, cross_cycle_skipped,
+                       created_at
+                FROM news_briefing_runs
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            cols = [d[0] for d in cur.description]
+            raw = cur.fetchall()
+    runs = []
+    for tup in raw:
+        row = {}
+        for k, v in zip(cols, tup):
+            if isinstance(v, datetime):
+                row[k] = v.isoformat() if v else None
+            elif isinstance(v, date):
+                row[k] = v.isoformat() if v else None
+            else:
+                row[k] = v
+        runs.append(row)
+    return {"runs": runs}
