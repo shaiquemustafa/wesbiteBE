@@ -18,10 +18,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 logger = logging.getLogger("uvicorn.error")
 
-# This file lives at wesbiteBE/jobs/… — repo root is one level above wesbiteBE.
+# Scratch pipeline lives under wesbiteBE/news_scratch (same repo as this backend).
 _WESBITE_BE = Path(__file__).resolve().parent.parent
-_REPO_ROOT = _WESBITE_BE.parent
-SCRATCH = Path(os.getenv("NEWS_SCRATCH_DIR", str(_REPO_ROOT / "news_scratch"))).resolve()
+_DEFAULT_SCRATCH = _WESBITE_BE / "news_scratch"
+SCRATCH = Path(os.getenv("NEWS_SCRATCH_DIR", str(_DEFAULT_SCRATCH))).resolve()
 
 CYCLE_TAGS = {
     "pre_market": "pre",

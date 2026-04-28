@@ -10,3 +10,8 @@ __pycache__/
 
 # Build artifacts
 /bse_downloads/
+
+# news_scratch: tracked scripts; exclude local venv / secrets inside subfolder
+news_scratch/.venv/
+news_scratch/__pycache__/
+news_scratch/.env

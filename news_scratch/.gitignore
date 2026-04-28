@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# Intermediate pipeline files at project root — disposable, regenerable
+news_today.xlsx
+news_today.csv
+news_*.xlsx
+news_*.csv
+
+# Generated at runtime (Render / local runs)
+outputs/*
+!outputs/.gitkeep
