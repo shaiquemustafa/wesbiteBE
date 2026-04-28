@@ -41,6 +41,15 @@ META_ACCESS_TOKEN = os.getenv(
     "EAAVKbgAbnP0BQ7R5gQyzD1EcWRRTlhyWF0uUe5vJtFqsqOA9snAQ77JZBeo5ctV2uVpZAFnlzoQdWrFXRMgOnxoGm74MI859Bnv8ZC4WFGV5omm1EciZA0eZCrtRn4GKmxnXoSOh56CoSZCsFCKS8OdxT5l5JRJLzyk6XJtQD5HIadVgMWFSHEPUreISSfqo1qdQZDZD",
 )
 META_TEST_EVENT_CODE = os.getenv("META_TEST_EVENT_CODE", "").strip()
+# Gupshup delivery webhook: routine success lines default to DEBUG; set to true for INFO-level audit noise.
+GUPSHUP_WEBHOOK_VERBOSE = os.getenv("GUPSHUP_WEBHOOK_VERBOSE", "").lower() in ("1", "true", "yes")
+
+
+def _gupshup_webhook_routine_log(msg: str, *args) -> None:
+    if GUPSHUP_WEBHOOK_VERBOSE:
+        logger.info(msg, *args)
+    else:
+        logger.debug(msg, *args)
 
 
 def _now_ist_naive() -> datetime:
@@ -2466,7 +2475,7 @@ async def gupshup_delivery_webhook(request: Request):
         body = await request.body()
         payload = await request.json() if body else {}
         
-        logger.info("  📥 Received Gupshup webhook: %s", payload)
+        _gupshup_webhook_routine_log("  📥 Received Gupshup webhook: %s", payload)
         
         # Handle both Gupshup v2 and Meta v3 formats
         # Gupshup v2 format: {"type": "message-event", "payload": {...}}
@@ -2609,7 +2618,7 @@ async def gupshup_delivery_webhook(request: Request):
                                 timestamp = datetime.now(timezone.utc)
             # If we processed inbound messages, we can return success immediately
             if inbound_processed and not status:
-                logger.info("  ✅ Inbound message processed and user record updated.")
+                _gupshup_webhook_routine_log("  ✅ Inbound message processed and user record updated.")
                 return {"status": "ok", "message": "Inbound message stored"}
         
         # If we couldn't parse, log and return
@@ -2673,8 +2682,26 @@ async def gupshup_delivery_webhook(request: Request):
                         """,
                         (message_id, phone, existing_user_name, existing_message_title, status, error_code, error_message, timestamp_ist, Json(payload)),
                     )
-            logger.info("  ✅ Stored delivery status: message_id=%s, phone=%s, user=%s, title=%s, status=%s", 
-                       message_id, phone, existing_user_name or "N/A", existing_message_title or "N/A", status)
+            if status == "failed" or error_code or error_message:
+                logger.warning(
+                    "  ⚠️ Delivery status issue: message_id=%s, phone=%s, user=%s, title=%s, status=%s, error_code=%s, error_message=%s",
+                    message_id,
+                    phone,
+                    existing_user_name or "N/A",
+                    existing_message_title or "N/A",
+                    status,
+                    error_code,
+                    error_message,
+                )
+            else:
+                _gupshup_webhook_routine_log(
+                    "  ✅ Stored delivery status: message_id=%s, phone=%s, user=%s, title=%s, status=%s",
+                    message_id,
+                    phone,
+                    existing_user_name or "N/A",
+                    existing_message_title or "N/A",
+                    status,
+                )
         except Exception as e:
             logger.error("  ❌ Failed to store delivery status: %s", e)
         
