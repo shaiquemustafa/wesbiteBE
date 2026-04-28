@@ -459,6 +459,35 @@ def _whatsapp_broadcast_has_scrip_and_category(scrip_cd, category: Optional[str]
         return False
 
 
+def _ui_data_has_scrip_and_category(scrip_cd, category: Optional[str]) -> bool:
+    """
+    True if ui_data already has a row with this scrip (in JSON data) and category.
+    Aligns with whatsapp_broadcast dedupe; rows older than cleanup (~48h) are gone.
+    """
+    if scrip_cd is None:
+        return False
+    scrip = str(scrip_cd).strip()
+    if not scrip:
+        return False
+    norm_cat = _normalize_category_broadcast_key(category)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM ui_data
+                    WHERE TRIM(COALESCE(data->>'scrip_cd', '')) = %s
+                      AND UPPER(TRIM(COALESCE(category, ''))) = %s
+                    LIMIT 1
+                    """,
+                    (scrip, norm_cat),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("ui_data scrip+category duplicate check failed: %s", e)
+        return False
+
+
 def _cleanup_old_records():
     """Delete records older than 48 hours from all tables to keep the DB lean."""
     cutoff = _now_ist_naive() - timedelta(hours=48)
@@ -978,59 +1007,96 @@ def _pipeline_sync(
             # All impacts (including STRONGLY NEGATIVE) go to ui_data
             try:
                 enriched = enrich_prediction(result)
-                ui_count = ui_service.bulk_store_enriched([enriched])
-                if ui_count:
-                    total_ui += ui_count
-                    logger.info("  [%s/%s] ✅ UI data saved for SCRIP %s.", i, total, row_dict.get("SCRIP_CD"))
-                
-                # Check if this should go to whatsapp_broadcast (stricter filtering)
-                should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(enriched, company_service)
-                if should_broadcast:
-                    if _whatsapp_broadcast_has_scrip_and_category(
-                        enriched.get("scrip_cd"), enriched.get("category")
-                    ):
+                duplicate_ui = _ui_data_has_scrip_and_category(
+                    enriched.get("scrip_cd"), enriched.get("category")
+                )
+                if duplicate_ui:
+                    logger.info(
+                        "  [%s/%s] ⏭️ UI data skipped (already have scrip+category): SCRIP %s | %s",
+                        i,
+                        total,
+                        row_dict.get("SCRIP_CD"),
+                        enriched.get("category") or "",
+                    )
+                else:
+                    ui_count = ui_service.bulk_store_enriched([enriched])
+                    if ui_count:
+                        total_ui += ui_count
                         logger.info(
-                            "  [%s/%s] ⏭️ WhatsApp broadcast skipped (already have scrip+category in window): SCRIP %s | %s",
+                            "  [%s/%s] ✅ UI data saved for SCRIP %s.",
                             i,
                             total,
                             row_dict.get("SCRIP_CD"),
-                            enriched.get("category") or "",
                         )
-                    else:
-                        try:
-                            with get_conn() as conn:
-                                with conn.cursor() as cur:
-                                    # Convert news_time to IST before storing
-                                    news_time_ist = _to_ist(enriched.get("news_time")) if enriched.get("news_time") else None
-                                    current_time_ist = _now_ist_naive().replace(tzinfo=IST)  # Current time in IST
 
-                                    cur.execute(
-                                        """
-                                        INSERT INTO whatsapp_broadcast
-                                            (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                        """,
-                                        (
-                                            enriched.get("scrip_cd"),
-                                            enriched.get("company_name", "Unknown"),
-                                            enriched.get("impact"),
-                                            enriched.get("category"),
-                                            enriched.get("summary"),
-                                            enriched.get("pdf_link"),
-                                            news_time_ist,
-                                            mkt_cap_cr,
-                                            Json(_make_json_serializable(enriched)),  # Store full enriched data as JSONB (convert Timestamps to strings)
-                                            current_time_ist,  # Explicitly set created_at in IST
-                                        ),
-                                    )
-                            items_to_notify.append(enriched)  # Add to notification queue
-                            logger.info("  [%s/%s] ✅ WhatsApp broadcast entry saved for SCRIP %s (mkt_cap=%.0f Cr).",
-                                        i, total, row_dict.get("SCRIP_CD"), mkt_cap_cr or 0)
-                        except Exception as e:
-                            logger.warning("  [%s/%s] Failed to save whatsapp_broadcast entry: %s", i, total, e)
-                else:
-                    logger.info("  [%s/%s] ⏭️ SCRIP %s excluded from WhatsApp broadcast (doesn't meet criteria).",
-                                i, total, row_dict.get("SCRIP_CD"))
+                    # Check if this should go to whatsapp_broadcast (stricter filtering)
+                    should_broadcast, mkt_cap_cr = _should_include_in_whatsapp_broadcast(
+                        enriched, company_service
+                    )
+                    if should_broadcast:
+                        if _whatsapp_broadcast_has_scrip_and_category(
+                            enriched.get("scrip_cd"), enriched.get("category")
+                        ):
+                            logger.info(
+                                "  [%s/%s] ⏭️ WhatsApp broadcast skipped (already have scrip+category in window): SCRIP %s | %s",
+                                i,
+                                total,
+                                row_dict.get("SCRIP_CD"),
+                                enriched.get("category") or "",
+                            )
+                        else:
+                            try:
+                                with get_conn() as conn:
+                                    with conn.cursor() as cur:
+                                        # Convert news_time to IST before storing
+                                        news_time_ist = (
+                                            _to_ist(enriched.get("news_time"))
+                                            if enriched.get("news_time")
+                                            else None
+                                        )
+                                        current_time_ist = _now_ist_naive().replace(tzinfo=IST)
+
+                                        cur.execute(
+                                            """
+                                            INSERT INTO whatsapp_broadcast
+                                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            """,
+                                            (
+                                                enriched.get("scrip_cd"),
+                                                enriched.get("company_name", "Unknown"),
+                                                enriched.get("impact"),
+                                                enriched.get("category"),
+                                                enriched.get("summary"),
+                                                enriched.get("pdf_link"),
+                                                news_time_ist,
+                                                mkt_cap_cr,
+                                                Json(_make_json_serializable(enriched)),
+                                                current_time_ist,
+                                            ),
+                                        )
+                                items_to_notify.append(enriched)
+                                logger.info(
+                                    "  [%s/%s] ✅ WhatsApp broadcast entry saved for SCRIP %s (mkt_cap=%.0f Cr).",
+                                    i,
+                                    total,
+                                    row_dict.get("SCRIP_CD"),
+                                    mkt_cap_cr or 0,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "  [%s/%s] Failed to save whatsapp_broadcast entry: %s",
+                                    i,
+                                    total,
+                                    e,
+                                )
+                    else:
+                        logger.info(
+                            "  [%s/%s] ⏭️ SCRIP %s excluded from WhatsApp broadcast (doesn't meet criteria).",
+                            i,
+                            total,
+                            row_dict.get("SCRIP_CD"),
+                        )
             except Exception as e:
                 logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
         else:

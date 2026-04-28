@@ -5,7 +5,7 @@ After a briefing run is ingested, each stock-news row is matched to users who
 have that BSE scrip on `user_watchlist`. Template uses WATCHLIST_TEMPLATE_ID
 (five body variables):
 
-  1) recipient first name   2) company line   3) category label
+  1) literal "user"         2) company line   3) literal "general"
   4) AI summary             5) time (IST) only — no link (keeps message shorter)
 
 Env:
@@ -46,13 +46,6 @@ def parse_bse_scrip(raw: Any) -> Optional[int]:
         return int(s)
     except (TypeError, ValueError):
         return None
-
-
-def _first_name(full: Optional[str]) -> str:
-    if not full or not str(full).strip():
-        return "there"
-    parts = str(full).strip().split()
-    return parts[0][:64] if parts else "there"
 
 
 def _clamp(s: str, n: int) -> str:
@@ -111,18 +104,15 @@ def _company_label(scrip: int, row: Dict[str, Any]) -> str:
 
 
 def build_briefing_watchlist_params(
-    user_first_name: str,
     company_display: str,
-    category: Optional[str],
     ai_summary: Optional[str],
     published_at_ist: Any,
 ) -> List[str]:
     """Five Gupshup body variables for the watchlist briefing template."""
-    p1 = _clamp(_first_name(user_first_name), _MAX_P1)
+    p1 = _clamp("user", _MAX_P1)
     raw_company = company_display.strip() if company_display else "Stock"
     p2 = _clamp(f"📊 *{raw_company}*", _MAX_P2)
-    cat = (category or "").strip() or "General news"
-    p3 = _clamp(cat, _MAX_P3)
+    p3 = _clamp("general", _MAX_P3)
     p4 = _clamp((ai_summary or "").strip() or "No summary available.", _MAX_P4)
     p5 = _format_time_only(published_at_ist)
     return [p1, p2, p3, p4, p5]
@@ -203,11 +193,9 @@ def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
 
         company = _company_label(scrip, row)
         title_short = (row.get("title") or company)[:80]
-        for phone, name in watchers:
+        for phone, _name in watchers:
             params = build_briefing_watchlist_params(
-                name,
                 company,
-                row.get("category"),
                 row.get("ai_summary"),
                 row.get("published_at_ist"),
             )
@@ -319,21 +307,9 @@ def send_test_briefing_watchlist(
         return {"ok": False, "error": "row has no parseable bse_scrip_code"}
 
     company = _company_label(scrip, row)
-    name_guess = "Friend"
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT name FROM users WHERE phone = %s", (phone,))
-                ur = cur.fetchone()
-                if ur and ur[0]:
-                    name_guess = ur[0]
-    except Exception:
-        pass
 
     params = build_briefing_watchlist_params(
-        name_guess,
         company,
-        row.get("category"),
         row.get("ai_summary"),
         row.get("published_at_ist"),
     )
