@@ -2922,3 +2922,56 @@ def admin_news_briefing_runs(
                 row[k] = v
         runs.append(row)
     return {"runs": runs}
+
+
+@app.post(
+    "/api/admin/news-briefing/test-watchlist-whatsapp",
+    summary="[ADMIN] Send one briefing-style WhatsApp (watchlist template) for QA",
+)
+def admin_news_briefing_test_watchlist_whatsapp(
+    phone: str = Query(
+        ...,
+        description="Destination number with country code, no + (e.g. 919876543210).",
+    ),
+    bse_scrip: Optional[int] = Query(
+        None,
+        description="BSE scrip code — uses the latest news_briefing_stock_news row for this stock.",
+    ),
+    stock_news_id: Optional[int] = Query(
+        None,
+        description="Exact row id from news_briefing_stock_news (overrides bse_scrip).",
+    ),
+    x_news_briefing_secret: Optional[str] = Header(None, alias="X-News-Briefing-Secret"),
+):
+    """
+    Sends the same 5-parameter watchlist briefing template used after ingest,
+    filled from DB (AI summary, category, time, link). Does **not** require the
+    stock to be on the recipient's watchlist — for testing only.
+
+    Either ``stock_news_id`` **or** ``bse_scrip`` is required.
+
+    Example::
+
+      curl -X POST -H \"X-News-Briefing-Secret: $SECRET\" \\
+        \"https://…/api/admin/news-briefing/test-watchlist-whatsapp?phone=919876543210&bse_scrip=500180\"
+    """
+    _require_news_briefing_secret(x_news_briefing_secret)
+    if stock_news_id is None and bse_scrip is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide stock_news_id or bse_scrip",
+        )
+    from service.news_briefing_whatsapp import send_test_briefing_watchlist
+
+    out = send_test_briefing_watchlist(
+        phone,
+        stock_news_id=stock_news_id,
+        bse_scrip=bse_scrip,
+    )
+    if out.get("ok"):
+        return out
+    err = str(out.get("error") or "")
+    code = 404 if "not found" in err.lower() else 400
+    if "Gupshup" in err:
+        code = 502
+    raise HTTPException(status_code=code, detail=out)

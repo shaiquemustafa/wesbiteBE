@@ -591,6 +591,18 @@ class WhatsAppService:
         )
         return {"sent": result["sent"], "failed": result["failed"]}
 
+    def send_template_batch(
+        self,
+        jobs: Sequence[tuple[str, dict, str]],
+    ) -> dict:
+        """
+        Parallel Gupshup template sends; each job may use different template id/params.
+        Jobs are (phone, {"id": uuid, "params": [...]}, message_title).
+
+        Returns {"sent": int, "failed": int, "total": int}.
+        """
+        return self._fan_out_template_sends(jobs)
+
     def send_user_training_message(
         self, phone: str, name_label: str, watchlist_csv: str, high_impact_label: str
     ) -> bool:

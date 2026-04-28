@@ -215,4 +215,15 @@ def run_pipeline_and_ingest(cycle: str) -> Dict[str, Any]:
         }
     )
     logger.info("news_briefing ingest OK: %s", meta)
+    try:
+        from service.news_briefing_whatsapp import (
+            briefing_whatsapp_enabled,
+            notify_watchlist_for_run,
+        )
+
+        if briefing_whatsapp_enabled() and meta.get("run_id"):
+            out = notify_watchlist_for_run(int(meta["run_id"]))
+            logger.info("news_briefing watchlist WhatsApp: %s", out)
+    except Exception:
+        logger.exception("news_briefing watchlist WhatsApp hook failed (ingest still OK)")
     return meta
