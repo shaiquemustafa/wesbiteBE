@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
@@ -43,6 +44,94 @@ META_ACCESS_TOKEN = os.getenv(
 META_TEST_EVENT_CODE = os.getenv("META_TEST_EVENT_CODE", "").strip()
 # Gupshup delivery webhook: routine success lines default to DEBUG; set to true for INFO-level audit noise.
 GUPSHUP_WEBHOOK_VERBOSE = os.getenv("GUPSHUP_WEBHOOK_VERBOSE", "").lower() in ("1", "true", "yes")
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes")
+
+
+# One INFO line per POST: what kind of event (delivery vs inbound). Default on; set GUPSHUP_WEBHOOK_SUMMARY_LOG=false to disable.
+GUPSHUP_WEBHOOK_SUMMARY_LOG = _env_bool("GUPSHUP_WEBHOOK_SUMMARY_LOG", True)
+# Hide uvicorn.access lines for this path only (less duplicate noise next to summary). Default off.
+GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG = _env_bool("GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG", False)
+
+_GUPSHUP_ACCESS_FILTER_INSTALLED = False
+
+
+def _mask_phone_tail(phone) -> str:
+    if phone is None:
+        return "?"
+    s = re.sub(r"[^\d]", "", str(phone))
+    if len(s) >= 4:
+        return f"****{s[-4:]}"
+    return "****"
+
+
+def _summarize_gupshup_payload(payload: dict) -> str:
+    """Short, privacy-safe description of why Gupshup POSTed (delivery receipts vs inbound vs unknown)."""
+    if not payload:
+        return "empty_body"
+    try:
+        if payload.get("type") == "message-event":
+            ep = payload.get("payload") or {}
+            evt = ep.get("eventType") or ep.get("status") or "?"
+            dest = ep.get("destination") or ep.get("phone")
+            mid = ep.get("messageId") or ep.get("id") or ""
+            mid_s = str(mid)
+            if len(mid_s) > 16:
+                mid_s = mid_s[:16] + "…"
+            return f"gupshup_v2 event={evt} dest={_mask_phone_tail(dest)} msg_id={mid_s}"
+        if payload.get("entry"):
+            kinds: list[str] = []
+            st = ph = mid = None
+            for entry in payload.get("entry", []):
+                for ch in entry.get("changes", []):
+                    val = ch.get("value") or {}
+                    if val.get("messages"):
+                        kinds.append("inbound_msg")
+                    if val.get("statuses"):
+                        kinds.append("delivery_status")
+                    if not st and val.get("statuses"):
+                        s0 = val["statuses"][0]
+                        st = s0.get("status")
+                        ph = s0.get("recipient_id")
+                        mid = s0.get("gs_id") or s0.get("meta_msg_id") or s0.get("id")
+            kinds_u = "+".join(sorted(set(kinds))) if kinds else "meta_empty"
+            mid_s = str(mid or "")
+            if len(mid_s) > 16:
+                mid_s = mid_s[:16] + "…"
+            extra = ""
+            if st or ph:
+                extra = f" status={st or '?'} dest={_mask_phone_tail(ph)} msg_id={mid_s}"
+            return f"meta_v3 {kinds_u}{extra}"
+    except Exception as e:
+        return f"parse_err={type(e).__name__}"
+    keys = list(payload.keys())[:6]
+    return f"unknown_shape keys={keys}"
+
+
+def _install_gupshup_access_log_filter() -> None:
+    """Drop uvicorn.access lines for POST /api/webhooks/gupshup-delivery when SILENCE flag is set."""
+    global _GUPSHUP_ACCESS_FILTER_INSTALLED
+    if _GUPSHUP_ACCESS_FILTER_INSTALLED or not GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG:
+        return
+
+    class _GupshupAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return True
+            return "/api/webhooks/gupshup-delivery" not in msg
+
+    logging.getLogger("uvicorn.access").addFilter(_GupshupAccessFilter())
+    _GUPSHUP_ACCESS_FILTER_INSTALLED = True
+
+
+_install_gupshup_access_log_filter()
 
 
 def _gupshup_webhook_routine_log(msg: str, *args) -> None:
@@ -2540,7 +2629,10 @@ async def gupshup_delivery_webhook(request: Request):
         # Get raw body to store for debugging
         body = await request.body()
         payload = await request.json() if body else {}
-        
+
+        if GUPSHUP_WEBHOOK_SUMMARY_LOG:
+            logger.info("Gupshup webhook: %s", _summarize_gupshup_payload(payload))
+
         _gupshup_webhook_routine_log("  📥 Received Gupshup webhook: %s", payload)
         
         # Handle both Gupshup v2 and Meta v3 formats
