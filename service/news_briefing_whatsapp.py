@@ -6,7 +6,7 @@ have that BSE scrip on `user_watchlist`. Template uses WATCHLIST_TEMPLATE_ID
 (five body variables):
 
   1) recipient first name   2) company line   3) category label
-  4) AI summary             5) time + source link
+  4) AI summary             5) time (IST) only — no link (keeps message shorter)
 
 Env:
   NEWS_BRIEFING_WHATSAPP_ENABLED — set to 1/true/yes to send after each ingest.
@@ -62,32 +62,29 @@ def _clamp(s: str, n: int) -> str:
     return s[: n - 1] + "…"
 
 
-def _format_time_link(published_at_ist: Any, link: Optional[str]) -> str:
-    """published_at_ist is naive IST in DB."""
-    time_part = "N/A"
-    if published_at_ist:
+def _format_time_only(published_at_ist: Any) -> str:
+    """published_at_ist is naive IST in DB. Variable 5 is time only (no URL)."""
+    if not published_at_ist:
+        return "N/A"
+    try:
+        if isinstance(published_at_ist, datetime):
+            dt = published_at_ist
+        else:
+            dt = datetime.fromisoformat(str(published_at_ist)[:19])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        else:
+            dt = dt.astimezone(IST)
         try:
-            if isinstance(published_at_ist, datetime):
-                dt = published_at_ist
-            else:
-                dt = datetime.fromisoformat(str(published_at_ist)[:19])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=IST)
-            else:
-                dt = dt.astimezone(IST)
-            try:
-                date_str = dt.strftime("%-d %b")
-                time_str = dt.strftime("%-I:%M %p")
-            except ValueError:
-                date_str = f"{dt.day} {dt.strftime('%b')}"
-                time_str = dt.strftime("%I:%M %p").lstrip("0")
-            time_part = f"{date_str}, {time_str}"
-        except Exception:
-            time_part = str(published_at_ist)[:80]
-    link = (link or "").strip()
-    if link:
-        return _clamp(f"{time_part} — {link}", _MAX_P5)
-    return _clamp(time_part, _MAX_P5)
+            date_str = dt.strftime("%-d %b")
+            time_str = dt.strftime("%-I:%M %p")
+        except ValueError:
+            date_str = f"{dt.day} {dt.strftime('%b')}"
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+        time_part = f"{date_str}, {time_str}"
+        return _clamp(time_part, _MAX_P5)
+    except Exception:
+        return _clamp(str(published_at_ist), _MAX_P5)
 
 
 def _company_label(scrip: int, row: Dict[str, Any]) -> str:
@@ -119,7 +116,6 @@ def build_briefing_watchlist_params(
     category: Optional[str],
     ai_summary: Optional[str],
     published_at_ist: Any,
-    link: Optional[str],
 ) -> List[str]:
     """Five Gupshup body variables for the watchlist briefing template."""
     p1 = _clamp(_first_name(user_first_name), _MAX_P1)
@@ -128,7 +124,7 @@ def build_briefing_watchlist_params(
     cat = (category or "").strip() or "General news"
     p3 = _clamp(cat, _MAX_P3)
     p4 = _clamp((ai_summary or "").strip() or "No summary available.", _MAX_P4)
-    p5 = _format_time_link(published_at_ist, link)
+    p5 = _format_time_only(published_at_ist)
     return [p1, p2, p3, p4, p5]
 
 
@@ -214,7 +210,6 @@ def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
                 row.get("category"),
                 row.get("ai_summary"),
                 row.get("published_at_ist"),
-                row.get("link"),
             )
             tpl = {"id": WATCHLIST_TEMPLATE_ID, "params": params}
             jobs.append((phone, tpl, title_short))
@@ -341,7 +336,6 @@ def send_test_briefing_watchlist(
         row.get("category"),
         row.get("ai_summary"),
         row.get("published_at_ist"),
-        row.get("link"),
     )
     tpl = {"id": WATCHLIST_TEMPLATE_ID, "params": params}
     ws = WhatsAppService()
