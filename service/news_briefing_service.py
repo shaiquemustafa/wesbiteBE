@@ -25,6 +25,15 @@ def story_fingerprint(link: Any, title: Any) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def dedupe_fingerprint(story_fp: str, scope: str) -> str:
+    """
+    Scope dedupe keys by logical bucket ("stock_news" vs "all_items_by_industry")
+    so one sheet cannot suppress inserts from the other.
+    """
+    seed = f"{scope}|{story_fp}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
 def _cell(v: Any) -> Any:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
@@ -227,6 +236,7 @@ def ingest_excel(
             link = r.get("link")
             title = r.get("title")
             fp = story_fingerprint(link, title)
+            seen_fp = dedupe_fingerprint(fp, "stock_news")
             cur.execute(
                 """
                 INSERT INTO news_briefing_seen_stories (
@@ -235,7 +245,7 @@ def ingest_excel(
                 ON CONFLICT (briefing_date_ist, story_fingerprint) DO NOTHING
                 RETURNING story_fingerprint
                 """,
-                (briefing_date_ist, fp, run_id, cycle),
+                (briefing_date_ist, seen_fp, run_id, cycle),
             )
             if cur.fetchone() is None:
                 skipped += 1
@@ -293,6 +303,7 @@ def ingest_excel(
             link = r.get("link")
             title = r.get("title")
             fp = story_fingerprint(link, title)
+            seen_fp = dedupe_fingerprint(fp, "all_items_by_industry")
             cur.execute(
                 """
                 INSERT INTO news_briefing_seen_stories (
@@ -301,7 +312,7 @@ def ingest_excel(
                 ON CONFLICT (briefing_date_ist, story_fingerprint) DO NOTHING
                 RETURNING story_fingerprint
                 """,
-                (briefing_date_ist, fp, run_id, cycle),
+                (briefing_date_ist, seen_fp, run_id, cycle),
             )
             if cur.fetchone() is None:
                 skipped += 1
