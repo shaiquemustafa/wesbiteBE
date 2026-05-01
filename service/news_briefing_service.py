@@ -55,25 +55,27 @@ def prune_seen_stories_older_than(conn, days: int = 14) -> int:
         return cur.rowcount
 
 
-def delete_runs_for_cycle_dates(
+def delete_all_prior_runs_for_cycle(
     conn,
     cycle: str,
     briefing_date_ist: date,
-) -> None:
+) -> int:
     """
-    Remove this cycle's run for `briefing_date_ist` (same-day retry) and for the
-    prior IST calendar day (yesterday same slot). CASCADE deletes child rows;
-    we also remove seen_stories rows keyed to those runs so fingerprints can
-    reappear on a retry.
+    Before inserting a new run for `cycle`, remove **every** prior
+    `news_briefing_runs` row with that cycle (any `briefing_date_ist`).
+    ON DELETE CASCADE drops `news_briefing_stock_news`,
+    `news_briefing_industry_insights`, and `news_briefing_all_items` for those runs.
+
+    Also clears `news_briefing_seen_stories` rows that pointed at those runs
+    (SET NULL would leave stale dedupe keys) and rows for this
+    `(briefing_date_ist, first_seen_cycle)` so same-day re-ingest is not blocked.
+
+    Returns how many run rows were deleted.
     """
-    prev = briefing_date_ist - timedelta(days=1)
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT id FROM news_briefing_runs
-            WHERE cycle = %s AND briefing_date_ist IN (%s, %s)
-            """,
-            (cycle, briefing_date_ist, prev),
+            "SELECT id FROM news_briefing_runs WHERE cycle = %s",
+            (cycle,),
         )
         ids = [row[0] for row in cur.fetchall()]
         if ids:
@@ -83,11 +85,13 @@ def delete_runs_for_cycle_dates(
             )
         cur.execute(
             """
-            DELETE FROM news_briefing_runs
-            WHERE cycle = %s AND briefing_date_ist IN (%s, %s)
+            DELETE FROM news_briefing_seen_stories
+            WHERE briefing_date_ist = %s AND first_seen_cycle = %s
             """,
-            (cycle, briefing_date_ist, prev),
+            (briefing_date_ist, cycle),
         )
+        cur.execute("DELETE FROM news_briefing_runs WHERE cycle = %s", (cycle,))
+        return len(ids)
 
 
 def insert_run_row(
@@ -378,14 +382,14 @@ def ingest_briefing_file(
     window_end_ist: datetime,
 ) -> Dict[str, Any]:
     """
-    Transaction: delete old runs (same cycle, today+yesterday dates), insert run,
+    Transaction: delete **all** prior runs for this `cycle` (any date), insert run,
     ingest sheets, prune old seen rows.
     """
     xlsx_path = Path(xlsx_path)
     prune_days = int(os.getenv("NEWS_BRIEFING_SEEN_PRUNE_DAYS", "14"))
     with get_conn() as conn:
         prune_seen_stories_older_than(conn, days=prune_days)
-        delete_runs_for_cycle_dates(conn, cycle, briefing_date_ist)
+        delete_all_prior_runs_for_cycle(conn, cycle, briefing_date_ist)
         rid = insert_run_row(
             conn,
             cycle=cycle,
