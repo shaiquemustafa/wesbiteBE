@@ -57,6 +57,8 @@ def _env_bool(key: str, default: bool) -> bool:
 GUPSHUP_WEBHOOK_SUMMARY_LOG = _env_bool("GUPSHUP_WEBHOOK_SUMMARY_LOG", True)
 # Hide uvicorn.access lines for this path only (less duplicate noise next to summary). Default off.
 GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG = _env_bool("GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG", False)
+# Acknowledge webhooks immediately; persist delivery/inbound in a worker thread (less event-loop contention vs OTP/site).
+GUPSHUP_WEBHOOK_DEFER = _env_bool("GUPSHUP_WEBHOOK_DEFER", True)
 
 _GUPSHUP_ACCESS_FILTER_INSTALLED = False
 
@@ -1730,13 +1732,14 @@ def _get_current_user(authorization: Optional[str] = Header(None)) -> dict:
 
 
 @app.post("/api/auth/send-otp", summary="Send OTP to WhatsApp number")
-def send_otp(body: SendOTPRequest):
+async def send_otp(body: SendOTPRequest):
     """
     Generates a 6-digit OTP, saves it, and sends it to the
-    user's WhatsApp number via WATI.
+    user's WhatsApp number via Gupshup. Runs in a thread pool so heavy
+    sync DB + HTTP work does not block other requests on the event loop.
     """
     auth_service = AuthService()
-    result = auth_service.send_otp(body.phone)
+    result = await asyncio.to_thread(auth_service.send_otp, body.phone)
 
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
@@ -2610,29 +2613,17 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
 # Gupshup Webhook Endpoint for Message Delivery Status
 # ──────────────────────────────────────────────────────────────────────
 
-@app.post("/api/webhooks/gupshup-delivery", summary="Gupshup webhook for message delivery status and inbound messages")
-async def gupshup_delivery_webhook(request: Request):
-    """
-    Receives delivery status updates from Gupshup webhooks.
-    
-    Handles both Gupshup v2 format and Meta v3 format.
-    Stores delivery status (sent, delivered, read, failed) in database.
-    
-    Events received:
-    - sent: Message was sent to WhatsApp
-    - delivered: Message was delivered to user's device
-    - read: Message was read by user
-    - failed: Message failed to send
-    - enqueued: Message is queued for sending
-    """
+async def _gupshup_webhook_deferred_work(payload: dict) -> None:
+    """Runs blocking webhook persistence off the main event loop."""
     try:
-        # Get raw body to store for debugging
-        body = await request.body()
-        payload = await request.json() if body else {}
+        await asyncio.to_thread(_process_gupshup_webhook_payload_sync, payload)
+    except Exception:
+        logger.exception("Gupshup webhook deferred processing failed")
 
-        if GUPSHUP_WEBHOOK_SUMMARY_LOG:
-            logger.info("Gupshup webhook: %s", _summarize_gupshup_payload(payload))
 
+def _process_gupshup_webhook_payload_sync(payload: dict) -> dict:
+    """Parse and persist Gupshup / Meta delivery receipts and inbound messages."""
+    try:
         _gupshup_webhook_routine_log("  📥 Received Gupshup webhook: %s", payload)
         
         # Handle both Gupshup v2 and Meta v3 formats
@@ -2864,10 +2855,47 @@ async def gupshup_delivery_webhook(request: Request):
             logger.error("  ❌ Failed to store delivery status: %s", e)
         
         return {"status": "ok", "message": "Webhook processed successfully"}
-        
     except Exception as e:
         logger.error("  ❌ Webhook processing error: %s", e)
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/webhooks/gupshup-delivery", summary="Gupshup webhook for message delivery status and inbound messages")
+async def gupshup_delivery_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receives delivery status updates from Gupshup webhooks.
+
+    Handles both Gupshup v2 format and Meta v3 format.
+    Stores delivery status (sent, delivered, read, failed) in database.
+
+    Events received:
+    - sent: Message was sent to WhatsApp
+    - delivered: Message was delivered to user's device
+    - read: Message was read by user
+    - failed: Message failed to send
+    - enqueued: Message is queued for sending
+    """
+    try:
+        body = await request.body()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = {}
+    except Exception as e:
+        logger.warning("Gupshup webhook: could not read body: %s", e)
+        return {"status": "ok", "message": "accepted"}
+
+    if GUPSHUP_WEBHOOK_SUMMARY_LOG:
+        logger.info("Gupshup webhook: %s", _summarize_gupshup_payload(payload))
+
+    if GUPSHUP_WEBHOOK_DEFER:
+        background_tasks.add_task(_gupshup_webhook_deferred_work, payload)
+        return {"status": "ok", "message": "accepted"}
+
+    return _process_gupshup_webhook_payload_sync(payload)
+
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────

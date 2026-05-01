@@ -30,6 +30,8 @@ WHATSAPP_PARALLELISM = int(os.getenv("WHATSAPP_PARALLELISM", "20"))
 WHATSAPP_REQUEST_TIMEOUT = int(os.getenv("WHATSAPP_REQUEST_TIMEOUT", "20"))
 WHATSAPP_MAX_RETRIES = int(os.getenv("WHATSAPP_MAX_RETRIES", "1"))
 WHATSAPP_RETRY_BACKOFF_SEC = float(os.getenv("WHATSAPP_RETRY_BACKOFF_SEC", "1.0"))
+# OTP uses the same Gupshup path but gets more retries (429/5xx/network) so login stays reliable under broadcast load.
+OTP_GUPSHUP_MAX_RETRIES = int(os.getenv("OTP_GUPSHUP_MAX_RETRIES", "3"))
 
 # Gupshup API Configuration - Hardcoded values
 GUPSHUP_BASE_URL = "https://api.gupshup.io/wa/api/v1"
@@ -138,10 +140,15 @@ class WhatsAppService:
     # ─────────────────────────────────────────────────────────────────
     # Internal: single-template send with retry on 429/5xx/network err
     # ─────────────────────────────────────────────────────────────────
-    def _post_template_request(self, phone: str, template_obj: dict) -> tuple[bool, dict | None, int]:
+    def _post_template_request(
+        self,
+        phone: str,
+        template_obj: dict,
+        max_retries: int | None = None,
+    ) -> tuple[bool, dict | None, int]:
         """
-        Posts ONE template message to Gupshup with up to WHATSAPP_MAX_RETRIES
-        extra attempts on 429 / 5xx / network errors.
+        Posts ONE template message to Gupshup with up to max_retries
+        extra attempts on 429 / 5xx / network errors (default: WHATSAPP_MAX_RETRIES).
 
         Returns (success, response_data_or_None, last_status_code).
         """
@@ -154,8 +161,9 @@ class WhatsAppService:
             "template": json.dumps(template_obj),
         }
 
+        retries = WHATSAPP_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
         last_status = 0
-        for attempt in range(1 + WHATSAPP_MAX_RETRIES):
+        for attempt in range(1 + retries):
             try:
                 response = _GUPSHUP_SESSION.post(
                     url,
@@ -165,7 +173,7 @@ class WhatsAppService:
                 )
             except requests.RequestException as e:
                 last_status = -1
-                if attempt < WHATSAPP_MAX_RETRIES:
+                if attempt < retries:
                     time.sleep(WHATSAPP_RETRY_BACKOFF_SEC)
                     continue
                 logger.warning("  ⚠️ Gupshup network error to %s: %s", phone, e)
@@ -174,7 +182,7 @@ class WhatsAppService:
             last_status = response.status_code
 
             # Retry on rate-limit / transient server errors
-            if (response.status_code == 429 or response.status_code >= 500) and attempt < WHATSAPP_MAX_RETRIES:
+            if (response.status_code == 429 or response.status_code >= 500) and attempt < retries:
                 logger.info(
                     "  ↻ Gupshup %s for %s — retrying after %.1fs",
                     response.status_code, phone, WHATSAPP_RETRY_BACKOFF_SEC,
@@ -271,6 +279,8 @@ class WhatsAppService:
         """
         Sends an OTP to the given phone number via WhatsApp using Gupshup API.
 
+        Uses pooled HTTP + retries (429 / 5xx / network), same as broadcast sends.
+
         Args:
             phone: Phone number with country code, no '+' (e.g., "919474841416")
             otp_code: The OTP code to send
@@ -278,85 +288,50 @@ class WhatsAppService:
         Returns:
             True if the message was sent successfully, False otherwise.
         """
-        # Gupshup API endpoint for template messages
-        url = f"{self.base_url}/template/msg"
-        
-        # Build template object as per Gupshup API format
-        # Based on your curl, the template expects 2 parameters
-        # Both are set to the OTP code - adjust if your template needs different values
-        template_obj = {
-            "id": OTP_TEMPLATE_ID,
-            "params": [otp_code, otp_code]  # Template has 2 params - both set to OTP code
-        }
-        
-        # Gupshup expects form-urlencoded data (matching your curl format)
-        payload = {
-            "channel": "whatsapp",
-            "source": GUPSHUP_SOURCE_NUMBER,  # 919187624274
-            "destination": phone,  # Recipient phone number
-            "src.name": GUPSHUP_APP_NAME,  # RITI01
-            "template": json.dumps(template_obj),  # Template as JSON string
-        }
-        
+        template_obj = {"id": OTP_TEMPLATE_ID, "params": [otp_code, otp_code]}
+        logger.info(
+            "  📤 Sending OTP via Gupshup to %s template=%s (extra_retries=%s)",
+            phone,
+            OTP_TEMPLATE_ID,
+            OTP_GUPSHUP_MAX_RETRIES,
+        )
         try:
-            logger.info("  📤 Sending OTP via Gupshup to %s using template ID %s", phone, OTP_TEMPLATE_ID)
-            logger.info("  📤 Template params: %s", template_obj["params"])
-            response = requests.post(url, data=payload, headers=self.headers, timeout=15)
-
-            logger.info("  📥 Gupshup response status: %s", response.status_code)
-            logger.info("  📥 Gupshup response body: %s", response.text[:500] if response.text else "(empty)")
-
-            if not response.text or not response.text.strip():
-                logger.error("  ❌ Gupshup returned empty response (status %s) for %s", response.status_code, phone)
-                return False
-
-            # Gupshup typically returns JSON
-            try:
-                data = response.json()
-            except ValueError:
-                # If response is not JSON, check status code
-                if response.status_code == 200:
-                    logger.info("  ✅ OTP sent to %s via WhatsApp (non-JSON response)", phone)
-                    return True
-                else:
-                    logger.error("  ❌ Gupshup returned non-JSON response (status %s): %s", response.status_code, response.text[:200])
-                    return False
-
-            # Check for success indicators in Gupshup response
-            status = data.get("status", "").lower()
-            if isinstance(data.get("response"), dict):
-                response_status = data.get("response", {}).get("status", "")
-                status = status or response_status.lower()
-            
-            # Also check for "accepted" status
-            success = (
-                status in ["success", "submitted", "accepted"] or 
-                response.status_code == 200 or
-                data.get("accepted", False)
+            success, data, last_status = self._post_template_request(
+                phone, template_obj, max_retries=OTP_GUPSHUP_MAX_RETRIES
             )
-
-            if success:
-                # Log message ID if available (for tracking via webhooks)
-                message_id = data.get("messageId") or data.get("id") or data.get("response", {}).get("messageId")
-                if message_id:
-                    # Store directly in message_delivery_status
-                    self._store_message_delivery_record(message_id, phone, "OTP")
-                    logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup) - messageId: %s", phone, message_id)
-                else:
-                    logger.info("  ✅ OTP sent to %s via WhatsApp (Gupshup)", phone)
-            else:
-                error_msg = (
-                    data.get("message") or 
-                    data.get("error") or 
-                    data.get("response", {}).get("message", "") if isinstance(data.get("response"), dict) else "" or
-                    "Unknown error"
-                )
-                logger.warning("  ❌ Failed to send OTP to %s: %s", phone, error_msg)
-
-            return success
         except Exception as e:
             logger.error("  ❌ Gupshup API error sending OTP to %s: %s", phone, e)
             return False
+
+        if success and data:
+            message_id = (
+                data.get("messageId")
+                or data.get("id")
+                or (data.get("response", {}) or {}).get("messageId")
+            )
+            if message_id:
+                self._store_message_delivery_record(message_id, phone, "OTP")
+                logger.info("  ✅ OTP sent to %s (Gupshup) messageId=%s", phone, message_id)
+            else:
+                logger.info("  ✅ OTP sent to %s (Gupshup)", phone)
+            return True
+
+        if success and not data:
+            logger.info("  ✅ OTP sent to %s (Gupshup, non-JSON OK)", phone)
+            return True
+
+        err = None
+        if isinstance(data, dict):
+            err = data.get("message") or data.get("error")
+            if not err and isinstance(data.get("response"), dict):
+                err = data["response"].get("message")
+        logger.warning(
+            "  ❌ OTP send failed phone=%s http=%s err=%s",
+            phone,
+            last_status,
+            err or "unknown",
+        )
+        return False
 
     def _update_contact_attributes(self, phone: str, attributes: list) -> bool:
         """
