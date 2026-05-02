@@ -59,8 +59,18 @@ GUPSHUP_WEBHOOK_SUMMARY_LOG = _env_bool("GUPSHUP_WEBHOOK_SUMMARY_LOG", True)
 GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG = _env_bool("GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG", False)
 # Acknowledge webhooks immediately; persist delivery/inbound in a worker thread (less event-loop contention vs OTP/site).
 GUPSHUP_WEBHOOK_DEFER = _env_bool("GUPSHUP_WEBHOOK_DEFER", True)
+# Limit concurrent webhook DB writers so bursts (enqueued→sent→delivered per message) cannot exhaust the Postgres pool.
+GUPSHUP_WEBHOOK_MAX_CONCURRENT = max(1, int(os.getenv("GUPSHUP_WEBHOOK_MAX_CONCURRENT", "8")))
 
 _GUPSHUP_ACCESS_FILTER_INSTALLED = False
+_gupshup_webhook_sem: asyncio.Semaphore | None = None
+
+
+def _gupshup_webhook_semaphore() -> asyncio.Semaphore:
+    global _gupshup_webhook_sem
+    if _gupshup_webhook_sem is None:
+        _gupshup_webhook_sem = asyncio.Semaphore(GUPSHUP_WEBHOOK_MAX_CONCURRENT)
+    return _gupshup_webhook_sem
 
 
 def _mask_phone_tail(phone) -> str:
@@ -2614,11 +2624,12 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
 # ──────────────────────────────────────────────────────────────────────
 
 async def _gupshup_webhook_deferred_work(payload: dict) -> None:
-    """Runs blocking webhook persistence off the main event loop."""
-    try:
-        await asyncio.to_thread(_process_gupshup_webhook_payload_sync, payload)
-    except Exception:
-        logger.exception("Gupshup webhook deferred processing failed")
+    """Runs blocking webhook persistence off the main event loop, capped for DB pool safety."""
+    async with _gupshup_webhook_semaphore():
+        try:
+            await asyncio.to_thread(_process_gupshup_webhook_payload_sync, payload)
+        except Exception:
+            logger.exception("Gupshup webhook deferred processing failed")
 
 
 def _process_gupshup_webhook_payload_sync(payload: dict) -> dict:
@@ -2892,7 +2903,8 @@ async def gupshup_delivery_webhook(request: Request, background_tasks: Backgroun
         background_tasks.add_task(_gupshup_webhook_deferred_work, payload)
         return {"status": "ok", "message": "accepted"}
 
-    return _process_gupshup_webhook_payload_sync(payload)
+    async with _gupshup_webhook_semaphore():
+        return await asyncio.to_thread(_process_gupshup_webhook_payload_sync, payload)
 
 
 

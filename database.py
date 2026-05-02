@@ -16,8 +16,9 @@ register_default_jsonb(loads=json.loads, globally=True)
 
 # Pool sizing — must comfortably exceed WHATSAPP_PARALLELISM since each
 # broadcast worker may grab a connection to record delivery status.
+# Webhooks + scheduler + API share this pool; raise DB_POOL_MAX on Render if you still see PoolError.
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "30"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "50"))
 
 _pool: ThreadedConnectionPool | None = None
 
