@@ -54,6 +54,16 @@ MARKET_UPDATE_TEMPLATE_ID = "109c6887-f03c-4617-a4d3-efd0c8c59ddf"
 # Params: [name_label, watchlist_companies_csv, high_impact_status_label]
 USER_TRAINING_TEMPLATE_ID = "b6082566-52b3-43e4-b13a-3053db1f456b"
 
+# Quick pulse / UI digest (summary_ui_data → whatsapp_broadcast only)
+# Params: [ "user", full_summary_text, send_time_label ]
+QUICK_PULSE_DIGEST_TEMPLATE_ID = os.getenv(
+    "QUICK_PULSE_DIGEST_TEMPLATE_ID",
+    "1a9bdb1e-16c5-454c-b534-5ce8e2ffe50d",
+).strip() or "1a9bdb1e-16c5-454c-b534-5ce8e2ffe50d"
+WHATSAPP_DIGEST_PARAM2_MAX_CHARS = max(
+    512, min(int(os.getenv("WHATSAPP_DIGEST_PARAM2_MAX_CHARS", "4096")), 16000)
+)
+
 # RITO website URL (used in notification messages)
 RITO_WEBSITE_URL = os.getenv("RITO_WEBSITE_URL", "rito.co.in")
 RITO_MANAGE_URL = os.getenv("RITO_MANAGE_URL", "rito.co.in/#watchlist")
@@ -563,6 +573,70 @@ class WhatsAppService:
         logger.info(
             "  ✅ Gupshup broadcast complete: %d sent, %d failed out of %d contacts in %.2fs",
             result["sent"], result["failed"], result["total"], elapsed,
+        )
+        return {"sent": result["sent"], "failed": result["failed"]}
+
+    def _format_quick_pulse_time_label(self, when: datetime | None = None) -> str:
+        """IST wall time for template param 3 (e.g. '9 May, 3:45 PM')."""
+        dt = when or datetime.now(IST)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        else:
+            dt = dt.astimezone(IST)
+        date_str = dt.strftime("%-d %b")
+        time_str = dt.strftime("%-I:%M %p")
+        return f"{date_str}, {time_str}"
+
+    def send_quick_pulse_digest_broadcast(
+        self,
+        phones: list,
+        summary_text: str,
+        time_label: str | None = None,
+    ) -> dict:
+        """
+        Sends the 3-parameter Quick pulse digest template to many numbers.
+        Param 1 is literal 'user'; param 2 is full digest text; param 3 is send time (IST).
+        """
+        if not phones:
+            return {"sent": 0, "failed": 0}
+
+        label = time_label or self._format_quick_pulse_time_label()
+        body = (summary_text or "").strip()
+        max_c = WHATSAPP_DIGEST_PARAM2_MAX_CHARS
+        if len(body) > max_c:
+            body = body[: max_c - 1].rstrip() + "…"
+
+        template_obj = {
+            "id": QUICK_PULSE_DIGEST_TEMPLATE_ID,
+            "params": ["user", body, label],
+        }
+
+        unique_phones: list[str] = []
+        seen: set[str] = set()
+        for p in phones:
+            if not p:
+                continue
+            p = str(p).strip()
+            if p and p not in seen:
+                seen.add(p)
+                unique_phones.append(p)
+
+        logger.info(
+            "  📤 Gupshup Quick pulse digest: template=%s | receivers=%d | parallelism=%d",
+            QUICK_PULSE_DIGEST_TEMPLATE_ID,
+            len(unique_phones),
+            WHATSAPP_PARALLELISM,
+        )
+        t0 = time.monotonic()
+        jobs = [(phone, template_obj, "Quick pulse") for phone in unique_phones]
+        result = self._fan_out_template_sends(jobs)
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "  ✅ Quick pulse digest: %d sent, %d failed out of %d in %.2fs",
+            result["sent"],
+            result["failed"],
+            result["total"],
+            elapsed,
         )
         return {"sent": result["sent"], "failed": result["failed"]}
 

@@ -1,12 +1,26 @@
 # service/notification_service.py – Send market updates to relevant users
 import logging
+import os
+from datetime import date, datetime, timedelta, timezone
 from typing import List
+
+from psycopg2.extras import Json
 
 from database import get_conn
 from service.whatsapp_service import WhatsAppService
 from service.watchlist_service import WatchlistService
 
 logger = logging.getLogger("uvicorn.error")
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _digest_broadcast_enabled() -> bool:
+    return os.getenv("WHATSAPP_DIGEST_BROADCAST_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 class NotificationService:
@@ -150,4 +164,156 @@ class NotificationService:
             "items_processed": len(enriched_items),
             "total_sent": total_sent,
             "total_failed": total_failed,
+        }
+
+    def notify_quick_pulse_digest(self, summary_text: str) -> dict:
+        """
+        Sends the Quick pulse digest template to every active user with a phone
+        (same scope as _get_all_active_phones). Param 3 is current IST send time.
+        """
+        text = (summary_text or "").strip()
+        if not text:
+            logger.info("  📭 Quick pulse digest skipped — empty summary.")
+            return {"total_users": 0, "sent": 0, "failed": 0}
+
+        phones = [
+            str(p).strip()
+            for p in self._get_all_active_phones()
+            if p and str(p).strip()
+        ]
+        if not phones:
+            logger.info("  📭 Quick pulse digest — no active phones.")
+            return {"total_users": 0, "sent": 0, "failed": 0}
+
+        logger.info(
+            "  📢 Quick pulse digest → %d recipient(s)",
+            len(phones),
+        )
+        result = self.whatsapp.send_quick_pulse_digest_broadcast(phones, text)
+        sent = result.get("sent", 0)
+        failed = result.get("failed", 0)
+        logger.info(
+            "  📢 Quick pulse digest done: %d sent, %d failed.",
+            sent,
+            failed,
+        )
+        return {"total_users": len(phones), "sent": sent, "failed": failed}
+
+    def send_quick_pulse_digest_test(self, phone: str, summary_text: str) -> dict:
+        """Single-phone QA send using the Quick pulse digest template."""
+        p = (phone or "").strip()
+        text = (summary_text or "").strip()
+        if not p:
+            return {"ok": False, "error": "phone required"}
+        if not text:
+            return {"ok": False, "error": "summary_text empty"}
+        result = self.whatsapp.send_quick_pulse_digest_broadcast([p], text)
+        return {
+            "ok": result.get("sent", 0) > 0,
+            "sent": result.get("sent", 0),
+            "failed": result.get("failed", 0),
+            "phone_tail": p[-4:] if len(p) >= 4 else p,
+        }
+
+    def publish_quick_pulse_digest_after_summary(
+        self,
+        summary_ui_data_id: int,
+        slot: str,
+        briefing_day: date,
+        summary_text: str,
+    ) -> dict:
+        """
+        Inserts a whatsapp_broadcast row (kind ui_summary_digest) and sends immediately.
+        Idempotent per summary_ui_data_id.
+        """
+        if not _digest_broadcast_enabled():
+            logger.info(
+                "Quick pulse digest skipped (WHATSAPP_DIGEST_BROADCAST_ENABLED=false) summary_ui_data_id=%s",
+                summary_ui_data_id,
+            )
+            return {"ok": False, "skipped": "digest_broadcast_disabled"}
+
+        text = (summary_text or "").strip()
+        if not text:
+            return {"ok": False, "skipped": "empty_summary"}
+
+        data_obj = {
+            "kind": "ui_summary_digest",
+            "summary_ui_data_id": summary_ui_data_id,
+            "slot": slot,
+            "briefing_date_ist": briefing_day.isoformat(),
+        }
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id FROM whatsapp_broadcast
+                        WHERE data->>'kind' = 'ui_summary_digest'
+                          AND (data->>'summary_ui_data_id')::bigint = %s
+                        LIMIT 1
+                        """,
+                        (summary_ui_data_id,),
+                    )
+                    existing = cur.fetchone()
+                    if existing:
+                        logger.info(
+                            "Quick pulse digest already queued for summary_ui_data_id=%s (broadcast id=%s)",
+                            summary_ui_data_id,
+                            existing[0],
+                        )
+                        return {
+                            "ok": False,
+                            "skipped": "already_enqueued",
+                            "broadcast_id": existing[0],
+                        }
+
+                    cur.execute(
+                        """
+                        INSERT INTO whatsapp_broadcast (
+                            scrip_cd, company_name, impact, category,
+                            summary, pdf_link, news_time, mkt_cap_cr, data
+                        )
+                        VALUES (
+                            NULL, %s, %s, %s, %s, NULL, NULL, NULL, %s
+                        )
+                        RETURNING id
+                        """,
+                        (
+                            "Quick pulse",
+                            "DIGEST",
+                            slot,
+                            text,
+                            Json(data_obj),
+                        ),
+                    )
+                    wb_id = cur.fetchone()[0]
+        except Exception as e:
+            logger.exception("Quick pulse whatsapp_broadcast insert failed: %s", e)
+            return {"ok": False, "error": str(e)}
+
+        notify = self.notify_quick_pulse_digest(text)
+        sent = notify.get("sent", 0)
+
+        if sent > 0:
+            try:
+                sent_at_ist = datetime.now(IST)
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE whatsapp_broadcast
+                            SET sent_at = %s
+                            WHERE id = %s
+                            """,
+                            (sent_at_ist, wb_id),
+                        )
+            except Exception as e:
+                logger.warning("Failed to set sent_at for digest broadcast %s: %s", wb_id, e)
+
+        return {
+            "ok": True,
+            "broadcast_id": wb_id,
+            "notify": notify,
         }

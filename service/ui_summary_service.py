@@ -177,10 +177,10 @@ def _insert_summary_row(
     summary_text: Optional[str] = None,
     model: Optional[str] = None,
     error_message: Optional[str] = None,
-) -> bool:
+) -> Optional[int]:
     """
     INSERT INTO summary_ui_data ON CONFLICT (briefing_date_ist, slot) DO NOTHING.
-    Returns True if a new row was inserted.
+    Returns the new row id, or None if the insert was skipped (conflict).
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -206,7 +206,33 @@ def _insert_summary_row(
                     error_message,
                 ),
             )
-            return cur.fetchone() is not None
+            row = cur.fetchone()
+            return int(row[0]) if row else None
+
+
+def _maybe_publish_quick_pulse_whatsapp(
+    summary_ui_data_id: int,
+    slot: str,
+    briefing_day: date,
+    digest: str,
+) -> None:
+    """completed summaries → whatsapp_broadcast + Quick pulse template (best-effort)."""
+    try:
+        from service.notification_service import NotificationService
+
+        out = NotificationService().publish_quick_pulse_digest_after_summary(
+            summary_ui_data_id, slot, briefing_day, digest
+        )
+        logger.info(
+            "ui_summary WhatsApp digest publish summary_ui_data_id=%s out=%s",
+            summary_ui_data_id,
+            out,
+        )
+    except Exception:
+        logger.exception(
+            "ui_summary WhatsApp digest publish failed summary_ui_data_id=%s",
+            summary_ui_data_id,
+        )
 
 
 def _build_observation_digest_lines(rows: List[Dict[str, Any]]) -> str:
@@ -286,7 +312,7 @@ def run_midday_summary(briefing_day: date) -> None:
             summary_text=None,
             model=None,
             error_message=None,
-        ):
+        ) is not None:
             logger.info(
                 "ui_summary midday: skipped_low_volume (%s obs < %s) for %s",
                 n,
@@ -310,6 +336,7 @@ def run_midday_summary(briefing_day: date) -> None:
         )
         if inserted:
             logger.info("ui_summary midday: completed for %s (%s obs)", briefing_day, n)
+            _maybe_publish_quick_pulse_whatsapp(inserted, slot, briefing_day, digest)
         else:
             logger.info("ui_summary midday: insert skipped (conflict) for %s", briefing_day)
     except Exception as e:
@@ -325,7 +352,7 @@ def run_midday_summary(briefing_day: date) -> None:
             summary_text=None,
             model=UI_SUMMARY_MODEL,
             error_message=msg,
-        ):
+        ) is not None:
             logger.info("ui_summary midday: recorded failed status for %s", briefing_day)
 
 
@@ -363,7 +390,7 @@ def run_evening_summary(briefing_day: date) -> None:
             summary_text=None,
             model=None,
             error_message=None,
-        ):
+        ) is not None:
             logger.info(
                 "ui_summary evening: skipped_low_volume (%s obs < %s) for %s",
                 n,
@@ -387,6 +414,7 @@ def run_evening_summary(briefing_day: date) -> None:
         )
         if inserted:
             logger.info("ui_summary evening: completed for %s (%s obs)", briefing_day, n)
+            _maybe_publish_quick_pulse_whatsapp(inserted, slot, briefing_day, digest)
         else:
             logger.info("ui_summary evening: insert skipped (conflict) for %s", briefing_day)
     except Exception as e:
@@ -402,7 +430,7 @@ def run_evening_summary(briefing_day: date) -> None:
             summary_text=None,
             model=UI_SUMMARY_MODEL,
             error_message=msg,
-        ):
+        ) is not None:
             logger.info("ui_summary evening: recorded failed status for %s", briefing_day)
 
 

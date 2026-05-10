@@ -32,7 +32,7 @@ from service.notification_service import NotificationService
 from service.watchlist_service import WatchlistService
 from service.whatsapp_service import WhatsAppService
 from entity.ui_data import UIDataItem
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Fixed IST offset (no tzdata dependency)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -69,6 +69,8 @@ def _env_bool(key: str, default: bool) -> bool:
 GUPSHUP_WEBHOOK_SUMMARY_LOG = _env_bool("GUPSHUP_WEBHOOK_SUMMARY_LOG", True)
 # Per-announcement WhatsApp broadcast rows + bulk notify (off by default).
 WHATSAPP_PER_NEWS_BROADCAST_ENABLED = _env_bool("WHATSAPP_PER_NEWS_BROADCAST_ENABLED", False)
+# UI digest (summary_ui_data) → Quick pulse template; independent of per-news flag.
+WHATSAPP_DIGEST_BROADCAST_ENABLED = _env_bool("WHATSAPP_DIGEST_BROADCAST_ENABLED", True)
 # Hide uvicorn.access lines for this path only (less duplicate noise next to summary). Default off.
 GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG = _env_bool("GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG", False)
 # Acknowledge webhooks immediately; persist delivery/inbound in a worker thread (less event-loop contention vs OTP/site).
@@ -208,33 +210,72 @@ async def _send_pending_broadcasts():
     await asyncio.to_thread(_send_pending_broadcasts_sync)
 
 
+def _notify_whatsapp_broadcast_entry(
+    notif_service: NotificationService,
+    entry: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Routes one whatsapp_broadcast row to Quick pulse (digest) or market templates.
+    Returns keys: sent, failed, skipped (bool), skip_reason (optional).
+    """
+    if entry.get("kind") == "ui_summary_digest":
+        if not WHATSAPP_DIGEST_BROADCAST_ENABLED:
+            return {"sent": 0, "failed": 0, "skipped": True, "skip_reason": "digest_disabled"}
+        summary_text = (entry.get("summary") or "").strip()
+        if not summary_text:
+            return {"sent": 0, "failed": 0, "skipped": True, "skip_reason": "empty_summary"}
+        r = notif_service.notify_quick_pulse_digest(summary_text)
+        return {
+            "sent": r.get("sent", 0),
+            "failed": r.get("failed", 0),
+            "skipped": False,
+            "skip_reason": None,
+        }
+    if not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
+        return {"sent": 0, "failed": 0, "skipped": True, "skip_reason": "per_news_disabled"}
+    r = notif_service.notify_all_users(entry)
+    return {
+        "sent": r.get("sent", 0),
+        "failed": r.get("failed", 0),
+        "skipped": False,
+        "skip_reason": None,
+    }
+
+
 def _send_pending_broadcasts_sync():
     """
     Automatically sends notifications for entries in whatsapp_broadcast
-    that haven't been sent yet (sent_at IS NULL). Each entry is dispatched
-    via WhatsAppService.send_market_update_broadcast which fans out to
-    Gupshup in parallel using the dedicated WhatsApp thread pool.
+    that haven't been sent yet (sent_at IS NULL).
+    - Rows with data.kind = ui_summary_digest use the Quick pulse 3-param template
+      (when WHATSAPP_DIGEST_BROADCAST_ENABLED).
+    - All other rows use the market high-impact path when
+      WHATSAPP_PER_NEWS_BROADCAST_ENABLED.
     """
-    if not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
+    if not WHATSAPP_DIGEST_BROADCAST_ENABLED and not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
         return
     try:
-        # Get all unsent entries from the last hour (to avoid sending very old entries)
-        unsent_entries = []
+        # Unsent digests: look back 24h (retries). Unsent per-news: 1h (stale guard).
+        unsent_entries: List[Dict] = []
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
-                           news_time, mkt_cap_cr, data
+                    SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link,
+                           news_time, mkt_cap_cr, data, created_at
                     FROM whatsapp_broadcast
                     WHERE sent_at IS NULL
-                      AND created_at > NOW() - INTERVAL '1 hour'
+                      AND (
+                        (data->>'kind' = 'ui_summary_digest'
+                         AND created_at > NOW() - INTERVAL '24 hours')
+                        OR ((data IS NULL OR data->>'kind' IS DISTINCT FROM 'ui_summary_digest')
+                            AND created_at > NOW() - INTERVAL '1 hour')
+                      )
                     ORDER BY created_at DESC
                     LIMIT 50
                     """
                 )
                 rows = cur.fetchall()
-                
+
                 for row in rows:
                     entry = {
                         "id": row[0],
@@ -246,33 +287,36 @@ def _send_pending_broadcasts_sync():
                         "pdf_link": row[6],
                         "news_time": row[7],
                         "mkt_cap_cr": float(row[8]) if row[8] else None,
+                        "_created_at": row[10],
                     }
-                    
-                    # Merge data from JSONB if available
+
                     if row[9]:
                         data_dict = row[9] if isinstance(row[9], dict) else {}
                         entry.update(data_dict)
-                    
+
                     unsent_entries.append(entry)
-        
+
         if not unsent_entries:
             return
-        
-        logger.info("  🔄 Found %d unsent entries in whatsapp_broadcast, sending notifications...", len(unsent_entries))
-        
-        # Send notifications
+
+        logger.info(
+            "  🔄 Found %d unsent entries in whatsapp_broadcast, sending notifications...",
+            len(unsent_entries),
+        )
+
         notif_service = NotificationService()
         sent_count = 0
-        
+
         for entry in unsent_entries:
             try:
-                result = notif_service.notify_all_users(entry)
-                if result["sent"] > 0:
+                result = _notify_whatsapp_broadcast_entry(notif_service, entry)
+                if result.get("skipped"):
+                    continue
+
+                if result.get("sent", 0) > 0:
                     sent_count += 1
-                    # Mark as sent
                     with get_conn() as conn:
                         with conn.cursor() as cur:
-                            # Set sent_at in IST
                             sent_at_ist = _now_ist_naive().replace(tzinfo=IST)
                             cur.execute(
                                 """
@@ -282,10 +326,18 @@ def _send_pending_broadcasts_sync():
                                 """,
                                 (sent_at_ist, entry["id"]),
                             )
-                    logger.info("  ✅ Sent notification for %s (entry ID: %s)", entry.get("company_name"), entry["id"])
+                    logger.info(
+                        "  ✅ Sent notification for %s (entry ID: %s)",
+                        entry.get("company_name"),
+                        entry["id"],
+                    )
             except Exception as e:
-                logger.warning("  ⚠️ Failed to send notification for entry %s: %s", entry.get("id"), e)
-        
+                logger.warning(
+                    "  ⚠️ Failed to send notification for entry %s: %s",
+                    entry.get("id"),
+                    e,
+                )
+
         if sent_count > 0:
             logger.info("  ✅ Sent %d pending notifications", sent_count)
     except Exception as e:
@@ -2546,7 +2598,9 @@ def send_pending_broadcasts():
     
     for entry in unsent_entries:
         try:
-            result = notif_service.notify_all_users(entry)
+            result = _notify_whatsapp_broadcast_entry(notif_service, entry)
+            if result.get("skipped"):
+                continue
             if result["sent"] > 0:
                 total_sent += result["sent"]
                 # Mark as sent
@@ -2637,10 +2691,23 @@ def send_last_broadcast():
     # Send notifications
     notif_service = NotificationService()
     try:
-        result = notif_service.notify_all_users(last_entry)
+        result = _notify_whatsapp_broadcast_entry(notif_service, last_entry)
+        if result.get("skipped"):
+            reason = result.get("skip_reason") or "skipped"
+            logger.info("  ⏭️ send-last-broadcast skipped: %s", reason)
+            return {
+                "message": f"Skipped ({reason}). Check WHATSAPP_DIGEST_BROADCAST_ENABLED / WHATSAPP_PER_NEWS_BROADCAST_ENABLED.",
+                "entry": {
+                    "id": last_entry.get("id"),
+                    "company_name": last_entry.get("company_name"),
+                    "kind": last_entry.get("kind"),
+                },
+                "sent": 0,
+                "failed": 0,
+            }
         sent = result.get("sent", 0)
         failed = result.get("failed", 0)
-        
+
         # Mark as sent (update sent_at even if it was already set)
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -2749,8 +2816,39 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
     # Send notifications to specified phones using WhatsApp service directly
     whatsapp_service = WhatsAppService()
     try:
-        # Regular broadcast (not watchlist-only) since it's from whatsapp_broadcast table
-        result = whatsapp_service.send_market_update_broadcast(request.phones, last_entry, is_watchlist=False)
+        if last_entry.get("kind") == "ui_summary_digest":
+            if not WHATSAPP_DIGEST_BROADCAST_ENABLED:
+                return {
+                    "message": "Skipped (digest_disabled). Set WHATSAPP_DIGEST_BROADCAST_ENABLED=true.",
+                    "entry": {"id": last_entry.get("id"), "company_name": last_entry.get("company_name")},
+                    "phones_requested": len(request.phones),
+                    "sent": 0,
+                    "failed": 0,
+                }
+            summary_text = (last_entry.get("summary") or "").strip()
+            if not summary_text:
+                return {
+                    "message": "Digest entry has empty summary.",
+                    "entry": {"id": last_entry.get("id")},
+                    "phones_requested": len(request.phones),
+                    "sent": 0,
+                    "failed": 0,
+                }
+            result = whatsapp_service.send_quick_pulse_digest_broadcast(
+                request.phones, summary_text
+            )
+        else:
+            if not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
+                return {
+                    "message": "Skipped (per_news_disabled). Set WHATSAPP_PER_NEWS_BROADCAST_ENABLED=true.",
+                    "entry": {"id": last_entry.get("id"), "company_name": last_entry.get("company_name")},
+                    "phones_requested": len(request.phones),
+                    "sent": 0,
+                    "failed": 0,
+                }
+            result = whatsapp_service.send_market_update_broadcast(
+                request.phones, last_entry, is_watchlist=False
+            )
         sent = result.get("sent", 0)
         failed = result.get("failed", 0)
         
@@ -3440,3 +3538,87 @@ def admin_ui_summary_recent(
                         row[k] = v
                 rows.append(row)
     return {"rows": rows, "limit": limit}
+
+
+@app.post(
+    "/api/admin/ui-summary/test-whatsapp",
+    summary="[ADMIN] Send one Quick pulse digest template message for QA",
+)
+def admin_ui_summary_test_whatsapp(
+    phone: str = Query(
+        ...,
+        description="Destination number with country code, no + (e.g. 919876543210).",
+    ),
+    summary_text: Optional[str] = Query(
+        None,
+        description="Full digest body for template variable 2. Omit to load from DB.",
+    ),
+    summary_id: Optional[int] = Query(
+        None,
+        description="Use summary_text from summary_ui_data.id (overrides default lookup).",
+    ),
+    x_ui_summary_secret: Optional[str] = Header(None, alias="X-UI-Summary-Secret"),
+):
+    """
+    Sends the same 3-parameter Quick pulse / UI digest Gupshup template used after a
+    completed ``summary_ui_data`` row (params: ``user``, full summary, IST send time).
+
+    Provide ``summary_text``, or ``summary_id``, or omit both to use the latest
+    ``status='completed'`` row.
+
+    Example::
+
+      curl -X POST -H \"X-UI-Summary-Secret: $SECRET\" \\
+        \"https://YOUR_HOST/api/admin/ui-summary/test-whatsapp?phone=919876543210\"
+    """
+    _require_ui_summary_trigger_secret(x_ui_summary_secret)
+
+    text = (summary_text or "").strip()
+    if summary_id is not None:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT summary_text FROM summary_ui_data
+                    WHERE id = %s AND status = 'completed'
+                    """,
+                    (summary_id,),
+                )
+                r = cur.fetchone()
+                if not r or not (r[0] or "").strip():
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No completed summary_ui_data row for id={summary_id}",
+                    )
+                text = (r[0] or "").strip()
+    if not text:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT summary_text FROM summary_ui_data
+                    WHERE status = 'completed' AND summary_text IS NOT NULL
+                      AND TRIM(summary_text) <> ''
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                )
+                r = cur.fetchone()
+                if r and r[0]:
+                    text = str(r[0]).strip()
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="No summary text — pass summary_text or summary_id or complete a digest run first.",
+        )
+
+    out = NotificationService().send_quick_pulse_digest_test(phone, text)
+    if out.get("ok"):
+        return {
+            "message": "Quick pulse template sent",
+            "template_id_note": "QUICK_PULSE_DIGEST_TEMPLATE_ID / env QUICK_PULSE_DIGEST_TEMPLATE_ID",
+            **out,
+            "summary_chars": len(text),
+        }
+    err = str(out.get("error") or "send failed")
+    raise HTTPException(status_code=502, detail=out if isinstance(out, dict) else err)
