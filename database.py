@@ -835,7 +835,7 @@ def _ensure_tables(conn):
             (
                 "summary_ui_data",
                 "LLM digests of ui_data activity for IST calendar days (12:30 midday and 19:30 evening slots).",
-                "Midday window: previous calendar day 07:30 through briefing day 12:30 IST inclusive. Evening: normally after 12:30 through 19:30 IST on the briefing day; extended to previous day 07:30 through 19:30 if midday slot is missing or not completed.",
+                "IST digest windows are cyclical (see ui_summary_service): narrow slice after prior slot completed, else 24h catch-up between slot anchors. Min observations UI_SUMMARY_MIN_OBSERVATIONS.",
                 "Rows from ui_data whose news_time falls in the IST window; skipped_low_volume when count < UI_SUMMARY_MIN_OBSERVATIONS (default 4). Status values: completed, skipped_low_volume, failed.",
                 "Automated WhatsApp-readable summaries keyed by briefing_date_ist and slot (unique).",
             ),

@@ -1,6 +1,12 @@
 """
 IST UI digest summaries over ui_data windows (midday / evening slots).
 Uses naive IST datetimes for windows, consistent with the rest of the backend.
+
+Windowing is cyclical: if the *previous* slot in the chain completed successfully,
+only the incremental slice is considered; if it skipped/failed or is missing,
+a 24-hour catch-up window between the same slot times is used. Each run still
+requires at least UI_SUMMARY_MIN_OBSERVATIONS (default 4) ui_data rows or it
+records skipped_low_volume.
 """
 
 from __future__ import annotations
@@ -44,25 +50,62 @@ def _naive_ist(d: date, hh: int, mm: int) -> datetime:
     return datetime.combine(d, time(hh, mm, 0))
 
 
-def midday_window_ist(briefing_day: date) -> tuple[datetime, datetime]:
-    """D-1 07:30 through D 12:30 IST inclusive."""
-    start = _naive_ist(briefing_day - timedelta(days=1), 7, 30)
-    end = _naive_ist(briefing_day, 12, 30)
-    return start, end
+def _summary_slot_status(slot: str, briefing_day: date) -> Optional[str]:
+    """Terminal status for this IST calendar day + slot, or None if no row."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status FROM summary_ui_data
+                WHERE briefing_date_ist = %s AND slot = %s
+                LIMIT 1
+                """,
+                (briefing_day, slot),
+            )
+            r = cur.fetchone()
+            return r[0] if r else None
 
 
-def evening_window_normal_ist(briefing_day: date) -> tuple[datetime, datetime]:
-    """news_time strictly after D 12:30 through D 19:30 IST inclusive."""
-    start = _naive_ist(briefing_day, 12, 30)
-    end = _naive_ist(briefing_day, 19, 30)
-    return start, end
+def _previous_evening_completed_for_midday(briefing_day: date) -> bool:
+    """True iff yesterday's 19:30 slot finished with status completed."""
+    prev_day = briefing_day - timedelta(days=1)
+    return _summary_slot_status(SLOT_EVENING, prev_day) == "completed"
 
 
-def evening_window_extended_ist(briefing_day: date) -> tuple[datetime, datetime]:
-    """D-1 07:30 through D 19:30 IST inclusive."""
-    start = _naive_ist(briefing_day - timedelta(days=1), 7, 30)
-    end = _naive_ist(briefing_day, 19, 30)
-    return start, end
+def _resolve_midday_window(briefing_day: date) -> tuple[datetime, datetime, bool, str]:
+    """
+    Cyclical window for D 12:30:
+    - If previous calendar day's evening slot **completed** → narrow slice only:
+      (D-1 19:30, D 12:30] IST (news after last evening digest through midday).
+    - Otherwise (skipped/failed/missing) → 24h catch-up between midday anchors:
+      (D-1 12:30, D 12:30] IST.
+
+    Returns (window_start, window_end, start_exclusive, label_for_logs).
+    """
+    if _previous_evening_completed_for_midday(briefing_day):
+        w_start = _naive_ist(briefing_day - timedelta(days=1), 19, 30)
+        w_end = _naive_ist(briefing_day, 12, 30)
+        return w_start, w_end, True, "narrow_after_evening_completed"
+    w_start = _naive_ist(briefing_day - timedelta(days=1), 12, 30)
+    w_end = _naive_ist(briefing_day, 12, 30)
+    return w_start, w_end, True, "wide_catchup_24h_midday"
+
+
+def _resolve_evening_window(briefing_day: date) -> tuple[datetime, datetime, bool, str]:
+    """
+    Cyclical window for D 19:30:
+    - If today's midday **completed** → narrow (12:30, 19:30] same day.
+    - Otherwise → 24h catch-up between evening anchors: (D-1 19:30, D 19:30] IST.
+
+    Returns (window_start, window_end, start_exclusive, label_for_logs).
+    """
+    if _summary_slot_status(SLOT_MIDDAY, briefing_day) == "completed":
+        w_start = _naive_ist(briefing_day, 12, 30)
+        w_end = _naive_ist(briefing_day, 19, 30)
+        return w_start, w_end, True, "narrow_after_midday_completed"
+    w_start = _naive_ist(briefing_day - timedelta(days=1), 19, 30)
+    w_end = _naive_ist(briefing_day, 19, 30)
+    return w_start, w_end, True, "wide_catchup_24h_evening"
 
 
 def fetch_ui_rows_in_window(
@@ -104,21 +147,6 @@ def fetch_ui_rows_in_window(
                 blob["_news_time"] = news_time
                 out.append(blob)
     return out
-
-
-def _midday_row_status(briefing_day: date) -> Optional[str]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT status FROM summary_ui_data
-                WHERE briefing_date_ist = %s AND slot = %s
-                LIMIT 1
-                """,
-                (briefing_day, SLOT_MIDDAY),
-            )
-            r = cur.fetchone()
-            return r[0] if r else None
 
 
 def summary_already_done(slot: str, briefing_day: date) -> bool:
@@ -296,11 +324,18 @@ def run_midday_summary(briefing_day: date) -> None:
         return
     _delete_failed_slot_row(slot, briefing_day)
 
-    w_start, w_end = midday_window_ist(briefing_day)
+    w_start, w_end, start_exc, win_mode = _resolve_midday_window(briefing_day)
     rows = fetch_ui_rows_in_window(
-        w_start, w_end, start_exclusive=False, end_inclusive=True
+        w_start, w_end, start_exclusive=start_exc, end_inclusive=True
     )
     n = len(rows)
+    logger.info(
+        "ui_summary midday: window_mode=%s obs=%s window=[%s .. %s]",
+        win_mode,
+        n,
+        w_start.isoformat(),
+        w_end.isoformat(),
+    )
     if n < UI_SUMMARY_MIN_OBSERVATIONS:
         if _insert_summary_row(
             slot,
@@ -366,19 +401,19 @@ def run_evening_summary(briefing_day: date) -> None:
         return
     _delete_failed_slot_row(slot, briefing_day)
 
-    midday_ok = _midday_row_status(briefing_day) == "completed"
-    if midday_ok:
-        w_start, w_end = evening_window_normal_ist(briefing_day)
-        rows = fetch_ui_rows_in_window(
-            w_start, w_end, start_exclusive=True, end_inclusive=True
-        )
-    else:
-        w_start, w_end = evening_window_extended_ist(briefing_day)
-        rows = fetch_ui_rows_in_window(
-            w_start, w_end, start_exclusive=False, end_inclusive=True
-        )
+    w_start, w_end, start_exc, win_mode = _resolve_evening_window(briefing_day)
+    rows = fetch_ui_rows_in_window(
+        w_start, w_end, start_exclusive=start_exc, end_inclusive=True
+    )
 
     n = len(rows)
+    logger.info(
+        "ui_summary evening: window_mode=%s obs=%s window=[%s .. %s]",
+        win_mode,
+        n,
+        w_start.isoformat(),
+        w_end.isoformat(),
+    )
     if n < UI_SUMMARY_MIN_OBSERVATIONS:
         if _insert_summary_row(
             slot,
