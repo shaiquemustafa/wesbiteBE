@@ -33,6 +33,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Scheduler config (env-overridable)
 SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "2"))
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+# Cleanup: always keep the N newest ui_data rows (by news_time), even if older than retention — avoids an empty website when few items exist.
+UI_DATA_MIN_ROWS_RETAINED = max(0, min(int(os.getenv("UI_DATA_MIN_ROWS_RETAINED", "2")), 500))
 # How often the 'user_training' utility template (feature explainer) is broadcast
 USER_TRAINING_INTERVAL_DAYS = int(os.getenv("USER_TRAINING_INTERVAL_DAYS", "15"))
 USER_TRAINING_JOB_NAME = "user_training_broadcast"
@@ -590,7 +592,12 @@ def _ui_data_has_scrip_and_category(scrip_cd, category: Optional[str]) -> bool:
 
 
 def _cleanup_old_records():
-    """Delete records older than 48 hours from all tables to keep the DB lean."""
+    """Delete records older than 48 hours from all tables to keep the DB lean.
+
+    ui_data: rows older than cutoff are deleted except we never remove the newest
+    UI_DATA_MIN_ROWS_RETAINED rows by news_time (so the dashboard keeps at least
+    that many items when the pipeline is quiet).
+    """
     cutoff = _now_ist_naive() - timedelta(hours=48)
     try:
         with get_conn() as conn:
@@ -599,7 +606,24 @@ def _cleanup_old_records():
                 raw_del = cur.rowcount
                 cur.execute("DELETE FROM predictions WHERE news_submission_dt < %s", (cutoff,))
                 pred_del = cur.rowcount
-                cur.execute("DELETE FROM ui_data WHERE news_time < %s", (cutoff,))
+                if UI_DATA_MIN_ROWS_RETAINED <= 0:
+                    cur.execute("DELETE FROM ui_data WHERE news_time < %s", (cutoff,))
+                else:
+                    cur.execute(
+                        """
+                        DELETE FROM ui_data u
+                        WHERE u.news_time < %s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM (
+                                  SELECT id FROM ui_data
+                                  ORDER BY news_time DESC NULLS LAST, id DESC
+                                  LIMIT %s
+                              ) AS keep_rows
+                              WHERE keep_rows.id = u.id
+                          )
+                        """,
+                        (cutoff, UI_DATA_MIN_ROWS_RETAINED),
+                    )
                 ui_del = cur.rowcount
                 cur.execute("DELETE FROM watchlist_notifications WHERE created_at < %s", (cutoff,))
                 wl_del = cur.rowcount
