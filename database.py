@@ -703,7 +703,7 @@ def _ensure_tables(conn):
             (
                 "ui_data",
                 "Stores all impactful market news for display on the website. Contains full enrichment data (prices, analyst consensus, quarterly results). Only companies >2,500 Cr market cap are processed.",
-                "48 hours - entries older than 48 hours are deleted except the newest rows by news_time are kept (default min 2 via UI_DATA_MIN_ROWS_RETAINED) so the site does not go empty.",
+                "Cleanup uses IST cycle boundary (previous day 15:30, same as /ui-data/today). Rows with news_time before that are removed unless new-cycle count < UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD (default 3), in which case the UI_DATA_MIN_OLD_CYCLE_ROWS (default 2) newest pre-cycle rows are kept.",
                 "Includes: POSITIVE, STRONGLY POSITIVE, NEGATIVE, STRONGLY NEGATIVE, BEAT, MISSED (for companies >2,500 Cr). Excludes: NEUTRAL, MATCHED, N/A, and companies <2,500 Cr.",
                 "Website display - shows all impactful news to users browsing the dashboard.",
             ),

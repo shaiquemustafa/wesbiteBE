@@ -7,6 +7,15 @@ from database import get_conn
 from entity.ui_data import UIDataItem
 
 
+def ui_data_cycle_start_ist(now_ist_naive: datetime) -> datetime:
+    """
+    Same lower bound as GET /ui-data/today: previous calendar day at 15:30 IST (naive).
+    Used for querying the feed and for cleanup (pre-cycle vs new-cycle rows).
+    """
+    previous_day = now_ist_naive - timedelta(days=1)
+    return previous_day.replace(hour=15, minute=30, second=0, microsecond=0)
+
+
 def _normalize_for_json(value):
     if isinstance(value, dict):
         return {k: _normalize_for_json(v) for k, v in value.items()}
@@ -129,14 +138,7 @@ class UIDataService:
         find_query = {}
         params = []
         if target_date:
-            # Calculate start_of_query_window: previous day 15:30:00 of target_date
-            previous_day = target_date - timedelta(days=1)
-            start_of_query_window = previous_day.replace(hour=15, minute=30, second=0, microsecond=0)
-            #print(start_of_query_window)
-            # Calculate end_of_query_window: target_date itself
-            # end_of_query_window is the target_date itself (which includes time)
-            end_of_query_window = target_date
-            #print(end_of_query_window)
+            start_of_query_window = ui_data_cycle_start_ist(target_date)
 
             # write a query to get news for "news_time" > start_of_query_window
             find_query = {

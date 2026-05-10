@@ -18,7 +18,7 @@ from stock_enrichment import enrich_prediction
 from database import connect_to_db, close_db_connection, get_conn
 from psycopg2.extras import Json
 from service.announcement_service import AnnouncementService
-from service.ui_data_service import UIDataService
+from service.ui_data_service import UIDataService, ui_data_cycle_start_ist
 from service.company_service import CompanyService
 from service.auth_service import AuthService
 from service.notification_service import NotificationService
@@ -33,8 +33,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Scheduler config (env-overridable)
 SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "2"))
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
-# Cleanup: always keep the N newest ui_data rows (by news_time), even if older than retention — avoids an empty website when few items exist.
-UI_DATA_MIN_ROWS_RETAINED = max(0, min(int(os.getenv("UI_DATA_MIN_ROWS_RETAINED", "2")), 500))
+# ui_data cleanup uses same cycle boundary as /ui-data/today (previous day 15:30 IST).
+# Rows with news_time >= cycle_start count as "new cycle". If count >= threshold, all pre-cycle rows are removed.
+# If count < threshold, keep the N newest pre-cycle rows only (rest deleted) so the UI never goes empty when few new stories arrive.
+UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD = max(1, min(int(os.getenv("UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD", "3")), 500))
+UI_DATA_MIN_OLD_CYCLE_ROWS = max(0, min(int(os.getenv("UI_DATA_MIN_OLD_CYCLE_ROWS", "2")), 500))
 # How often the 'user_training' utility template (feature explainer) is broadcast
 USER_TRAINING_INTERVAL_DAYS = int(os.getenv("USER_TRAINING_INTERVAL_DAYS", "15"))
 USER_TRAINING_JOB_NAME = "user_training_broadcast"
@@ -592,12 +595,7 @@ def _ui_data_has_scrip_and_category(scrip_cd, category: Optional[str]) -> bool:
 
 
 def _cleanup_old_records():
-    """Delete records older than 48 hours from all tables to keep the DB lean.
-
-    ui_data: rows older than cutoff are deleted except we never remove the newest
-    UI_DATA_MIN_ROWS_RETAINED rows by news_time (so the dashboard keeps at least
-    that many items when the pipeline is quiet).
-    """
+    """Delete records older than 48 hours from auxiliary tables; ui_data uses IST cycle logic."""
     cutoff = _now_ist_naive() - timedelta(hours=48)
     try:
         with get_conn() as conn:
@@ -606,23 +604,47 @@ def _cleanup_old_records():
                 raw_del = cur.rowcount
                 cur.execute("DELETE FROM predictions WHERE news_submission_dt < %s", (cutoff,))
                 pred_del = cur.rowcount
-                if UI_DATA_MIN_ROWS_RETAINED <= 0:
-                    cur.execute("DELETE FROM ui_data WHERE news_time < %s", (cutoff,))
+
+                now_ist = _now_ist_naive()
+                cycle_start = ui_data_cycle_start_ist(now_ist)
+                cur.execute(
+                    "SELECT COUNT(*) FROM ui_data WHERE news_time >= %s",
+                    (cycle_start,),
+                )
+                n_new_cycle = cur.fetchone()[0]
+                release_old = n_new_cycle >= UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD
+                if release_old:
+                    cur.execute(
+                        """
+                        DELETE FROM ui_data
+                        WHERE news_time < %s OR news_time IS NULL
+                        """,
+                        (cycle_start,),
+                    )
+                elif UI_DATA_MIN_OLD_CYCLE_ROWS <= 0:
+                    cur.execute(
+                        """
+                        DELETE FROM ui_data
+                        WHERE news_time < %s OR news_time IS NULL
+                        """,
+                        (cycle_start,),
+                    )
                 else:
                     cur.execute(
                         """
                         DELETE FROM ui_data u
-                        WHERE u.news_time < %s
+                        WHERE (u.news_time < %s OR u.news_time IS NULL)
                           AND NOT EXISTS (
                               SELECT 1 FROM (
                                   SELECT id FROM ui_data
+                                  WHERE (news_time < %s OR news_time IS NULL)
                                   ORDER BY news_time DESC NULLS LAST, id DESC
                                   LIMIT %s
-                              ) AS keep_rows
-                              WHERE keep_rows.id = u.id
+                              ) AS keep_old
+                              WHERE keep_old.id = u.id
                           )
                         """,
-                        (cutoff, UI_DATA_MIN_ROWS_RETAINED),
+                        (cycle_start, cycle_start, UI_DATA_MIN_OLD_CYCLE_ROWS),
                     )
                 ui_del = cur.rowcount
                 cur.execute("DELETE FROM watchlist_notifications WHERE created_at < %s", (cutoff,))
@@ -636,6 +658,14 @@ def _cleanup_old_records():
                 "Cleanup: deleted %s raw, %s predictions, %s ui_data, %s watchlist_notifs, %s whatsapp_broadcast, %s expired OTPs.",
                 raw_del, pred_del, ui_del, wl_del, wb_del, otp_del,
             )
+            if ui_del:
+                logger.info(
+                    "Cleanup ui_data: cycle_start=%s new_cycle_count=%s released_old_cycle=%s min_old_kept=%s",
+                    cycle_start,
+                    n_new_cycle,
+                    release_old,
+                    0 if release_old else UI_DATA_MIN_OLD_CYCLE_ROWS,
+                )
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
 
