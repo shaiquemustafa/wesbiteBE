@@ -25,14 +25,14 @@ UI_SUMMARY_TARGET_CHARS = max(400, min(int(os.getenv("UI_SUMMARY_TARGET_CHARS", 
 _DIGEST_SYSTEM = f"""You write a short \"Quick pulse\" digest for Indian equity investors. It will be sent on WhatsApp as a gentle nudge — not a full article. Users get details on the website later.
 
 OUTPUT SHAPE (follow closely):
-1) First line exactly: Quick pulse (broadly):
+1) First line exactly: Quick pulse:
 2) Then one bullet per company or distinct story, using the • character and this pattern:
-   • Company Name — one flowing sentence that tells the story AND weaves in exactly ONE salient number from the input (order value, % growth, EPS, revenue, PAT, capacity, run-rate, etc.). Pick the single most investor-meaningful number for that line; do not add a second figure on the same line unless unavoidable (prefer one).
-3) After the bullets, one short closing line nudging readers to check details and filings on the website (word it naturally, e.g. mention skimming the site if these names matter).
-4) Plain text only. No markdown headings beyond what is specified. No numbered lists except the • bullets.
+   • *Company Name* — WhatsApp bold: wrap ONLY the company name in single asterisks (*Like This*) so it renders bold when pasted into a WhatsApp template variable. Then one flowing sentence after the em dash that tells the story AND weaves in exactly ONE salient number from the input (order value, % growth, EPS, revenue, PAT, capacity, run-rate, etc.). Pick the single most investor-meaningful number for that line; do not add a second figure on the same line unless unavoidable (prefer one).
+3) After the bullets, one short closing line. Use approachable wording like: Check the website for full details and filings if these names matter to your portfolio. (Do not use the word \"skim\". Keep it plain and friendly.)
+4) Plain text only aside from *bold company names*. No markdown headings beyond what is specified. No numbered lists except the • bullets.
 
 STYLE RULES:
-- Warm, readable, conversational — like the examples the product owner liked (mini-story per line, not keyword dumps).
+- Warm, readable, conversational — mini-story per line, not keyword dumps.
 - Do NOT add a separate \"Overall\", \"In summary\", or wrap-up paragraph at the end (only the bullets + one closing nudge line).
 - Do NOT strip numbers entirely: every bullet must include one concrete number when the source material supports it; if a row truly has no numeric fact, one qualitative anchor is OK but prefer a number from the text.
 - If there are many companies (>8–10), prioritize the most material names and briefly cluster the rest (\"Several smaller names also filed updates — see site\") without inventing numbers.
@@ -239,8 +239,10 @@ def _openai_digest(observation_text: str) -> str:
     client = OpenAI(api_key=api_key)
     user_msg = (
         "Using ONLY the facts below (do not invent companies or numbers), produce the Quick pulse digest.\n"
-        "Remember: first line 'Quick pulse (broadly):', then • bullets (each line one story + one key number where possible), "
-        f"then one closing line pointing to the website. Aim ~{UI_SUMMARY_TARGET_CHARS} characters total.\n\n"
+        "Remember: first line 'Quick pulse:', then • bullets with *Company Name* in WhatsApp bold asterisks, "
+        "each line one story + one key number where possible, "
+        "then one closing line (Check the website for full details and filings… — not 'skim'). "
+        f"Aim ~{UI_SUMMARY_TARGET_CHARS} characters total.\n\n"
         f"{observation_text}"
     )
     resp = client.chat.completions.create(
