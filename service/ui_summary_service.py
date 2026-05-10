@@ -398,3 +398,65 @@ def run_slot(slot: str, briefing_day: date) -> None:
         run_evening_summary(briefing_day)
     else:
         logger.warning("ui_summary: unknown slot %s", slot)
+
+
+def delete_summary_slot_row(briefing_day: date, slot: str) -> int:
+    """Remove any existing row for this day+slot so a manual trigger can re-run."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM summary_ui_data
+                WHERE briefing_date_ist = %s AND slot = %s
+                """,
+                (briefing_day, slot),
+            )
+            return cur.rowcount
+
+
+def fetch_summary_row(briefing_day: date, slot: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, slot, briefing_date_ist, window_start_ist, window_end_ist,
+                       observation_count, status, summary_text, model, error_message, created_at
+                FROM summary_ui_data
+                WHERE briefing_date_ist = %s AND slot = %s
+                LIMIT 1
+                """,
+                (briefing_day, slot),
+            )
+            r = cur.fetchone()
+            if not r:
+                return None
+            cols = [d[0] for d in cur.description]
+            out: Dict[str, Any] = {}
+            for k, v in zip(cols, r):
+                if isinstance(v, datetime):
+                    out[k] = v.isoformat()
+                elif isinstance(v, date):
+                    out[k] = v.isoformat()
+                else:
+                    out[k] = v
+            return out
+
+
+def manual_trigger(slot: str, briefing_day: date, *, force: bool) -> Dict[str, Any]:
+    """
+    Run one summary slot immediately (for QA). If force=True, deletes existing DB row first.
+    Returns the resulting row (if any) plus observation meta.
+    """
+    if slot not in (SLOT_MIDDAY, SLOT_EVENING):
+        raise ValueError(f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING}, got {slot!r}")
+    deleted = 0
+    if force:
+        deleted = delete_summary_slot_row(briefing_day, slot)
+    run_slot(slot, briefing_day)
+    row = fetch_summary_row(briefing_day, slot)
+    return {
+        "slot": slot,
+        "briefing_date_ist": briefing_day.isoformat(),
+        "force_deleted_prior_row": deleted,
+        "row": row,
+    }

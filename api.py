@@ -20,6 +20,7 @@ from psycopg2.extras import Json
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService, ui_data_cycle_start_ist
 from service.ui_summary_service import (
+    manual_trigger,
     run_slot,
     SLOT_MIDDAY,
     SLOT_EVENING,
@@ -3336,3 +3337,106 @@ def admin_news_briefing_test_watchlist_whatsapp(
     if "Gupshup" in err:
         code = 502
     raise HTTPException(status_code=code, detail=out)
+
+
+# ---------------------------------------------------------------------------
+# UI summary digest (manual trigger + browse rows)
+# ---------------------------------------------------------------------------
+UI_SUMMARY_JOB_SECRET = os.getenv("UI_SUMMARY_JOB_SECRET", "").strip()
+
+
+def _effective_ui_summary_secret() -> str:
+    return UI_SUMMARY_JOB_SECRET or NEWS_BRIEFING_JOB_SECRET
+
+
+def _require_ui_summary_trigger_secret(x_secret: Optional[str]) -> None:
+    sec = _effective_ui_summary_secret()
+    if not sec:
+        raise HTTPException(
+            status_code=503,
+            detail="Set UI_SUMMARY_JOB_SECRET or NEWS_BRIEFING_JOB_SECRET for manual UI-summary triggers",
+        )
+    if (x_secret or "").strip() != sec:
+        raise HTTPException(status_code=401, detail="Invalid X-UI-Summary-Secret header")
+
+
+@app.post(
+    "/api/admin/ui-summary/run",
+    summary="[ADMIN] Manually run one UI digest slot (12:30 or 19:30 window)",
+)
+def admin_ui_summary_run(
+    slot: str = Query(..., description="12_30 (midday window) or 19_30 (evening window)"),
+    briefing_date: Optional[date] = Query(
+        None,
+        description="IST calendar day for this run (default: today IST)",
+    ),
+    force: bool = Query(
+        True,
+        description="Delete existing summary_ui_data row for this day+slot first (recommended for retesting)",
+    ),
+    x_ui_summary_secret: Optional[str] = Header(None, alias="X-UI-Summary-Secret"),
+):
+    """
+    Runs the same logic as the scheduled jobs immediately so you can inspect
+    ``summary_ui_data`` without waiting for 12:30 / 19:30 IST.
+
+    Authentication: header ``X-UI-Summary-Secret`` must match ``UI_SUMMARY_JOB_SECRET``,
+    or if unset, ``NEWS_BRIEFING_JOB_SECRET``.
+
+    Example::
+      curl -X POST -H \"X-UI-Summary-Secret: $SECRET\" \\
+        \"https://YOUR_HOST/api/admin/ui-summary/run?slot=12_30&force=true\"
+    """
+    _require_ui_summary_trigger_secret(x_ui_summary_secret)
+
+    s = (slot or "").strip()
+    if s not in (SLOT_MIDDAY, SLOT_EVENING):
+        raise HTTPException(
+            status_code=400,
+            detail=f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING}",
+        )
+    day = briefing_date if briefing_date is not None else _now_ist_naive().date()
+    try:
+        out = manual_trigger(s, day, force=force)
+        return out
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get(
+    "/api/admin/ui-summary/recent",
+    summary="[ADMIN] Recent rows from summary_ui_data",
+)
+def admin_ui_summary_recent(
+    limit: int = Query(20, ge=1, le=100),
+    x_ui_summary_secret: Optional[str] = Header(None, alias="X-UI-Summary-Secret"),
+):
+    """Browse generated summaries (same secret as POST /api/admin/ui-summary/run)."""
+    _require_ui_summary_trigger_secret(x_ui_summary_secret)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, slot, briefing_date_ist, window_start_ist, window_end_ist,
+                       observation_count, status,
+                       LEFT(summary_text, 4000) AS summary_preview,
+                       model, error_message, created_at
+                FROM summary_ui_data
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            cols = [d[0] for d in cur.description]
+            rows = []
+            for tup in cur.fetchall():
+                row = {}
+                for k, v in zip(cols, tup):
+                    if isinstance(v, datetime):
+                        row[k] = v.isoformat()
+                    elif isinstance(v, date):
+                        row[k] = v.isoformat()
+                    else:
+                        row[k] = v
+                rows.append(row)
+    return {"rows": rows, "limit": limit}
