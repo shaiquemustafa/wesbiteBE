@@ -37,6 +37,18 @@ class NotificationService:
                 cur.execute("SELECT phone FROM users WHERE is_active = TRUE")
                 return [row[0] for row in cur.fetchall()]
 
+    def _get_receive_all_active_phones(self) -> List[str]:
+        """Active users who opted into receive_all_updates (high-impact / all-company path)."""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT phone FROM users
+                    WHERE is_active = TRUE AND receive_all_updates = TRUE
+                    """
+                )
+                return [row[0] for row in cur.fetchall()]
+
     def notify_all_users(self, enriched_item: dict) -> dict:
         """
         Sends a market update notification using WATI's broadcast API (v2).
@@ -168,8 +180,9 @@ class NotificationService:
 
     def notify_quick_pulse_digest(self, summary_text: str) -> dict:
         """
-        Sends the Quick pulse digest template to every active user with a phone
-        (same scope as _get_all_active_phones). Param 3 is current IST send time.
+        Sends the Quick pulse digest to active users with receive_all_updates = TRUE
+        (same high-impact audience as the per-news “all companies” path). Param 3 is
+        current IST send time.
         """
         text = (summary_text or "").strip()
         if not text:
@@ -178,15 +191,15 @@ class NotificationService:
 
         phones = [
             str(p).strip()
-            for p in self._get_all_active_phones()
+            for p in self._get_receive_all_active_phones()
             if p and str(p).strip()
         ]
         if not phones:
-            logger.info("  📭 Quick pulse digest — no active phones.")
+            logger.info("  📭 Quick pulse digest — no active users with receive_all_updates.")
             return {"total_users": 0, "sent": 0, "failed": 0}
 
         logger.info(
-            "  📢 Quick pulse digest → %d recipient(s)",
+            "  📢 Quick pulse digest (receive_all_updates) → %d recipient(s)",
             len(phones),
         )
         result = self.whatsapp.send_quick_pulse_digest_broadcast(phones, text)
