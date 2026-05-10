@@ -19,6 +19,12 @@ from database import connect_to_db, close_db_connection, get_conn
 from psycopg2.extras import Json
 from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService, ui_data_cycle_start_ist
+from service.ui_summary_service import (
+    run_slot,
+    SLOT_MIDDAY,
+    SLOT_EVENING,
+    summary_already_done,
+)
 from service.company_service import CompanyService
 from service.auth_service import AuthService
 from service.notification_service import NotificationService
@@ -60,6 +66,8 @@ def _env_bool(key: str, default: bool) -> bool:
 
 # One INFO line per POST: what kind of event (delivery vs inbound). Default on; set GUPSHUP_WEBHOOK_SUMMARY_LOG=false to disable.
 GUPSHUP_WEBHOOK_SUMMARY_LOG = _env_bool("GUPSHUP_WEBHOOK_SUMMARY_LOG", True)
+# Per-announcement WhatsApp broadcast rows + bulk notify (off by default).
+WHATSAPP_PER_NEWS_BROADCAST_ENABLED = _env_bool("WHATSAPP_PER_NEWS_BROADCAST_ENABLED", False)
 # Hide uvicorn.access lines for this path only (less duplicate noise next to summary). Default off.
 GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG = _env_bool("GUPSHUP_WEBHOOK_SILENCE_ACCESS_LOG", False)
 # Acknowledge webhooks immediately; persist delivery/inbound in a worker thread (less event-loop contention vs OTP/site).
@@ -184,7 +192,9 @@ analysis_lock = asyncio.Lock()
 logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
 _news_briefing_scheduler_task: asyncio.Task | None = None
+_ui_summary_scheduler_task: asyncio.Task | None = None
 _news_briefing_job_lock = asyncio.Lock()
+_ui_summary_job_lock = asyncio.Lock()
 
 
 async def _send_pending_broadcasts():
@@ -204,6 +214,8 @@ def _send_pending_broadcasts_sync():
     via WhatsAppService.send_market_update_broadcast which fans out to
     Gupshup in parallel using the dedicated WhatsApp thread pool.
     """
+    if not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
+        return
     try:
         # Get all unsent entries from the last hour (to avoid sending very old entries)
         unsent_entries = []
@@ -742,6 +754,8 @@ async def _scheduled_analysis_loop():
 # ---------------------------------------------------------------------------
 NEWS_BRIEFING_AUTO_SCHEDULE = os.getenv("NEWS_BRIEFING_AUTO_SCHEDULE", "true").lower() == "true"
 NEWS_BRIEFING_SLOT_GRACE_MIN = int(os.getenv("NEWS_BRIEFING_SLOT_GRACE_MIN", "12"))
+UI_SUMMARY_AUTO_SCHEDULE = _env_bool("UI_SUMMARY_AUTO_SCHEDULE", True)
+UI_SUMMARY_SLOT_GRACE_MIN = int(os.getenv("UI_SUMMARY_SLOT_GRACE_MIN", "5"))
 _NEWS_BRIEFING_IST_SLOTS: Tuple[Tuple[str, int, int], ...] = (
     ("pre_market", 8, 30),
     ("during_market", 15, 30),
@@ -845,9 +859,79 @@ async def _news_briefing_scheduler_loop():
             await asyncio.sleep(60)
 
 
+# ---------------------------------------------------------------------------
+# Auto UI-summary digest (IST) — 12:30 / 19:30 slots with grace window
+# ---------------------------------------------------------------------------
+_UI_SUMMARY_IST_SLOTS: Tuple[Tuple[str, int, int], ...] = (
+    (SLOT_MIDDAY, 12, 30),
+    (SLOT_EVENING, 19, 30),
+)
+
+
+def _next_ui_summary_slot_strictly_after(now_ist: datetime) -> datetime:
+    """Earliest 12:30 / 19:30 IST strictly after ``now_ist`` (naive); else tomorrow 12:30."""
+    d = now_ist.date()
+    slots = (
+        datetime.combine(d, time(12, 30, 0)),
+        datetime.combine(d, time(19, 30, 0)),
+    )
+    for t in slots:
+        if t > now_ist:
+            return t
+    return datetime.combine(d + timedelta(days=1), time(12, 30, 0))
+
+
+async def _ui_summary_scheduler_loop():
+    """
+    If we're inside [slot, slot+grace] for a slot today and digest not completed,
+    run immediately (covers restart / slight oversleep).
+    Otherwise sleep until the next slot boundary.
+    """
+    grace = timedelta(minutes=max(1, UI_SUMMARY_SLOT_GRACE_MIN))
+    logger.info(
+        "UI-summary auto-scheduler ON (sleep-until-slot, grace=%s min IST).",
+        grace.total_seconds() / 60,
+    )
+    await asyncio.sleep(20)
+    while True:
+        try:
+            now = _now_ist_naive()
+            d = now.date()
+            fired = False
+            for slot_const, hh, mm in _UI_SUMMARY_IST_SLOTS:
+                slot_dt = datetime.combine(d, time(hh, mm, 0))
+                if slot_dt <= now <= slot_dt + grace:
+                    if await asyncio.to_thread(summary_already_done, slot_const, d):
+                        continue
+                    async with _ui_summary_job_lock:
+                        if await asyncio.to_thread(summary_already_done, slot_const, d):
+                            continue
+                        logger.info(
+                            "📋 Auto ui_summary: slot=%s IST=%s (grace window)",
+                            slot_const,
+                            now.strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                        await asyncio.to_thread(run_slot, slot_const, d)
+                    fired = True
+                    break
+            if fired:
+                await asyncio.sleep(2)
+                continue
+
+            next_t = _next_ui_summary_slot_strictly_after(now)
+            delay = (next_t - now).total_seconds()
+            delay = max(5.0, min(delay, 86400 * 2))
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("ui_summary scheduler error: %s", e)
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler_task, _news_briefing_scheduler_task
+    global _scheduler_task, _news_briefing_scheduler_task, _ui_summary_scheduler_task
     connect_to_db()
 
     # Start the background scheduler
@@ -861,6 +945,12 @@ async def lifespan(app: FastAPI):
         logger.info("News-briefing auto-scheduler started (sleep-until-next-slot).")
     else:
         logger.info("News-briefing auto-scheduler OFF (NEWS_BRIEFING_AUTO_SCHEDULE=false).")
+
+    if UI_SUMMARY_AUTO_SCHEDULE:
+        _ui_summary_scheduler_task = asyncio.create_task(_ui_summary_scheduler_loop())
+        logger.info("UI-summary auto-scheduler started (sleep-until-next-slot).")
+    else:
+        logger.info("UI-summary auto-scheduler OFF (UI_SUMMARY_AUTO_SCHEDULE=false).")
 
     # Kick the periodic 'user_training' broadcast off immediately on boot so
     # a fresh deploy doesn't have to wait for the next scheduler tick. The
@@ -895,6 +985,12 @@ async def lifespan(app: FastAPI):
         _news_briefing_scheduler_task.cancel()
         try:
             await _news_briefing_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if _ui_summary_scheduler_task:
+        _ui_summary_scheduler_task.cancel()
+        try:
+            await _ui_summary_scheduler_task
         except asyncio.CancelledError:
             pass
     close_db_connection()
@@ -1189,7 +1285,15 @@ def _pipeline_sync(
                         enriched, company_service
                     )
                     if should_broadcast:
-                        if _whatsapp_broadcast_has_scrip_and_category(
+                        if not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
+                            logger.info(
+                                "  [%s/%s] ⏭️ WhatsApp per-news broadcast disabled "
+                                "(WHATSAPP_PER_NEWS_BROADCAST_ENABLED=false): SCRIP %s",
+                                i,
+                                total,
+                                row_dict.get("SCRIP_CD"),
+                            )
+                        elif _whatsapp_broadcast_has_scrip_and_category(
                             enriched.get("scrip_cd"), enriched.get("category")
                         ):
                             logger.info(
@@ -1302,7 +1406,7 @@ def _pipeline_sync(
 
     # 3a) WhatsApp broadcast items → notify watchlist users + receive_all_updates users
     # items_to_notify: passed whatsapp_broadcast rules (see _should_include_in_whatsapp_broadcast)
-    if items_to_notify:
+    if WHATSAPP_PER_NEWS_BROADCAST_ENABLED and items_to_notify:
         try:
             notif_result = notif_service.notify_all_users_bulk(items_to_notify)
             total_notified += notif_result["total_sent"]
@@ -2114,6 +2218,11 @@ def backfill_whatsapp_broadcast():
     Skips records already in whatsapp_broadcast (scrip_cd + news_time), or same scrip_cd + category
     as an existing row (dedupe repeated filings until cleanup removes old rows).
     """
+    if not WHATSAPP_PER_NEWS_BROADCAST_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="WHATSAPP_PER_NEWS_BROADCAST_ENABLED is false — enable it to run backfill.",
+        )
     logger.info("🔄 Starting whatsapp_broadcast backfill from today's ui_data...")
     
     company_service = CompanyService()

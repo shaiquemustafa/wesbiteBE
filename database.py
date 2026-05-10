@@ -682,6 +682,32 @@ def _ensure_tables(conn):
             """
         )
 
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summary_ui_data (
+                id BIGSERIAL PRIMARY KEY,
+                slot VARCHAR(10) NOT NULL
+                    CHECK (slot IN ('12_30','19_30')),
+                briefing_date_ist DATE NOT NULL,
+                window_start_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                window_end_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                observation_count INT NOT NULL DEFAULT 0,
+                status VARCHAR(30) NOT NULL,
+                summary_text TEXT,
+                model VARCHAR(80),
+                error_message TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (briefing_date_ist, slot)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_summary_ui_data_briefing_date
+                ON summary_ui_data (briefing_date_ist DESC);
+            """
+        )
+
         # Table metadata/documentation (definitions, rules, cutoffs, functions)
         cur.execute(
             """
@@ -805,6 +831,13 @@ def _ensure_tables(conn):
                 "Optional cleanup of rows older than ~14 days can be done by the job.",
                 "Prevents duplicate link/title across the three daily cycles.",
                 "Cross-cycle dedupe index.",
+            ),
+            (
+                "summary_ui_data",
+                "LLM digests of ui_data activity for IST calendar days (12:30 midday and 19:30 evening slots).",
+                "Midday window: previous calendar day 07:30 through briefing day 12:30 IST inclusive. Evening: normally after 12:30 through 19:30 IST on the briefing day; extended to previous day 07:30 through 19:30 if midday slot is missing or not completed.",
+                "Rows from ui_data whose news_time falls in the IST window; skipped_low_volume when count < UI_SUMMARY_MIN_OBSERVATIONS (default 4). Status values: completed, skipped_low_volume, failed.",
+                "Automated WhatsApp-readable summaries keyed by briefing_date_ist and slot (unique).",
             ),
         ]
 
