@@ -21,6 +21,7 @@ from service.announcement_service import AnnouncementService
 from service.ui_data_service import UIDataService, ui_data_cycle_start_ist
 from service.ui_summary_service import (
     manual_trigger,
+    normalize_ui_summary_slot_label,
     run_slot,
     SLOT_MIDDAY,
     SLOT_EVENING,
@@ -260,7 +261,7 @@ def _send_pending_broadcasts_sync():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link,
+                    SELECT id, scrip_cd, company_name, impact, category, slot, summary, pdf_link,
                            news_time, mkt_cap_cr, data, created_at
                     FROM whatsapp_broadcast
                     WHERE sent_at IS NULL
@@ -283,15 +284,16 @@ def _send_pending_broadcasts_sync():
                         "company_name": row[2],
                         "impact": row[3],
                         "category": row[4],
-                        "summary": row[5],
-                        "pdf_link": row[6],
-                        "news_time": row[7],
-                        "mkt_cap_cr": float(row[8]) if row[8] else None,
-                        "_created_at": row[10],
+                        "slot": row[5],
+                        "summary": row[6],
+                        "pdf_link": row[7],
+                        "news_time": row[8],
+                        "mkt_cap_cr": float(row[9]) if row[9] else None,
+                        "_created_at": row[11],
                     }
 
-                    if row[9]:
-                        data_dict = row[9] if isinstance(row[9], dict) else {}
+                    if row[10]:
+                        data_dict = row[10] if isinstance(row[10], dict) else {}
                         entry.update(data_dict)
 
                     unsent_entries.append(entry)
@@ -1371,14 +1373,15 @@ def _pipeline_sync(
                                         cur.execute(
                                             """
                                             INSERT INTO whatsapp_broadcast
-                                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
-                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                (scrip_cd, company_name, impact, category, slot, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                             """,
                                             (
                                                 enriched.get("scrip_cd"),
                                                 enriched.get("company_name", "Unknown"),
                                                 enriched.get("impact"),
                                                 enriched.get("category"),
+                                                None,
                                                 enriched.get("summary"),
                                                 enriched.get("pdf_link"),
                                                 news_time_ist,
@@ -2365,14 +2368,15 @@ def backfill_whatsapp_broadcast():
                         cur.execute(
                             """
                             INSERT INTO whatsapp_broadcast
-                                (scrip_cd, company_name, impact, category, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                (scrip_cd, company_name, impact, category, slot, summary, pdf_link, news_time, mkt_cap_cr, data, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                             (
                                 item.get("scrip_cd"),
                                 item.get("company_name", "Unknown"),
                                 item.get("impact"),
                                 item.get("category"),
+                                None,
                                 item.get("summary"),
                                 item.get("pdf_link"),
                                 news_time_ist,
@@ -2551,7 +2555,7 @@ def send_pending_broadcasts():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                SELECT id, scrip_cd, company_name, impact, category, slot, summary, pdf_link, 
                        news_time, mkt_cap_cr, data
                 FROM whatsapp_broadcast
                 WHERE sent_at IS NULL
@@ -2567,15 +2571,16 @@ def send_pending_broadcasts():
                     "company_name": row[2],
                     "impact": row[3],
                     "category": row[4],
-                    "summary": row[5],
-                    "pdf_link": row[6],
-                    "news_time": row[7],
-                    "mkt_cap_cr": float(row[8]) if row[8] else None,
+                    "slot": row[5],
+                    "summary": row[6],
+                    "pdf_link": row[7],
+                    "news_time": row[8],
+                    "mkt_cap_cr": float(row[9]) if row[9] else None,
                 }
                 
                 # Merge data from JSONB if available
-                if row[9]:
-                    data_dict = row[9] if isinstance(row[9], dict) else {}
+                if row[10]:
+                    data_dict = row[10] if isinstance(row[10], dict) else {}
                     entry.update(data_dict)
                 
                 unsent_entries.append(entry)
@@ -2649,7 +2654,7 @@ def send_last_broadcast():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                SELECT id, scrip_cd, company_name, impact, category, slot, summary, pdf_link, 
                        news_time, mkt_cap_cr, data, created_at
                 FROM whatsapp_broadcast
                 ORDER BY created_at DESC
@@ -2673,16 +2678,17 @@ def send_last_broadcast():
                 "company_name": row[2],
                 "impact": row[3],
                 "category": row[4],
-                "summary": row[5],
-                "pdf_link": row[6],
-                "news_time": row[7],
-                "mkt_cap_cr": float(row[8]) if row[8] else None,
-                "created_at": row[10].isoformat() if row[10] else None,
+                "slot": row[5],
+                "summary": row[6],
+                "pdf_link": row[7],
+                "news_time": row[8],
+                "mkt_cap_cr": float(row[9]) if row[9] else None,
+                "created_at": row[11].isoformat() if row[11] else None,
             }
             
             # Merge data from JSONB if available
-            if row[9]:
-                data_dict = row[9] if isinstance(row[9], dict) else {}
+            if row[10]:
+                data_dict = row[10] if isinstance(row[10], dict) else {}
                 last_entry.update(data_dict)
     
     logger.info("  📋 Found last entry: %s (ID: %s, created: %s)", 
@@ -2774,7 +2780,7 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, scrip_cd, company_name, impact, category, summary, pdf_link, 
+                SELECT id, scrip_cd, company_name, impact, category, slot, summary, pdf_link, 
                        news_time, mkt_cap_cr, data, created_at
                 FROM whatsapp_broadcast
                 ORDER BY created_at DESC
@@ -2798,16 +2804,17 @@ def send_last_broadcast_to_phones(request: SendToPhonesRequest):
                 "company_name": row[2],
                 "impact": row[3],
                 "category": row[4],
-                "summary": row[5],
-                "pdf_link": row[6],
-                "news_time": row[7],
-                "mkt_cap_cr": float(row[8]) if row[8] else None,
-                "created_at": row[10].isoformat() if row[10] else None,
+                "slot": row[5],
+                "summary": row[6],
+                "pdf_link": row[7],
+                "news_time": row[8],
+                "mkt_cap_cr": float(row[9]) if row[9] else None,
+                "created_at": row[11].isoformat() if row[11] else None,
             }
             
             # Merge data from JSONB if available
-            if row[9]:
-                data_dict = row[9] if isinstance(row[9], dict) else {}
+            if row[10]:
+                data_dict = row[10] if isinstance(row[10], dict) else {}
                 last_entry.update(data_dict)
     
     logger.info("  📋 Found last entry: %s (ID: %s, created: %s)", 
@@ -3463,7 +3470,10 @@ def _require_ui_summary_trigger_secret(x_secret: Optional[str]) -> None:
     summary="[ADMIN] Manually run one UI digest slot (12:30 or 19:30 window)",
 )
 def admin_ui_summary_run(
-    slot: str = Query(..., description="12_30 (midday window) or 19_30 (evening window)"),
+    slot: str = Query(
+        ...,
+        description="12.30 (midday) or 19.30 (evening); legacy 12_30 / 19_30 also accepted",
+    ),
     briefing_date: Optional[date] = Query(
         None,
         description="IST calendar day for this run (default: today IST)",
@@ -3483,15 +3493,15 @@ def admin_ui_summary_run(
 
     Example::
       curl -X POST -H \"X-UI-Summary-Secret: $SECRET\" \\
-        \"https://YOUR_HOST/api/admin/ui-summary/run?slot=12_30&force=true\"
+        \"https://YOUR_HOST/api/admin/ui-summary/run?slot=12.30&force=true\"
     """
     _require_ui_summary_trigger_secret(x_ui_summary_secret)
 
-    s = (slot or "").strip()
+    s = normalize_ui_summary_slot_label((slot or "").strip())
     if s not in (SLOT_MIDDAY, SLOT_EVENING):
         raise HTTPException(
             status_code=400,
-            detail=f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING}",
+            detail=f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING} (legacy 12_30 / 19_30 accepted)",
         )
     day = briefing_date if briefing_date is not None else _now_ist_naive().date()
     try:

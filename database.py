@@ -417,6 +417,7 @@ def _ensure_tables(conn):
                 company_name VARCHAR(255),
                 impact VARCHAR(50),
                 category VARCHAR(100),
+                slot VARCHAR(20),
                 summary TEXT,
                 pdf_link TEXT,
                 news_time TIMESTAMPTZ,
@@ -460,23 +461,37 @@ def _ensure_tables(conn):
                 END IF;
             END $$;
         """)
-        # Create index on sent_at ONLY if the column exists
+        # Add whatsapp_broadcast.slot (digest run label); news rows keep category, slot NULL.
         cur.execute("""
-            DO $$ 
+            DO $$
             BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns 
-                    WHERE table_name = 'whatsapp_broadcast' 
-                    AND column_name = 'sent_at'
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'whatsapp_broadcast' AND column_name = 'slot'
                 ) THEN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_indexes 
-                        WHERE tablename = 'whatsapp_broadcast' 
-                        AND indexname = 'idx_whatsapp_broadcast_sent'
-                    ) THEN
-                        CREATE INDEX idx_whatsapp_broadcast_sent
-                            ON whatsapp_broadcast (sent_at) WHERE sent_at IS NULL;
-                    END IF;
+                    ALTER TABLE whatsapp_broadcast ADD COLUMN slot VARCHAR(20);
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'whatsapp_broadcast' AND column_name = 'slot'
+                ) THEN
+                    UPDATE whatsapp_broadcast SET slot = '12.30'
+                    WHERE data->>'kind' = 'ui_summary_digest'
+                      AND (slot IS NULL OR slot = '')
+                      AND (category = '12_30' OR (data->>'slot') = '12_30');
+                    UPDATE whatsapp_broadcast SET slot = '19.30'
+                    WHERE data->>'kind' = 'ui_summary_digest'
+                      AND (slot IS NULL OR slot = '')
+                      AND (category = '19_30' OR (data->>'slot') = '19_30');
+                    UPDATE whatsapp_broadcast SET category = NULL
+                    WHERE data->>'kind' = 'ui_summary_digest' AND slot IS NOT NULL;
+                    UPDATE whatsapp_broadcast SET data = jsonb_set(
+                        COALESCE(data::jsonb, '{}'::jsonb),
+                        '{slot}',
+                        to_jsonb(slot::text),
+                        true
+                    )
+                    WHERE data->>'kind' = 'ui_summary_digest' AND slot IS NOT NULL;
                 END IF;
             END $$;
         """)
@@ -686,8 +701,8 @@ def _ensure_tables(conn):
             """
             CREATE TABLE IF NOT EXISTS summary_ui_data (
                 id BIGSERIAL PRIMARY KEY,
-                slot VARCHAR(10) NOT NULL
-                    CHECK (slot IN ('12_30','19_30')),
+                slot VARCHAR(15) NOT NULL
+                    CHECK (slot IN ('12.30','19.30')),
                 briefing_date_ist DATE NOT NULL,
                 window_start_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
                 window_end_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
@@ -701,6 +716,29 @@ def _ensure_tables(conn):
             );
             """
         )
+        # Migrate legacy slot labels (12_30 / 19_30) and CHECK constraint to 12.30 / 19.30.
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'summary_ui_data'
+                ) THEN
+                    ALTER TABLE summary_ui_data DROP CONSTRAINT IF EXISTS summary_ui_data_slot_check;
+                    UPDATE summary_ui_data SET slot = '12.30' WHERE slot = '12_30';
+                    UPDATE summary_ui_data SET slot = '19.30' WHERE slot = '19_30';
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = 'summary_ui_data'::regclass
+                          AND conname = 'summary_ui_data_slot_check'
+                    ) THEN
+                        ALTER TABLE summary_ui_data
+                        ADD CONSTRAINT summary_ui_data_slot_check
+                        CHECK (slot IN ('12.30','19.30'));
+                    END IF;
+                END IF;
+            END $$;
+        """)
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_summary_ui_data_briefing_date
@@ -744,7 +782,7 @@ def _ensure_tables(conn):
                 "whatsapp_broadcast",
                 "Filtered bulk messages table for WhatsApp notifications to all users. Stricter filtering than ui_data.",
                 "48 hours - entries older than 48 hours are automatically deleted.",
-                "Includes: (1) STRONGLY POSITIVE or BEAT for all companies >2,500 Cr, (2) STRONGLY NEGATIVE only for non-financial categories and market cap >10,000 Cr, (3) Financial Results category only when impact is STRONGLY POSITIVE or BEAT (not plain POSITIVE/NEUTRAL/NEGATIVE). Excludes: regular NEGATIVE, MISSED, etc. At most one row per scrip_cd + category while data exists (dedupes repeat filings).",
+                "Includes per-news rows (scrip_cd + category dedupe) and UI digest rows (data.kind=ui_summary_digest) with slot 12.30 or 19.30, category NULL, created_at/sent_at as TIMESTAMPTZ from IST-aware inserts.",
                 "WhatsApp bulk notifications - sends high-priority news to all relevant users via WhatsApp.",
             ),
             (
@@ -834,10 +872,10 @@ def _ensure_tables(conn):
             ),
             (
                 "summary_ui_data",
-                "LLM digests of ui_data activity for IST calendar days (12:30 midday and 19:30 evening slots).",
+                "LLM digests of ui_data for IST calendar days. Slot labels: 12.30 (midday run) and 19.30 (evening run).",
                 "IST digest windows are cyclical (see ui_summary_service): narrow slice after prior slot completed, else 24h catch-up between slot anchors. Min observations UI_SUMMARY_MIN_OBSERVATIONS.",
                 "Rows from ui_data whose news_time falls in the IST window; skipped_low_volume when count < UI_SUMMARY_MIN_OBSERVATIONS (default 4). Status values: completed, skipped_low_volume, failed.",
-                "Automated WhatsApp-readable summaries keyed by briefing_date_ist and slot (unique).",
+                "created_at is stored as TIMESTAMPTZ using IST clock at insert time. window_start_ist / window_end_ist are naive TIMESTAMP values in IST.",
             ),
         ]
 

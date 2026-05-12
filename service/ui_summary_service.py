@@ -1,27 +1,41 @@
 """
 IST UI digest summaries over ui_data windows (midday / evening slots).
 Uses naive IST datetimes for windows, consistent with the rest of the backend.
+Slot keys stored in DB are ``12.30`` and ``19.30`` (the scheduled run times).
 
 Windowing is cyclical: if the *previous* slot in the chain completed successfully,
 only the incremental slice is considered; if it skipped/failed or is missing,
 a 24-hour catch-up window between the same slot times is used. Each run still
 requires at least UI_SUMMARY_MIN_OBSERVATIONS (default 4) ui_data rows or it
 records skipped_low_volume.
+
+``summary_ui_data.created_at`` is written explicitly in IST (timezone-aware)
+so TIMESTAMPTZ reflects the correct instant for India.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from database import get_conn
 
 logger = logging.getLogger("uvicorn.error")
 
-SLOT_MIDDAY = "12_30"
-SLOT_EVENING = "19_30"
+# IST wall-clock labels for the two digest runs (stored in DB + whatsapp_broadcast.slot).
+IST = timezone(timedelta(hours=5, minutes=30))
+SLOT_MIDDAY = "12.30"
+SLOT_EVENING = "19.30"
+
+# Accept legacy admin/API query strings and normalize.
+_LEGACY_SLOT_ALIASES = {"12_30": SLOT_MIDDAY, "19_30": SLOT_EVENING}
+
+
+def normalize_ui_summary_slot_label(slot: str) -> str:
+    s = (slot or "").strip()
+    return _LEGACY_SLOT_ALIASES.get(s, s)
 
 UI_SUMMARY_MIN_OBSERVATIONS = max(0, int(os.getenv("UI_SUMMARY_MIN_OBSERVATIONS", "4")))
 UI_SUMMARY_MODEL = os.getenv("UI_SUMMARY_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
@@ -209,16 +223,18 @@ def _insert_summary_row(
     """
     INSERT INTO summary_ui_data ON CONFLICT (briefing_date_ist, slot) DO NOTHING.
     Returns the new row id, or None if the insert was skipped (conflict).
+    ``created_at`` is written explicitly in IST so TIMESTAMPTZ reflects the correct instant.
     """
+    created_at_ist = datetime.now(IST)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO summary_ui_data (
                     slot, briefing_date_ist, window_start_ist, window_end_ist,
-                    observation_count, status, summary_text, model, error_message
+                    observation_count, status, summary_text, model, error_message, created_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (briefing_date_ist, slot) DO NOTHING
                 RETURNING id
                 """,
@@ -232,6 +248,7 @@ def _insert_summary_row(
                     summary_text,
                     model,
                     error_message,
+                    created_at_ist,
                 ),
             )
             row = cur.fetchone()
@@ -525,8 +542,11 @@ def manual_trigger(slot: str, briefing_day: date, *, force: bool) -> Dict[str, A
     Run one summary slot immediately (for QA). If force=True, deletes existing DB row first.
     Returns the resulting row (if any) plus observation meta.
     """
+    slot = normalize_ui_summary_slot_label(slot)
     if slot not in (SLOT_MIDDAY, SLOT_EVENING):
-        raise ValueError(f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING}, got {slot!r}")
+        raise ValueError(
+            f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING} (legacy 12_30 / 19_30 accepted), got {slot!r}"
+        )
     deleted = 0
     if force:
         deleted = delete_summary_slot_row(briefing_day, slot)

@@ -256,6 +256,7 @@ class NotificationService:
             "slot": slot,
             "briefing_date_ist": briefing_day.isoformat(),
         }
+        created_at_ist = datetime.now(IST)
 
         try:
             with get_conn() as conn:
@@ -285,11 +286,11 @@ class NotificationService:
                     cur.execute(
                         """
                         INSERT INTO whatsapp_broadcast (
-                            scrip_cd, company_name, impact, category,
-                            summary, pdf_link, news_time, mkt_cap_cr, data
+                            scrip_cd, company_name, impact, category, slot,
+                            summary, pdf_link, news_time, mkt_cap_cr, data, created_at
                         )
                         VALUES (
-                            NULL, %s, %s, %s, %s, NULL, NULL, NULL, %s
+                            NULL, %s, %s, NULL, %s, %s, NULL, NULL, NULL, %s, %s
                         )
                         RETURNING id
                         """,
@@ -299,6 +300,7 @@ class NotificationService:
                             slot,
                             text,
                             Json(data_obj),
+                            created_at_ist,
                         ),
                     )
                     wb_id = cur.fetchone()[0]
