@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from contextlib import contextmanager
 from dotenv import load_dotenv
@@ -13,6 +14,13 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL not found in .env file. Please set it.")
 
 register_default_jsonb(loads=json.loads, globally=True)
+
+# Every pooled connection runs SET TIME ZONE so TIMESTAMPTZ displays as IST in
+# psql, many SQL clients, and some dashboards. Override via DB_SESSION_TIMEZONE.
+_tz_env = (os.getenv("DB_SESSION_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata").strip()
+if not re.fullmatch(r"[A-Za-z0-9_/+\-]+", _tz_env):
+    _tz_env = "Asia/Kolkata"
+DB_SESSION_TIMEZONE = _tz_env
 
 # Pool sizing — must comfortably exceed WHATSAPP_PARALLELISM since each
 # broadcast worker may grab a connection to record delivery status.
@@ -67,6 +75,10 @@ def get_conn():
     Yields a live pooled connection with commit/rollback handling.
     Automatically detects and replaces stale/dead connections
     (e.g. after Neon drops idle SSL connections).
+
+    Each checkout runs SET TIME ZONE (default Asia/Kolkata, overridable via
+    DB_SESSION_TIMEZONE) so TIMESTAMPTZ columns display and interpret in IST
+    for this session (psql, many clients, and some DB UIs).
     """
     if _pool is None:
         raise ConnectionError("Database connection is not established.")
@@ -93,6 +105,9 @@ def get_conn():
         conn = _pool.getconn()        # pool will create a brand-new connection
 
     try:
+        if not conn.closed:
+            with conn.cursor() as cur:
+                cur.execute("SET TIME ZONE %s", (DB_SESSION_TIMEZONE,))
         yield conn
         if not conn.closed:
             conn.commit()
@@ -113,6 +128,27 @@ def get_conn():
 
 def _ensure_tables(conn):
     with conn.cursor() as cur:
+        # Best-effort: default new DB sessions to IST (helps SQL editor / tools).
+        try:
+            _tz_sql = DB_SESSION_TIMEZONE.replace("'", "''")
+            cur.execute(
+                f"""
+                DO $tz$
+                BEGIN
+                    EXECUTE format(
+                        'ALTER DATABASE %I SET timezone TO %L',
+                        current_database(),
+                        '{_tz_sql}'
+                    );
+                EXCEPTION WHEN OTHERS THEN
+                    NULL;
+                END
+                $tz$;
+                """
+            )
+        except Exception:
+            pass
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS raw_bse_announcements (
