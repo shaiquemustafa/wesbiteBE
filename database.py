@@ -889,7 +889,7 @@ def _ensure_tables(conn):
                 "news_briefing_stock_news",
                 "Stock-focused briefing rows with BSE/NSE/ISIN/market cap columns.",
                 "Deleted when parent run is deleted.",
-                "Cross-cycle dedupe uses news_briefing_seen_stories + story_fingerprint.",
+                "Cross-cycle dedupe uses news_briefing_seen_stories (scrip(s)+URL+category when present, else link+title).",
                 "Stock-level RSS digest archive.",
             ),
             (
@@ -903,7 +903,7 @@ def _ensure_tables(conn):
                 "news_briefing_seen_stories",
                 "Per trading-day IST fingerprints of stories already stored (stock_news + all_items).",
                 "Optional cleanup of rows older than ~14 days can be done by the job.",
-                "Prevents duplicate link/title across the three daily cycles.",
+                "Prevents duplicate stock rows same IST day: scrip set + normalized URL + category, else link+title.",
                 "Cross-cycle dedupe index.",
             ),
             (

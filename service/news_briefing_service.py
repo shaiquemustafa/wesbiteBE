@@ -3,14 +3,21 @@ Persist news_scratch final Excel (three sheets) into Postgres.
 
 All wall-clock columns are naive IST (TIMESTAMP WITHOUT TIME ZONE), matching
 fetch_news / dedupe_news conventions.
+
+Cross-cycle stock_news dedupe (same IST calendar day): when the row has at
+least one parseable BSE scrip, a non-empty normalized URL, and a non-empty
+category, the seen key is (sorted scrip list + URL + category). Otherwise
+the prior link+title fingerprint is used.
 """
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pandas as pd
 from psycopg2.extras import execute_batch
@@ -32,6 +39,104 @@ def dedupe_fingerprint(story_fp: str, scope: str) -> str:
     """
     seed = f"{scope}|{story_fp}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "gclid",
+        "fbclid",
+        "mc_cid",
+        "mc_eid",
+    }
+)
+
+
+def normalize_story_url(link: Any) -> str:
+    """Lower host/path, strip common tracking query params, for dedupe comparison."""
+    s = str(link or "").strip()
+    if not s:
+        return ""
+    try:
+        p = urlparse(s if "://" in s else f"https://{s}")
+        netloc = (p.netloc or "").lower()
+        path = (p.path or "").rstrip("/") or "/"
+        pairs = [
+            (k, v)
+            for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in _TRACKING_QUERY_KEYS
+        ]
+        pairs.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+        q = urlencode(pairs)
+        return urlunparse((p.scheme.lower() or "https", netloc, path, "", q, ""))
+    except Exception:
+        return re.sub(r"\s+", "", s.lower())
+
+
+def _parse_one_bse_scrip_token(token: str) -> Optional[int]:
+    token = (token or "").strip()
+    if not token:
+        return None
+    try:
+        if "." in token or "e" in token.lower():
+            v = int(float(token))
+        else:
+            v = int(token)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_all_bse_scrips_for_dedupe(raw: Any) -> List[int]:
+    """All positive BSE scrip ints from a cell (comma / semicolon / ' and ')."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    for sep in ";", "|":
+        s = s.replace(sep, ",")
+    parts = re.split(r"\s*,\s*|\s+and\s+", s, flags=re.I)
+    seen: set[int] = set()
+    out: List[int] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        n = _parse_one_bse_scrip_token(p)
+        if n is not None and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def stock_news_cross_cycle_fingerprint(
+    link: Any,
+    title: Any,
+    bse_scrip_code: Any,
+    category: Any,
+) -> str:
+    """
+    Key for news_briefing_seen_stories (stock_news sheet only).
+
+    Same IST day + same scrip set + same normalized URL + same category → one
+    ingest. Multi-scrip cells use sorted unique scrip list in the key.
+
+    Without scrip, URL, or category, fall back to link+title scoped dedupe.
+    """
+    fp = story_fingerprint(link, title)
+    scrips = parse_all_bse_scrips_for_dedupe(bse_scrip_code)
+    cat = str(category or "").strip().lower()
+    url_key = normalize_story_url(link)
+    if scrips and url_key and cat:
+        scrip_key = "+".join(str(x) for x in sorted(scrips))
+        seed = f"stock_news|scrips={scrip_key}|url={url_key}|cat={cat}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return dedupe_fingerprint(fp, "stock_news")
 
 
 def _cell(v: Any) -> Any:
@@ -240,7 +345,9 @@ def ingest_excel(
             link = r.get("link")
             title = r.get("title")
             fp = story_fingerprint(link, title)
-            seen_fp = dedupe_fingerprint(fp, "stock_news")
+            seen_fp = stock_news_cross_cycle_fingerprint(
+                link, title, r.get("bse_scrip_code"), r.get("category"),
+            )
             cur.execute(
                 """
                 INSERT INTO news_briefing_seen_stories (

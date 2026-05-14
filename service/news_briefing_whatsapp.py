@@ -46,18 +46,50 @@ def briefing_whatsapp_enabled() -> bool:
     return True
 
 
-def parse_bse_scrip(raw: Any) -> Optional[int]:
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
+def _parse_one_bse_scrip_token(token: str) -> Optional[int]:
+    token = (token or "").strip()
+    if not token:
         return None
     try:
-        if "." in s or "e" in s.lower():
-            return int(float(s))
-        return int(s)
+        if "." in token or "e" in token.lower():
+            v = int(float(token))
+        else:
+            v = int(token)
+        return v if v > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def parse_all_bse_scrips(raw: Any) -> List[int]:
+    """
+    All positive BSE scrip codes from a cell: comma, semicolon, pipe, or ' and '.
+    Handles Excel floats like 532540.0 per token.
+    """
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    for sep in ";", "|":
+        s = s.replace(sep, ",")
+    parts = re.split(r"\s*,\s*|\s+and\s+", s, flags=re.I)
+    seen: set[int] = set()
+    out: List[int] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        n = _parse_one_bse_scrip_token(p)
+        if n is not None and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def parse_bse_scrip(raw: Any) -> Optional[int]:
+    """First parseable BSE scrip from a cell (backward compatible)."""
+    allv = parse_all_bse_scrips(raw)
+    return allv[0] if allv else None
 
 
 def _clamp(s: str, n: int) -> str:
@@ -165,7 +197,9 @@ def _row_dict_from_sn(
 
 def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
     """
-    For each news_briefing_stock_news row in this run, notify users watching that scrip.
+    For each news_briefing_stock_news row in this run, notify users watching any
+    BSE scrip listed in that row (comma / semicolon / ' and '). One WhatsApp per
+    phone per row: company line lists each watched scrip's label for that user.
     """
     if not briefing_whatsapp_enabled():
         return {"skipped": True, "reason": "NEWS_BRIEFING_WHATSAPP_ENABLED=off"}
@@ -193,19 +227,29 @@ def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
     for tup in stock_rows:
         row = _row_dict_from_sn(tup, cols)
         rows_seen += 1
-        scrip = parse_bse_scrip(row.get("bse_scrip_code"))
-        if not scrip:
+        scrips = parse_all_bse_scrips(row.get("bse_scrip_code"))
+        if not scrips:
             rows_no_scrip += 1
             continue
 
-        watchers = fetch_watchers_for_scrip(scrip)
-        if not watchers:
+        phone_to_scrips: Dict[str, List[int]] = {}
+        for scrip in scrips:
+            for phone, _name in fetch_watchers_for_scrip(scrip):
+                phone_to_scrips.setdefault(phone, []).append(scrip)
+
+        if not phone_to_scrips:
             rows_no_watchers += 1
             continue
 
-        company = _company_label(scrip, row)
-        title_short = (row.get("title") or company)[:80]
-        for phone, _name in watchers:
+        base_title = ((row.get("title") or "").strip() or "")[:80]
+        for phone, scrip_list in phone_to_scrips.items():
+            uniq = list(dict.fromkeys(scrip_list))
+            if len(uniq) == 1:
+                company = _company_label(uniq[0], row)
+            else:
+                labels = [_company_label(s, row) for s in uniq]
+                company = " / ".join(dict.fromkeys(labels))[:220] or "Stock update"
+            title_short = base_title if base_title else (company or "Stock update")[:80]
             params = build_briefing_watchlist_params(
                 company,
                 row.get("ai_summary"),
@@ -283,7 +327,7 @@ def find_latest_stock_news_for_scrip(bse_scrip: int) -> Optional[Dict[str, Any]]
             cols = [d[0] for d in cur.description]
             for tup in cur.fetchall():
                 row = _row_dict_from_sn(tup, cols)
-                if parse_bse_scrip(row.get("bse_scrip_code")) == bse_scrip:
+                if bse_scrip in parse_all_bse_scrips(row.get("bse_scrip_code")):
                     return row
     return None
 
@@ -314,11 +358,15 @@ def send_test_briefing_watchlist(
     else:
         return {"ok": False, "error": "provide stock_news_id or bse_scrip"}
 
-    scrip = parse_bse_scrip(row.get("bse_scrip_code"))
-    if not scrip:
+    scrips = parse_all_bse_scrips(row.get("bse_scrip_code"))
+    if not scrips:
         return {"ok": False, "error": "row has no parseable bse_scrip_code"}
 
-    company = _company_label(scrip, row)
+    if bse_scrip is not None and int(bse_scrip) not in scrips:
+        return {"ok": False, "error": f"bse_scrip {bse_scrip} not in row codes {scrips}"}
+
+    primary = int(bse_scrip) if bse_scrip is not None else scrips[0]
+    company = _company_label(primary, row)
 
     params = build_briefing_watchlist_params(
         company,
@@ -335,7 +383,8 @@ def send_test_briefing_watchlist(
         "phone": phone,
         "stock_news_id": row.get("id"),
         "run_id": row.get("run_id"),
-        "bse_scrip_code": scrip,
+        "bse_scrip_code": primary,
+        "bse_scrip_codes": scrips,
         "template_id": WATCHLIST_TEMPLATE_ID,
         "params_preview": params,
     }
