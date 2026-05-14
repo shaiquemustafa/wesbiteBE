@@ -3393,7 +3393,7 @@ def admin_news_briefing_runs(
 
 @app.post(
     "/api/admin/news-briefing/test-watchlist-whatsapp",
-    summary="[ADMIN] Send one briefing-style WhatsApp (watchlist template) for QA",
+    summary="[ADMIN] Send one briefing watchlist WhatsApp (General news + link template) for QA",
 )
 def admin_news_briefing_test_watchlist_whatsapp(
     phone: str = Query(
@@ -3411,9 +3411,10 @@ def admin_news_briefing_test_watchlist_whatsapp(
     x_news_briefing_secret: Optional[str] = Header(None, alias="X-News-Briefing-Secret"),
 ):
     """
-    Sends the same 5-parameter watchlist briefing template used after ingest,
-    filled from DB (AI summary, category, time, link). Does **not** require the
-    stock to be on the recipient's watchlist — for testing only.
+    Sends the same 5-parameter template used after briefing ingest: user label,
+    company name, ``General news``, AI summary, article link (from
+    ``news_briefing_stock_news``). Does **not** require the stock to be on the
+    recipient's watchlist — for testing only.
 
     Either ``stock_news_id`` **or** ``bse_scrip`` is required.
 

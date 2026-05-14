@@ -2,11 +2,11 @@
 WhatsApp watchlist notifications for `news_briefing_stock_news` rows.
 
 After a briefing run is ingested, each stock-news row is matched to users who
-have that BSE scrip on `user_watchlist`. Template uses WATCHLIST_TEMPLATE_ID
-(five body variables):
+have that BSE scrip on `user_watchlist`. Uses ``NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID``
+(Gupshup body variables):
 
-  1) literal "user"         2) company line   3) literal "general"
-  4) AI summary             5) time (IST) only — no link (keeps message shorter)
+  1) literal "user"     2) company name   3) literal "General news"
+  4) AI summary         5) article link
 
 Env:
   NEWS_BRIEFING_WHATSAPP_ENABLED — optional. Sends run by default after each ingest
@@ -17,18 +17,19 @@ from __future__ import annotations
 import os
 import logging
 import re
-from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from database import get_conn
-from service.whatsapp_service import WhatsAppService, WATCHLIST_TEMPLATE_ID
+from service.whatsapp_service import (
+    NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID,
+    RITO_WEBSITE_URL,
+    WhatsAppService,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
-IST = timezone(timedelta(hours=5, minutes=30))
-
-# Meta/Gupshup variable practical limits
-_MAX_P1, _MAX_P2, _MAX_P3, _MAX_P4, _MAX_P5 = 80, 220, 120, 1000, 900
+# Meta/Gupshup variable practical limits (approved template body vars)
+_MAX_P1, _MAX_P2, _MAX_P3, _MAX_P4, _MAX_P5 = 80, 220, 120, 1000, 1024
 
 
 def briefing_whatsapp_enabled() -> bool:
@@ -99,29 +100,11 @@ def _clamp(s: str, n: int) -> str:
     return s[: n - 1] + "…"
 
 
-def _format_time_only(published_at_ist: Any) -> str:
-    """published_at_ist is naive IST in DB. Variable 5 is time only (no URL)."""
-    if not published_at_ist:
-        return "N/A"
-    try:
-        if isinstance(published_at_ist, datetime):
-            dt = published_at_ist
-        else:
-            dt = datetime.fromisoformat(str(published_at_ist)[:19])
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=IST)
-        else:
-            dt = dt.astimezone(IST)
-        try:
-            date_str = dt.strftime("%-d %b")
-            time_str = dt.strftime("%-I:%M %p")
-        except ValueError:
-            date_str = f"{dt.day} {dt.strftime('%b')}"
-            time_str = dt.strftime("%I:%M %p").lstrip("0")
-        time_part = f"{date_str}, {time_str}"
-        return _clamp(time_part, _MAX_P5)
-    except Exception:
-        return _clamp(str(published_at_ist), _MAX_P5)
+def _default_article_link() -> str:
+    base = (RITO_WEBSITE_URL or "rito.co.in").strip().rstrip("/")
+    if base.startswith("http://") or base.startswith("https://"):
+        return base
+    return f"https://{base}"
 
 
 def _company_label(scrip: int, row: Dict[str, Any]) -> str:
@@ -150,15 +133,18 @@ def _company_label(scrip: int, row: Dict[str, Any]) -> str:
 def build_briefing_watchlist_params(
     company_display: str,
     ai_summary: Optional[str],
-    published_at_ist: Any,
+    link: Optional[str],
 ) -> List[str]:
-    """Five Gupshup body variables for the watchlist briefing template."""
+    """Five Gupshup body variables for NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID."""
     p1 = _clamp("user", _MAX_P1)
-    raw_company = company_display.strip() if company_display else "Stock"
-    p2 = _clamp(f"📊 *{raw_company}*", _MAX_P2)
-    p3 = _clamp("general", _MAX_P3)
+    raw_company = (company_display or "").strip() or "Stock"
+    p2 = _clamp(raw_company, _MAX_P2)
+    p3 = _clamp("General news", _MAX_P3)
     p4 = _clamp((ai_summary or "").strip() or "No summary available.", _MAX_P4)
-    p5 = _format_time_only(published_at_ist)
+    url = (link or "").strip()
+    if not url:
+        url = _default_article_link()
+    p5 = _clamp(url, _MAX_P5)
     return [p1, p2, p3, p4, p5]
 
 
@@ -253,9 +239,9 @@ def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
             params = build_briefing_watchlist_params(
                 company,
                 row.get("ai_summary"),
-                row.get("published_at_ist"),
+                row.get("link"),
             )
-            tpl = {"id": WATCHLIST_TEMPLATE_ID, "params": params}
+            tpl = {"id": NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID, "params": params}
             jobs.append((phone, tpl, title_short))
 
     if not jobs:
@@ -371,9 +357,9 @@ def send_test_briefing_watchlist(
     params = build_briefing_watchlist_params(
         company,
         row.get("ai_summary"),
-        row.get("published_at_ist"),
+        row.get("link"),
     )
-    tpl = {"id": WATCHLIST_TEMPLATE_ID, "params": params}
+    tpl = {"id": NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID, "params": params}
     ws = WhatsAppService()
     title = (row.get("title") or company)[:120]
     batch = ws.send_template_batch([(phone, tpl, title)])
@@ -385,7 +371,7 @@ def send_test_briefing_watchlist(
         "run_id": row.get("run_id"),
         "bse_scrip_code": primary,
         "bse_scrip_codes": scrips,
-        "template_id": WATCHLIST_TEMPLATE_ID,
+        "template_id": NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID,
         "params_preview": params,
     }
     if not ok:
