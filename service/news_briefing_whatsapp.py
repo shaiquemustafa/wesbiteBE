@@ -5,7 +5,7 @@ After a briefing run is ingested, each stock-news row is matched to users who
 have that BSE scrip on `user_watchlist`. Uses ``NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID``
 (Gupshup body variables):
 
-  1) literal "user"     2) company name   3) literal "General news"
+  1) literal "user"     2) 📊 *company* (bold)   3) literal "General news"
   4) AI summary         5) article link
 
 Env:
@@ -138,7 +138,9 @@ def build_briefing_watchlist_params(
     """Five Gupshup body variables for NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID."""
     p1 = _clamp("user", _MAX_P1)
     raw_company = (company_display or "").strip() or "Stock"
-    p2 = _clamp(raw_company, _MAX_P2)
+    # WhatsApp bold: *text*; chart emoji for visibility (variable 2 sits in template body).
+    safe_name = raw_company.replace("*", "")
+    p2 = _clamp(f"📊 *{safe_name}*", _MAX_P2)
     p3 = _clamp("General news", _MAX_P3)
     p4 = _clamp((ai_summary or "").strip() or "No summary available.", _MAX_P4)
     url = (link or "").strip()
