@@ -9,7 +9,8 @@ have that BSE scrip on `user_watchlist`. Template uses WATCHLIST_TEMPLATE_ID
   4) AI summary             5) time (IST) only — no link (keeps message shorter)
 
 Env:
-  NEWS_BRIEFING_WHATSAPP_ENABLED — set to 1/true/yes to send after each ingest.
+  NEWS_BRIEFING_WHATSAPP_ENABLED — optional. Sends run by default after each ingest
+  for users who watch the stock. Set to 0/false/no/off to disable (e.g. staging).
 """
 from __future__ import annotations
 
@@ -31,7 +32,18 @@ _MAX_P1, _MAX_P2, _MAX_P3, _MAX_P4, _MAX_P5 = 80, 220, 120, 1000, 900
 
 
 def briefing_whatsapp_enabled() -> bool:
-    return os.getenv("NEWS_BRIEFING_WHATSAPP_ENABLED", "").lower() in ("1", "true", "yes")
+    """
+    Briefing → watchlist WhatsApp is on by default (matches product: watchlist = notify).
+
+    Opt out only: set NEWS_BRIEFING_WHATSAPP_ENABLED to 0, false, no, or off.
+    """
+    raw = os.getenv("NEWS_BRIEFING_WHATSAPP_ENABLED")
+    if raw is None or not str(raw).strip():
+        return True
+    s = str(raw).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 def parse_bse_scrip(raw: Any) -> Optional[int]:
@@ -156,7 +168,7 @@ def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
     For each news_briefing_stock_news row in this run, notify users watching that scrip.
     """
     if not briefing_whatsapp_enabled():
-        return {"skipped": True, "reason": "NEWS_BRIEFING_WHATSAPP_ENABLED not set"}
+        return {"skipped": True, "reason": "NEWS_BRIEFING_WHATSAPP_ENABLED=off"}
 
     jobs: List[Tuple[str, dict, str]] = []
     rows_seen = 0
