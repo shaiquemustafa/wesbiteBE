@@ -6,8 +6,9 @@ Slot keys stored in DB are ``12.30`` and ``19.30`` (the scheduled run times).
 Windowing is cyclical: if the *previous* slot in the chain completed successfully,
 only the incremental slice is considered; if it skipped/failed or is missing,
 a 24-hour catch-up window between the same slot times is used. Each run still
-requires at least UI_SUMMARY_MIN_OBSERVATIONS (default 4) ui_data rows or it
-records skipped_low_volume.
+requires at least UI_SUMMARY_MIN_OBSERVATIONS (default 4) **high-signal** ui_data
+rows (STRONGLY POSITIVE, BEAT, STRONGLY NEGATIVE) in the window or it records
+skipped_low_volume. Time windows and cyclical slot logic are unchanged.
 
 ``summary_ui_data.created_at`` is written explicitly in IST (timezone-aware)
 so TIMESTAMPTZ reflects the correct instant for India.
@@ -161,6 +162,34 @@ def fetch_ui_rows_in_window(
                 blob["_news_time"] = news_time
                 out.append(blob)
     return out
+
+
+def _impact_upper_from_ui_row(row: Dict[str, Any]) -> str:
+    v = row.get("impact") or row.get("Impact") or ""
+    return str(v).strip().upper()
+
+
+def row_is_high_signal_for_ui_digest(row: Dict[str, Any]) -> bool:
+    """
+    Quick pulse digest: only material impacts (aligned with broadcast “signal”
+    labels, without market-cap side conditions).
+
+    Includes: STRONGLY POSITIVE, BEAT, STRONGLY NEGATIVE.
+    Excludes: POSITIVE/NEGATIVE without STRONGLY, NEUTRAL, MATCHED, MISSED, N/A, etc.
+    """
+    imp = _impact_upper_from_ui_row(row)
+    if not imp:
+        return False
+    if "STRONGLY POSITIVE" in imp or imp == "BEAT":
+        return True
+    if "STRONGLY NEGATIVE" in imp:
+        return True
+    return False
+
+
+def filter_ui_rows_for_digest(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Subset of ui_data rows passed to the digest LLM."""
+    return [r for r in rows if row_is_high_signal_for_ui_digest(r)]
 
 
 def summary_already_done(slot: str, briefing_day: date) -> bool:
@@ -342,13 +371,15 @@ def run_midday_summary(briefing_day: date) -> None:
     _delete_failed_slot_row(slot, briefing_day)
 
     w_start, w_end, start_exc, win_mode = _resolve_midday_window(briefing_day)
-    rows = fetch_ui_rows_in_window(
+    rows_all = fetch_ui_rows_in_window(
         w_start, w_end, start_exclusive=start_exc, end_inclusive=True
     )
+    rows = filter_ui_rows_for_digest(rows_all)
     n = len(rows)
     logger.info(
-        "ui_summary midday: window_mode=%s obs=%s window=[%s .. %s]",
+        "ui_summary midday: window_mode=%s raw_obs=%s digest_obs=%s window=[%s .. %s]",
         win_mode,
+        len(rows_all),
         n,
         w_start.isoformat(),
         w_end.isoformat(),
@@ -419,14 +450,15 @@ def run_evening_summary(briefing_day: date) -> None:
     _delete_failed_slot_row(slot, briefing_day)
 
     w_start, w_end, start_exc, win_mode = _resolve_evening_window(briefing_day)
-    rows = fetch_ui_rows_in_window(
+    rows_all = fetch_ui_rows_in_window(
         w_start, w_end, start_exclusive=start_exc, end_inclusive=True
     )
-
+    rows = filter_ui_rows_for_digest(rows_all)
     n = len(rows)
     logger.info(
-        "ui_summary evening: window_mode=%s obs=%s window=[%s .. %s]",
+        "ui_summary evening: window_mode=%s raw_obs=%s digest_obs=%s window=[%s .. %s]",
         win_mode,
+        len(rows_all),
         n,
         w_start.isoformat(),
         w_end.isoformat(),

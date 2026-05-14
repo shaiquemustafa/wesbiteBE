@@ -910,7 +910,7 @@ def _ensure_tables(conn):
                 "summary_ui_data",
                 "LLM digests of ui_data for IST calendar days. Slot labels: 12.30 (midday run) and 19.30 (evening run).",
                 "IST digest windows are cyclical (see ui_summary_service): narrow slice after prior slot completed, else 24h catch-up between slot anchors. Min observations UI_SUMMARY_MIN_OBSERVATIONS.",
-                "Rows from ui_data whose news_time falls in the IST window; skipped_low_volume when count < UI_SUMMARY_MIN_OBSERVATIONS (default 4). Status values: completed, skipped_low_volume, failed.",
+                "High-signal ui_data rows (STRONGLY POSITIVE, BEAT, STRONGLY NEGATIVE) whose news_time falls in the IST window; skipped_low_volume when filtered count < UI_SUMMARY_MIN_OBSERVATIONS (default 4). Status values: completed, skipped_low_volume, failed.",
                 "created_at is stored as TIMESTAMPTZ using IST clock at insert time. window_start_ist / window_end_ist are naive TIMESTAMP values in IST.",
             ),
         ]
