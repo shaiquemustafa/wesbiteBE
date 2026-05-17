@@ -63,7 +63,7 @@ QUICK_PULSE_DIGEST_TEMPLATE_ID = os.getenv(
     "1a9bdb1e-16c5-454c-b534-5ce8e2ffe50d",
 ).strip() or "1a9bdb1e-16c5-454c-b534-5ce8e2ffe50d"
 WHATSAPP_DIGEST_PARAM2_MAX_CHARS = max(
-    512, min(int(os.getenv("WHATSAPP_DIGEST_PARAM2_MAX_CHARS", "4096")), 16000)
+    200, min(int(os.getenv("WHATSAPP_DIGEST_PARAM2_MAX_CHARS", "800")), 16000)
 )
 
 # RITO website URL (used in notification messages)

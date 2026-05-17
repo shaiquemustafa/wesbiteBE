@@ -1,14 +1,15 @@
 """
-IST UI digest summaries over ui_data windows (midday / evening slots).
-Uses naive IST datetimes for windows, consistent with the rest of the backend.
-Slot keys stored in DB are ``12.30`` and ``19.30`` (the scheduled run times).
+IST UI digest summaries — single daily run at 14:30 IST.
+Slot key stored in DB: ``14.30``.
 
-Windowing is cyclical: if the *previous* slot in the chain completed successfully,
-only the incremental slice is considered; if it skipped/failed or is missing,
-a 24-hour catch-up window between the same slot times is used. Each run still
-requires at least UI_SUMMARY_MIN_OBSERVATIONS (default 4) **high-signal** ui_data
-rows (STRONGLY POSITIVE, BEAT, STRONGLY NEGATIVE) in the window or it records
-skipped_low_volume. Time windows and cyclical slot logic are unchanged.
+Window: previous day 14:30 → today 14:30 IST (exclusive start, inclusive end),
+covering a clean 24-hour trading day.
+
+Only STRONGLY POSITIVE, BEAT, and STRONGLY NEGATIVE rows from ui_data are used,
+filtered further to companies with market cap ≥ 9,000 Cr.
+
+Minimum observations: 1 (runs whenever at least one qualifying stock exists).
+Hard cap on digest text: 800 characters to stay safe under WhatsApp template limits.
 
 ``summary_ui_data.created_at`` is written explicitly in IST (timezone-aware)
 so TIMESTAMPTZ reflects the correct instant for India.
@@ -25,23 +26,33 @@ from database import get_conn
 
 logger = logging.getLogger("uvicorn.error")
 
-# IST wall-clock labels for the two digest runs (stored in DB + whatsapp_broadcast.slot).
 IST = timezone(timedelta(hours=5, minutes=30))
-SLOT_MIDDAY = "12.30"
-SLOT_EVENING = "19.30"
 
-# Accept legacy admin/API query strings and normalize.
-_LEGACY_SLOT_ALIASES = {"12_30": SLOT_MIDDAY, "19_30": SLOT_EVENING}
+# Single daily digest slot at 14:30 IST.
+SLOT_DAILY = "14.30"
+# Keep legacy names so existing imports / admin API still work without a migration.
+SLOT_MIDDAY = SLOT_DAILY
+SLOT_EVENING = SLOT_DAILY
+
+_LEGACY_SLOT_ALIASES: Dict[str, str] = {
+    "12_30": SLOT_DAILY,
+    "19_30": SLOT_DAILY,
+    "12.30": SLOT_DAILY,
+    "19.30": SLOT_DAILY,
+    "14_30": SLOT_DAILY,
+}
 
 
 def normalize_ui_summary_slot_label(slot: str) -> str:
     s = (slot or "").strip()
     return _LEGACY_SLOT_ALIASES.get(s, s)
 
-UI_SUMMARY_MIN_OBSERVATIONS = max(0, int(os.getenv("UI_SUMMARY_MIN_OBSERVATIONS", "4")))
+UI_SUMMARY_MIN_OBSERVATIONS = 1   # run whenever ≥1 qualifying stock exists
 UI_SUMMARY_MODEL = os.getenv("UI_SUMMARY_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-# Target length for one WhatsApp bubble (~900 chars comfortable; hard stay under ~1100).
-UI_SUMMARY_TARGET_CHARS = max(400, min(int(os.getenv("UI_SUMMARY_TARGET_CHARS", "950")), 2500))
+# LLM target length: aim well under the 800-char hard send cap.
+UI_SUMMARY_TARGET_CHARS = max(400, min(int(os.getenv("UI_SUMMARY_TARGET_CHARS", "750")), 2500))
+# Market cap threshold for digest inclusion (Crores).
+UI_SUMMARY_MIN_MARKET_CAP_CR: float = float(os.getenv("UI_SUMMARY_MIN_MARKET_CAP_CR", "9000"))
 
 _DIGEST_SYSTEM = f"""You write a short \"Quick pulse\" digest for Indian equity investors. It will be sent on WhatsApp as a gentle nudge — not a full article. Users get details on the website later.
 
@@ -81,46 +92,11 @@ def _summary_slot_status(slot: str, briefing_day: date) -> Optional[str]:
             return r[0] if r else None
 
 
-def _previous_evening_completed_for_midday(briefing_day: date) -> bool:
-    """True iff yesterday's 19:30 slot finished with status completed."""
-    prev_day = briefing_day - timedelta(days=1)
-    return _summary_slot_status(SLOT_EVENING, prev_day) == "completed"
-
-
-def _resolve_midday_window(briefing_day: date) -> tuple[datetime, datetime, bool, str]:
-    """
-    Cyclical window for D 12:30:
-    - If previous calendar day's evening slot **completed** → narrow slice only:
-      (D-1 19:30, D 12:30] IST (news after last evening digest through midday).
-    - Otherwise (skipped/failed/missing) → 24h catch-up between midday anchors:
-      (D-1 12:30, D 12:30] IST.
-
-    Returns (window_start, window_end, start_exclusive, label_for_logs).
-    """
-    if _previous_evening_completed_for_midday(briefing_day):
-        w_start = _naive_ist(briefing_day - timedelta(days=1), 19, 30)
-        w_end = _naive_ist(briefing_day, 12, 30)
-        return w_start, w_end, True, "narrow_after_evening_completed"
-    w_start = _naive_ist(briefing_day - timedelta(days=1), 12, 30)
-    w_end = _naive_ist(briefing_day, 12, 30)
-    return w_start, w_end, True, "wide_catchup_24h_midday"
-
-
-def _resolve_evening_window(briefing_day: date) -> tuple[datetime, datetime, bool, str]:
-    """
-    Cyclical window for D 19:30:
-    - If today's midday **completed** → narrow (12:30, 19:30] same day.
-    - Otherwise → 24h catch-up between evening anchors: (D-1 19:30, D 19:30] IST.
-
-    Returns (window_start, window_end, start_exclusive, label_for_logs).
-    """
-    if _summary_slot_status(SLOT_MIDDAY, briefing_day) == "completed":
-        w_start = _naive_ist(briefing_day, 12, 30)
-        w_end = _naive_ist(briefing_day, 19, 30)
-        return w_start, w_end, True, "narrow_after_midday_completed"
-    w_start = _naive_ist(briefing_day - timedelta(days=1), 19, 30)
-    w_end = _naive_ist(briefing_day, 19, 30)
-    return w_start, w_end, True, "wide_catchup_24h_evening"
+def _resolve_daily_window(briefing_day: date) -> tuple[datetime, datetime]:
+    """24-hour window ending at today 14:30 IST (previous day 14:30 exclusive → today 14:30 inclusive)."""
+    w_start = _naive_ist(briefing_day - timedelta(days=1), 14, 30)
+    w_end = _naive_ist(briefing_day, 14, 30)
+    return w_start, w_end
 
 
 def fetch_ui_rows_in_window(
@@ -187,9 +163,29 @@ def row_is_high_signal_for_ui_digest(row: Dict[str, Any]) -> bool:
     return False
 
 
+def _market_cap_for_row(row: Dict[str, Any]) -> Optional[float]:
+    for key in ("marketCap", "market_cap", "mkt_cap_cr", "market_cap_cr"):
+        v = row.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 def filter_ui_rows_for_digest(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Subset of ui_data rows passed to the digest LLM."""
-    return [r for r in rows if row_is_high_signal_for_ui_digest(r)]
+    """High-signal rows (impact filter) AND market cap ≥ UI_SUMMARY_MIN_MARKET_CAP_CR.
+    Rows with no market cap data are included (unknown cap = not excluded)."""
+    out = []
+    for r in rows:
+        if not row_is_high_signal_for_ui_digest(r):
+            continue
+        cap = _market_cap_for_row(r)
+        if cap is not None and cap < UI_SUMMARY_MIN_MARKET_CAP_CR:
+            continue
+        out.append(r)
+    return out
 
 
 def summary_already_done(slot: str, briefing_day: date) -> bool:
@@ -360,29 +356,30 @@ def _openai_digest(observation_text: str) -> str:
     return text
 
 
-def run_midday_summary(briefing_day: date) -> None:
-    slot = SLOT_MIDDAY
+def run_daily_summary(briefing_day: date) -> None:
+    """Single daily digest at 14:30 IST. Window: previous day 14:30 → today 14:30."""
+    slot = SLOT_DAILY
     if summary_already_done(slot, briefing_day):
-        logger.info("ui_summary midday: already completed for %s", briefing_day)
+        logger.info("ui_summary daily: already completed for %s", briefing_day)
         return
     if _should_skip_existing_slot(slot, briefing_day):
-        logger.info("ui_summary midday: existing terminal row for %s — skip", briefing_day)
+        logger.info("ui_summary daily: existing terminal row for %s — skip", briefing_day)
         return
     _delete_failed_slot_row(slot, briefing_day)
 
-    w_start, w_end, start_exc, win_mode = _resolve_midday_window(briefing_day)
+    w_start, w_end = _resolve_daily_window(briefing_day)
     rows_all = fetch_ui_rows_in_window(
-        w_start, w_end, start_exclusive=start_exc, end_inclusive=True
+        w_start, w_end, start_exclusive=True, end_inclusive=True
     )
     rows = filter_ui_rows_for_digest(rows_all)
     n = len(rows)
     logger.info(
-        "ui_summary midday: window_mode=%s raw_obs=%s digest_obs=%s window=[%s .. %s]",
-        win_mode,
+        "ui_summary daily: raw_obs=%s digest_obs=%s window=[%s .. %s] cap_filter>=%.0fCr",
         len(rows_all),
         n,
         w_start.isoformat(),
         w_end.isoformat(),
+        UI_SUMMARY_MIN_MARKET_CAP_CR,
     )
     if n < UI_SUMMARY_MIN_OBSERVATIONS:
         if _insert_summary_row(
@@ -397,7 +394,7 @@ def run_midday_summary(briefing_day: date) -> None:
             error_message=None,
         ) is not None:
             logger.info(
-                "ui_summary midday: skipped_low_volume (%s obs < %s) for %s",
+                "ui_summary daily: skipped_low_volume (%s obs < %s) for %s",
                 n,
                 UI_SUMMARY_MIN_OBSERVATIONS,
                 briefing_day,
@@ -418,12 +415,12 @@ def run_midday_summary(briefing_day: date) -> None:
             error_message=None,
         )
         if inserted:
-            logger.info("ui_summary midday: completed for %s (%s obs)", briefing_day, n)
+            logger.info("ui_summary daily: completed for %s (%s obs)", briefing_day, n)
             _maybe_publish_quick_pulse_whatsapp(inserted, slot, briefing_day, digest)
         else:
-            logger.info("ui_summary midday: insert skipped (conflict) for %s", briefing_day)
+            logger.info("ui_summary daily: insert skipped (conflict) for %s", briefing_day)
     except Exception as e:
-        logger.exception("ui_summary midday: failed for %s: %s", briefing_day, e)
+        logger.exception("ui_summary daily: failed for %s: %s", briefing_day, e)
         msg = str(e)[:2000]
         if _insert_summary_row(
             slot,
@@ -436,95 +433,20 @@ def run_midday_summary(briefing_day: date) -> None:
             model=UI_SUMMARY_MODEL,
             error_message=msg,
         ) is not None:
-            logger.info("ui_summary midday: recorded failed status for %s", briefing_day)
+            logger.info("ui_summary daily: recorded failed status for %s", briefing_day)
+
+
+# Aliases kept for backward compatibility (API + scheduler use run_slot / run_midday / run_evening).
+def run_midday_summary(briefing_day: date) -> None:
+    run_daily_summary(briefing_day)
 
 
 def run_evening_summary(briefing_day: date) -> None:
-    slot = SLOT_EVENING
-    if summary_already_done(slot, briefing_day):
-        logger.info("ui_summary evening: already completed for %s", briefing_day)
-        return
-    if _should_skip_existing_slot(slot, briefing_day):
-        logger.info("ui_summary evening: existing terminal row for %s — skip", briefing_day)
-        return
-    _delete_failed_slot_row(slot, briefing_day)
-
-    w_start, w_end, start_exc, win_mode = _resolve_evening_window(briefing_day)
-    rows_all = fetch_ui_rows_in_window(
-        w_start, w_end, start_exclusive=start_exc, end_inclusive=True
-    )
-    rows = filter_ui_rows_for_digest(rows_all)
-    n = len(rows)
-    logger.info(
-        "ui_summary evening: window_mode=%s raw_obs=%s digest_obs=%s window=[%s .. %s]",
-        win_mode,
-        len(rows_all),
-        n,
-        w_start.isoformat(),
-        w_end.isoformat(),
-    )
-    if n < UI_SUMMARY_MIN_OBSERVATIONS:
-        if _insert_summary_row(
-            slot,
-            briefing_day,
-            w_start,
-            w_end,
-            n,
-            "skipped_low_volume",
-            summary_text=None,
-            model=None,
-            error_message=None,
-        ) is not None:
-            logger.info(
-                "ui_summary evening: skipped_low_volume (%s obs < %s) for %s",
-                n,
-                UI_SUMMARY_MIN_OBSERVATIONS,
-                briefing_day,
-            )
-        return
-
-    try:
-        digest = _openai_digest(_build_observation_digest_lines(rows))
-        inserted = _insert_summary_row(
-            slot,
-            briefing_day,
-            w_start,
-            w_end,
-            n,
-            "completed",
-            summary_text=digest,
-            model=UI_SUMMARY_MODEL,
-            error_message=None,
-        )
-        if inserted:
-            logger.info("ui_summary evening: completed for %s (%s obs)", briefing_day, n)
-            _maybe_publish_quick_pulse_whatsapp(inserted, slot, briefing_day, digest)
-        else:
-            logger.info("ui_summary evening: insert skipped (conflict) for %s", briefing_day)
-    except Exception as e:
-        logger.exception("ui_summary evening: failed for %s: %s", briefing_day, e)
-        msg = str(e)[:2000]
-        if _insert_summary_row(
-            slot,
-            briefing_day,
-            w_start,
-            w_end,
-            n,
-            "failed",
-            summary_text=None,
-            model=UI_SUMMARY_MODEL,
-            error_message=msg,
-        ) is not None:
-            logger.info("ui_summary evening: recorded failed status for %s", briefing_day)
+    run_daily_summary(briefing_day)
 
 
 def run_slot(slot: str, briefing_day: date) -> None:
-    if slot == SLOT_MIDDAY:
-        run_midday_summary(briefing_day)
-    elif slot == SLOT_EVENING:
-        run_evening_summary(briefing_day)
-    else:
-        logger.warning("ui_summary: unknown slot %s", slot)
+    run_daily_summary(briefing_day)
 
 
 def delete_summary_slot_row(briefing_day: date, slot: str) -> int:

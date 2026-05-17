@@ -915,25 +915,20 @@ async def _news_briefing_scheduler_loop():
 
 
 # ---------------------------------------------------------------------------
-# Auto UI-summary digest (IST) — 12:30 / 19:30 slots with grace window
+# Auto UI-summary digest (IST) — single daily slot at 14:30
 # ---------------------------------------------------------------------------
 _UI_SUMMARY_IST_SLOTS: Tuple[Tuple[str, int, int], ...] = (
-    (SLOT_MIDDAY, 12, 30),
-    (SLOT_EVENING, 19, 30),
+    (SLOT_MIDDAY, 14, 30),
 )
 
 
 def _next_ui_summary_slot_strictly_after(now_ist: datetime) -> datetime:
-    """Earliest 12:30 / 19:30 IST strictly after ``now_ist`` (naive); else tomorrow 12:30."""
+    """Earliest 14:30 IST strictly after ``now_ist`` (naive); else tomorrow 14:30."""
     d = now_ist.date()
-    slots = (
-        datetime.combine(d, time(12, 30, 0)),
-        datetime.combine(d, time(19, 30, 0)),
-    )
-    for t in slots:
-        if t > now_ist:
-            return t
-    return datetime.combine(d + timedelta(days=1), time(12, 30, 0))
+    slot_today = datetime.combine(d, time(14, 30, 0))
+    if slot_today > now_ist:
+        return slot_today
+    return datetime.combine(d + timedelta(days=1), time(14, 30, 0))
 
 
 async def _ui_summary_scheduler_loop():
@@ -3468,12 +3463,12 @@ def _require_ui_summary_trigger_secret(x_secret: Optional[str]) -> None:
 
 @app.post(
     "/api/admin/ui-summary/run",
-    summary="[ADMIN] Manually run one UI digest slot (12:30 or 19:30 window)",
+    summary="[ADMIN] Manually run the daily UI digest (14:30 window)",
 )
 def admin_ui_summary_run(
     slot: str = Query(
-        ...,
-        description="12.30 (midday) or 19.30 (evening); legacy 12_30 / 19_30 also accepted",
+        "14.30",
+        description="14.30 (daily); legacy 12.30 / 19.30 / 12_30 / 19_30 also accepted (all map to 14.30)",
     ),
     briefing_date: Optional[date] = Query(
         None,
@@ -3486,23 +3481,24 @@ def admin_ui_summary_run(
     x_ui_summary_secret: Optional[str] = Header(None, alias="X-UI-Summary-Secret"),
 ):
     """
-    Runs the same logic as the scheduled jobs immediately so you can inspect
-    ``summary_ui_data`` without waiting for 12:30 / 19:30 IST.
+    Runs the same logic as the scheduled job immediately so you can inspect
+    ``summary_ui_data`` without waiting for 14:30 IST.
 
     Authentication: header ``X-UI-Summary-Secret`` must match ``UI_SUMMARY_JOB_SECRET``,
     or if unset, ``NEWS_BRIEFING_JOB_SECRET``.
 
     Example::
       curl -X POST -H \"X-UI-Summary-Secret: $SECRET\" \\
-        \"https://YOUR_HOST/api/admin/ui-summary/run?slot=12.30&force=true\"
+        \"https://YOUR_HOST/api/admin/ui-summary/run?slot=14.30&force=true\"
     """
     _require_ui_summary_trigger_secret(x_ui_summary_secret)
 
     s = normalize_ui_summary_slot_label((slot or "").strip())
-    if s not in (SLOT_MIDDAY, SLOT_EVENING):
+    # Any legacy alias resolves to SLOT_DAILY; accept it.
+    if s != SLOT_MIDDAY:
         raise HTTPException(
             status_code=400,
-            detail=f"slot must be {SLOT_MIDDAY} or {SLOT_EVENING} (legacy 12_30 / 19_30 accepted)",
+            detail=f"slot must be 14.30 (or legacy 12.30 / 19.30 / 12_30 / 19_30)",
         )
     day = briefing_date if briefing_date is not None else _now_ist_naive().date()
     try:
