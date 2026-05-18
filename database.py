@@ -738,7 +738,7 @@ def _ensure_tables(conn):
             CREATE TABLE IF NOT EXISTS summary_ui_data (
                 id BIGSERIAL PRIMARY KEY,
                 slot VARCHAR(15) NOT NULL
-                    CHECK (slot IN ('12.30','19.30')),
+                    CHECK (slot IN ('12.30','19.30','14.30')),
                 briefing_date_ist DATE NOT NULL,
                 window_start_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
                 window_end_ist TIMESTAMP WITHOUT TIME ZONE NOT NULL,
@@ -752,7 +752,7 @@ def _ensure_tables(conn):
             );
             """
         )
-        # Migrate legacy slot labels (12_30 / 19_30) and CHECK constraint to 12.30 / 19.30.
+        # Migrate legacy slot labels and update CHECK constraint to include 14.30.
         cur.execute("""
             DO $$
             BEGIN
@@ -763,15 +763,9 @@ def _ensure_tables(conn):
                     ALTER TABLE summary_ui_data DROP CONSTRAINT IF EXISTS summary_ui_data_slot_check;
                     UPDATE summary_ui_data SET slot = '12.30' WHERE slot = '12_30';
                     UPDATE summary_ui_data SET slot = '19.30' WHERE slot = '19_30';
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint
-                        WHERE conrelid = 'summary_ui_data'::regclass
-                          AND conname = 'summary_ui_data_slot_check'
-                    ) THEN
-                        ALTER TABLE summary_ui_data
+                    ALTER TABLE summary_ui_data
                         ADD CONSTRAINT summary_ui_data_slot_check
-                        CHECK (slot IN ('12.30','19.30'));
-                    END IF;
+                        CHECK (slot IN ('12.30','19.30','14.30'));
                 END IF;
             END $$;
         """)
