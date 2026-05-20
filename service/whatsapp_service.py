@@ -60,8 +60,8 @@ USER_TRAINING_TEMPLATE_ID = "b6082566-52b3-43e4-b13a-3053db1f456b"
 # Params: [ "user", full_summary_text, send_time_label ]
 QUICK_PULSE_DIGEST_TEMPLATE_ID = os.getenv(
     "QUICK_PULSE_DIGEST_TEMPLATE_ID",
-    "1a9bdb1e-16c5-454c-b534-5ce8e2ffe50d",
-).strip() or "1a9bdb1e-16c5-454c-b534-5ce8e2ffe50d"
+    "7c89e101-59c3-4f96-9384-84e7b4c5b560",
+).strip() or "7c89e101-59c3-4f96-9384-84e7b4c5b560"
 WHATSAPP_DIGEST_PARAM2_MAX_CHARS = max(
     200, min(int(os.getenv("WHATSAPP_DIGEST_PARAM2_MAX_CHARS", "800")), 16000)
 )
@@ -610,7 +610,7 @@ class WhatsAppService:
 
         template_obj = {
             "id": QUICK_PULSE_DIGEST_TEMPLATE_ID,
-            "params": ["user", body, label],
+            "params": ["User", body, label],
         }
 
         unique_phones: list[str] = []
