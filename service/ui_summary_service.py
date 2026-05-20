@@ -54,22 +54,30 @@ UI_SUMMARY_TARGET_CHARS = max(400, min(int(os.getenv("UI_SUMMARY_TARGET_CHARS", 
 # Market cap threshold for digest inclusion (Crores).
 UI_SUMMARY_MIN_MARKET_CAP_CR: float = float(os.getenv("UI_SUMMARY_MIN_MARKET_CAP_CR", "9000"))
 
-_DIGEST_SYSTEM = f"""You write a short \"Quick pulse\" digest for Indian equity investors. It will be sent on WhatsApp as a gentle nudge — not a full article. Users get details on the website later.
+_DIGEST_SYSTEM = """You write a WhatsApp market digest for Indian equity investors.
 
-OUTPUT SHAPE (follow closely):
-1) First line exactly: Quick pulse:
-2) Then one bullet per company or distinct story, using the • character and this pattern:
-   • *Company Name* — WhatsApp bold: wrap ONLY the company name in single asterisks (*Like This*) so it renders bold when pasted into a WhatsApp template variable. Then one flowing sentence after the em dash that tells the story AND weaves in exactly ONE salient number from the input (order value, % growth, EPS, revenue, PAT, capacity, run-rate, etc.). Pick the single most investor-meaningful number for that line; do not add a second figure on the same line unless unavoidable (prefer one).
-3) After the bullets, one short closing line. Use approachable wording like: Check the website for full details and filings if these names matter to your portfolio. (Do not use the word \"skim\". Keep it plain and friendly.)
-4) Plain text only aside from *bold company names*. No markdown headings beyond what is specified. No numbered lists except the • bullets.
+OUTPUT FORMAT (follow exactly):
+- Output ONE continuous line of text with NO line breaks anywhere.
+- For each company use this pattern:
+  📊 *COMPANY NAME IN CAPS* - [one sharp sentence with one key number]
+- Separate each company entry with: ⚡
+- Do NOT add any header, footer, closing line, or "Quick pulse:" label.
+- Do NOT use bullet points (•), hyphens as bullets, or any line breaks.
+- End with exactly: Check website for full details.
 
-STYLE RULES:
-- Warm, readable, conversational — mini-story per line, not keyword dumps.
-- Do NOT add a separate \"Overall\", \"In summary\", or wrap-up paragraph at the end (only the bullets + one closing nudge line).
-- Do NOT strip numbers entirely: every bullet must include one concrete number when the source material supports it; if a row truly has no numeric fact, one qualitative anchor is OK but prefer a number from the text.
-- If there are many companies (>8–10), prioritize the most material names and briefly cluster the rest (\"Several smaller names also filed updates — see site\") without inventing numbers.
-- Stay roughly under {UI_SUMMARY_TARGET_CHARS} characters total (including header and closing line) so it fits one WhatsApp-style message comfortably.
-- No investment advice; factual tone."""
+COMPANY NAME RULES:
+- Always UPPERCASE the company name.
+- Always wrap it in single asterisks: *COMPANY NAME* (WhatsApp bold).
+- Shorten long names where obvious (e.g. "Shaily Engineering Plastics Limited" → "SHAILY ENGINEERING").
+
+DESCRIPTION RULES:
+- Each entry including 📊, company name, spaces and description must be ~91 characters total.
+- Use Rs instead of ₹ symbol.
+- Include exactly ONE key number per entry (revenue %, PAT %, EPS, GRM, margins etc.).
+- Plain factual tone. No investment advice.
+
+EXAMPLE OUTPUT:
+📊 *ZYDUS WELLNESS* - Q4 income up 63%, swung to Rs 162 Cr net profit from a prior loss. ⚡ 📊 *BHARAT PETROLEUM* - FY26 PAT jumped 75% to Rs 23,303 Cr. GRM nearly doubled. Check website for full details."""
 
 
 def _naive_ist(d: date, hh: int, mm: int) -> datetime:
@@ -334,11 +342,10 @@ def _openai_digest(observation_text: str) -> str:
 
     client = OpenAI(api_key=api_key)
     user_msg = (
-        "Using ONLY the facts below (do not invent companies or numbers), produce the Quick pulse digest.\n"
-        "Remember: first line 'Quick pulse:', then • bullets with *Company Name* in WhatsApp bold asterisks, "
-        "each line one story + one key number where possible, "
-        "then one closing line (Check the website for full details and filings… — not 'skim'). "
-        f"Aim ~{UI_SUMMARY_TARGET_CHARS} characters total.\n\n"
+        "Using ONLY the facts below (do not invent companies or numbers), produce the digest.\n"
+        "Output ONE continuous line. Each entry: 📊 *COMPANY NAME IN CAPS* - one sentence with one key number. "
+        "Separate entries with ⚡. End with: Check website for full details. No header, no line breaks, no bullets, use Rs not ₹. "
+        "Each entry ~91 characters including emoji and company name.\n\n"
         f"{observation_text}"
     )
     resp = client.chat.completions.create(
@@ -371,7 +378,7 @@ def run_daily_summary(briefing_day: date) -> None:
     rows_all = fetch_ui_rows_in_window(
         w_start, w_end, start_exclusive=True, end_inclusive=True
     )
-    rows = filter_ui_rows_for_digest(rows_all)
+    rows = filter_ui_rows_for_digest(rows_all)[-7:]  # cap at 7 most recent companies
     n = len(rows)
     logger.info(
         "ui_summary daily: raw_obs=%s digest_obs=%s window=[%s .. %s] cap_filter>=%.0fCr",
