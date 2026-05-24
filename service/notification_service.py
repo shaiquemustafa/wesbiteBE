@@ -283,14 +283,18 @@ class NotificationService:
                             "broadcast_id": existing[0],
                         }
 
+                    # Set sent_at immediately in the same transaction so that
+                    # _send_pending_broadcasts_sync (which queries sent_at IS NULL) can
+                    # never pick up this row and trigger a duplicate send.
                     cur.execute(
                         """
                         INSERT INTO whatsapp_broadcast (
                             scrip_cd, company_name, impact, category, slot,
-                            summary, pdf_link, news_time, mkt_cap_cr, data, created_at
+                            summary, pdf_link, news_time, mkt_cap_cr, data, created_at,
+                            sent_at
                         )
                         VALUES (
-                            NULL, %s, %s, NULL, %s, %s, NULL, NULL, NULL, %s, %s
+                            NULL, %s, %s, NULL, %s, %s, NULL, NULL, NULL, %s, %s, %s
                         )
                         RETURNING id
                         """,
@@ -301,6 +305,7 @@ class NotificationService:
                             text,
                             Json(data_obj),
                             created_at_ist,
+                            created_at_ist,
                         ),
                     )
                     wb_id = cur.fetchone()[0]
@@ -310,22 +315,6 @@ class NotificationService:
 
         notify = self.notify_quick_pulse_digest(text)
         sent = notify.get("sent", 0)
-
-        if sent > 0:
-            try:
-                sent_at_ist = datetime.now(IST)
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE whatsapp_broadcast
-                            SET sent_at = %s
-                            WHERE id = %s
-                            """,
-                            (sent_at_ist, wb_id),
-                        )
-            except Exception as e:
-                logger.warning("Failed to set sent_at for digest broadcast %s: %s", wb_id, e)
 
         return {
             "ok": True,
