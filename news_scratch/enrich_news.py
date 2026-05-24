@@ -169,11 +169,16 @@ preparing user-ready news alerts. A news item has already been triaged \
 twice; you now receive its title, source, RSS summary, a prior short \
 summary, and (usually) the full article body. Your job is FINAL triage.
 
-BE BRUTAL. Only KEEP items that are likely to:
+KEEP items that are likely to:
   • move an Indian listed stock by at least a few percent, OR
   • materially change the view on a specific sector / industry, OR
   • represent a genuinely important macro-to-sector development \
-    (e.g. policy, commodity / currency shock with clear read-through).
+    (e.g. policy, commodity / currency shock with clear read-through), OR
+  • contain a concrete corporate event or date that investors in that \
+    stock should know about (board meeting date, record date, AGM date, \
+    result announcement date, dividend details, insider trade, \
+    shareholding change, demerger timeline, court/NCLT date, etc.) — \
+    even if the news has a neutral direction with no immediate price impact.
 
 FORCED DROP (always keep=false):
   • Anything whose core story is quarterly or annual earnings of a \
@@ -181,7 +186,8 @@ FORCED DROP (always keep=false):
     Reason: "earnings handled elsewhere".
   • Generic market wraps, index moves, FII/DII flows, "top gainers".
   • Soft corporate PR (forms committee, signs MoU without numbers, \
-    generic launch, award announcement) with no material impact.
+    generic launch, award announcement) with no material impact AND \
+    no extractable concrete dates or numbers.
   • Opinion / editorial / podcast / column / visual story.
   • Foreign corporate or political news without a clear, direct \
     Indian-stock or Indian-sector read-through.
@@ -189,16 +195,15 @@ FORCED DROP (always keep=false):
     without a specific broker target.
   • Personal-finance explainers, tax how-tos, SIP guides.
   • Pure macro prints (GDP, CPI, IIP, unemployment) without a sector tie.
-  • Speculation / preview ("what to expect from X") without guidance \
-    or concrete numbers.
+  • Vague speculation / preview with no concrete numbers, dates, or guidance.
 
-KEEP only when ALL of the following hold:
-  • The article states a CONCRETE event (order win / deal / JV / \
-    regulatory action / capex / product / management change / legal \
-    ruling / demand shift / policy move / rating or target change).
-  • There is a LIKELY, IDENTIFIABLE stock or sector impact.
-  • You have enough detail to write an accurate 2–4 sentence summary \
-    with at least one or two concrete numbers (value, %, rating, date).
+KEEP SUMMARY RULE — for neutral/general items that are kept:
+  Even if the news is neutral (e.g. "Company will announce Q4 results on \
+  May 30"), write the ai_summary to be as factual and concrete as possible: \
+  include the exact date, company name, type of event, and any other \
+  extractable details. Do NOT write a vague placeholder like "Company \
+  announced upcoming results". Write: "COMPANY will release Q4 FY26 results \
+  on DATE. [Any other concrete details from the filing]."
 
 CATEGORIES (choose exactly one; do NOT use "earnings"):
   {", ".join(CATEGORIES)}
@@ -210,10 +215,11 @@ Return a JSON OBJECT with these fields (no markdown, nothing outside):
   "category": "<one of above>",
   "affected_stocks": ["<Indian listed co>", ...],
   "affected_industries": ["<lowercased sector tag>", ...],
-  "ai_summary": "<2-4 sentences, preserves key numbers, names parties, \
-dates, values — write as a user-facing alert: clear, direct, useful>",
-  "key_numbers": "<comma-separated list of important numbers: \
-e.g. 'Rs 350.23 cr, +9.6%, FY26'>",
+  "ai_summary": "<2-4 sentences, preserves ALL key numbers, names, \
+dates, values — write as a user-facing alert: clear, direct, useful. \
+For neutral/general items still include every concrete fact available.>",
+  "key_numbers": "<comma-separated list of important numbers/dates: \
+e.g. 'Rs 350.23 cr, +9.6%, FY26, May 30 2026'>",
   "implication": "<one sentence — what this means for the stock/sector. \
 State direction and rough magnitude.>",
   "direction": "<positive|negative|neutral|mixed>",

@@ -5,8 +5,8 @@ After a briefing run is ingested, each stock-news row is matched to users who
 have that BSE scrip on `user_watchlist`. Uses ``NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID``
 (Gupshup body variables):
 
-  1) literal "user"     2) 📊 *company* (bold)   3) literal "General news"
-  4) AI summary         5) article link
+  1) literal "User"     2) 📊 *company* (bold)   3) literal "General news"
+  4) AI summary         5) published time (IST)   6) article / PDF link
 
 Env:
   NEWS_BRIEFING_WHATSAPP_ENABLED — optional. Sends run by default after each ingest
@@ -29,7 +29,7 @@ from service.whatsapp_service import (
 logger = logging.getLogger("uvicorn.error")
 
 # Meta/Gupshup variable practical limits (approved template body vars)
-_MAX_P1, _MAX_P2, _MAX_P3, _MAX_P4, _MAX_P5 = 80, 220, 120, 1000, 1024
+_MAX_P1, _MAX_P2, _MAX_P3, _MAX_P4, _MAX_P5, _MAX_P6 = 80, 220, 120, 1000, 80, 1024
 
 
 def briefing_whatsapp_enabled() -> bool:
@@ -134,20 +134,35 @@ def build_briefing_watchlist_params(
     company_display: str,
     ai_summary: Optional[str],
     link: Optional[str],
+    news_time: Optional[Any] = None,
 ) -> List[str]:
-    """Five Gupshup body variables for NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID."""
-    p1 = _clamp("user", _MAX_P1)
+    """Six Gupshup body variables for NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID."""
+    p1 = _clamp("User", _MAX_P1)
     raw_company = (company_display or "").strip() or "Stock"
     # WhatsApp bold: *text*; chart emoji for visibility (variable 2 sits in template body).
     safe_name = raw_company.replace("*", "")
     p2 = _clamp(f"📊 *{safe_name}*", _MAX_P2)
     p3 = _clamp("General news", _MAX_P3)
     p4 = _clamp((ai_summary or "").strip() or "No summary available.", _MAX_P4)
+    # Variable 5: formatted publish time in IST (e.g. "May 24, 2:30 PM")
+    if news_time:
+        try:
+            if hasattr(news_time, "strftime"):
+                p5 = news_time.strftime("%-d %b, %-I:%M %p IST")
+            else:
+                from datetime import datetime as _dt
+                p5 = _dt.strptime(str(news_time), "%Y-%m-%d %H:%M:%S").strftime("%-d %b, %-I:%M %p IST")
+        except Exception:
+            p5 = str(news_time)[:_MAX_P5]
+    else:
+        p5 = ""
+    p5 = _clamp(p5, _MAX_P5)
+    # Variable 6: article / BSE PDF link
     url = (link or "").strip()
     if not url:
         url = _default_article_link()
-    p5 = _clamp(url, _MAX_P5)
-    return [p1, p2, p3, p4, p5]
+    p6 = _clamp(url, _MAX_P6)
+    return [p1, p2, p3, p4, p5, p6]
 
 
 def fetch_watchers_for_scrip(bse_scrip: int) -> List[Tuple[str, str]]:
@@ -242,6 +257,7 @@ def notify_watchlist_for_run(run_id: int) -> Dict[str, Any]:
                 company,
                 row.get("ai_summary"),
                 row.get("link"),
+                row.get("published_at_ist"),
             )
             tpl = {"id": NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID, "params": params}
             jobs.append((phone, tpl, title_short))
@@ -360,6 +376,7 @@ def send_test_briefing_watchlist(
         company,
         row.get("ai_summary"),
         row.get("link"),
+        row.get("published_at_ist"),
     )
     tpl = {"id": NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID, "params": params}
     ws = WhatsAppService()

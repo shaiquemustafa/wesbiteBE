@@ -47,7 +47,7 @@ OTP_TEMPLATE_NAME = "auth_user_1"
 # Watchlist template: BSE / PDF announcement watchlist path (notification_service).
 WATCHLIST_TEMPLATE_ID = "1f019a3b-1bd3-4af9-91ff-118955cea4a0"
 # News briefing stock_news → watchlist (Hi {{1}} … Full News: {{5}} with article link).
-NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID = "255533d4-0bdf-4d3e-942c-429de3a7ed6f"
+NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID = "821d9a54-7409-445c-bfb9-a4fefb640964"
 # High-impact template: for users who opted for high-impact news from all companies
 HIGH_IMPACT_TEMPLATE_ID = "ade884d4-7716-46a0-a371-a234158dd9c1"
 # Legacy template (kept for backward compatibility, but not used)
