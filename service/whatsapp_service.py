@@ -45,7 +45,7 @@ OTP_TEMPLATE_NAME = "auth_user_1"
 
 # Template for market update notifications (WhatsApp broadcast)
 # Watchlist template: BSE / PDF announcement watchlist path (notification_service).
-WATCHLIST_TEMPLATE_ID = "1f019a3b-1bd3-4af9-91ff-118955cea4a0"
+WATCHLIST_TEMPLATE_ID = "821d9a54-7409-445c-bfb9-a4fefb640964"
 # News briefing stock_news → watchlist (Hi {{1}} … Full News: {{5}} with article link).
 NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID = "821d9a54-7409-445c-bfb9-a4fefb640964"
 # High-impact template: for users who opted for high-impact news from all companies
@@ -410,19 +410,19 @@ class WhatsAppService:
     def _build_market_update_params(self, item: dict, is_watchlist: bool = False) -> list:
         """
         Builds the template parameters list for a market update item.
-        Returns list of 5 parameters for Gupshup template.
-        
+        Returns list of 6 parameters for Gupshup template.
+
         Args:
             item: Enriched prediction dict
             is_watchlist: True if this is a watchlist-only notification, False for regular broadcast
-        
+
         Returns:
-            List of 5 parameter values: [user, company_context, category_impact, summary, time]
+            List of 6 parameter values: [user, company_context, category_impact, summary, time, pdf_link]
         """
         company_name = item.get("company_name", "Unknown")
-        
-        # Parameter 1: Just "user" (not personalized)
-        param1 = "user"
+
+        # Parameter 1: "User" (capitalised, not personalised)
+        param1 = "User"
         
         # Parameter 2: Company name. For the HIGH-IMPACT broadcast we also
         # append the NSE symbol in brackets when available (e.g.
@@ -481,8 +481,16 @@ class WhatsAppService:
                 param5 = str(news_time)
         else:
             param5 = "N/A"
-        
-        return [param1, param2, param3, param4, param5]
+
+        # Parameter 6: BSE PDF link
+        pdf_link = (item.get("pdf_link") or "").strip()
+        if not pdf_link:
+            pdf_link = (RITO_WEBSITE_URL or "https://rito.co.in").strip().rstrip("/")
+            if not pdf_link.startswith("http"):
+                pdf_link = f"https://{pdf_link}"
+        param6 = pdf_link[:1024]
+
+        return [param1, param2, param3, param4, param5, param6]
 
     def send_market_update(self, phone: str, item: dict) -> bool:
         """
