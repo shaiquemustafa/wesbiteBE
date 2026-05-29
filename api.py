@@ -1402,11 +1402,25 @@ def _pipeline_sync(
                                 )
                     else:
                         logger.info(
-                            "  [%s/%s] ⏭️ SCRIP %s excluded from WhatsApp broadcast (doesn't meet criteria).",
+                            "  [%s/%s] ⏭️ SCRIP %s excluded from broad WhatsApp broadcast — "
+                            "will still notify watchlist users.",
                             i,
                             total,
                             row_dict.get("SCRIP_CD"),
                         )
+                        # The item didn't qualify for the broad broadcast but users who
+                        # specifically added this stock to their watchlist must still
+                        # receive it.  Reuse the same watchlist-only notification path
+                        # as low-impact items so every BSE announcement reaches watchers.
+                        watchlist_only_items.append({
+                            "scrip_cd": str(enriched.get("scrip_cd", "")),
+                            "company_name": enriched.get("company_name", "Unknown"),
+                            "impact": enriched.get("impact", "N/A"),
+                            "category": enriched.get("category", "General"),
+                            "summary": enriched.get("summary", ""),
+                            "pdf_link": enriched.get("pdf_link", ""),
+                            "news_time": enriched.get("news_time"),
+                        })
             except Exception as e:
                 logger.warning("  [%s/%s] Enrichment/UI save failed: %s", i, total, e)
         else:
