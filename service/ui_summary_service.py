@@ -52,7 +52,7 @@ UI_SUMMARY_MODEL = os.getenv("UI_SUMMARY_MODEL", "gpt-4.1-mini").strip() or "gpt
 # LLM target length: aim well under the 800-char hard send cap.
 UI_SUMMARY_TARGET_CHARS = max(400, min(int(os.getenv("UI_SUMMARY_TARGET_CHARS", "750")), 2500))
 # Market cap threshold for digest inclusion (Crores).
-UI_SUMMARY_MIN_MARKET_CAP_CR: float = float(os.getenv("UI_SUMMARY_MIN_MARKET_CAP_CR", "9000"))
+UI_SUMMARY_MIN_MARKET_CAP_CR: float = float(os.getenv("UI_SUMMARY_MIN_MARKET_CAP_CR", "2500"))
 
 _DIGEST_SYSTEM = """You write a WhatsApp market digest for Indian equity investors.
 
