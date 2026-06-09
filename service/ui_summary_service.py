@@ -5,8 +5,8 @@ Slot key stored in DB: ``14.30``.
 Window: previous day 14:30 → today 14:30 IST (exclusive start, inclusive end),
 covering a clean 24-hour trading day.
 
-Only STRONGLY POSITIVE, BEAT, and STRONGLY NEGATIVE rows from ui_data are used,
-filtered further to companies with market cap ≥ 9,000 Cr.
+Uses all non-neutral ui_data rows in the window (ui_data already excludes
+NEUTRAL / N/A / MATCHED at ingest). Optional market cap floor: UI_SUMMARY_MIN_MARKET_CAP_CR.
 
 Minimum observations: 1 (runs whenever at least one qualifying stock exists).
 Hard cap on digest text: 800 characters to stay safe under WhatsApp template limits.
@@ -155,20 +155,24 @@ def _impact_upper_from_ui_row(row: Dict[str, Any]) -> str:
 
 def row_is_high_signal_for_ui_digest(row: Dict[str, Any]) -> bool:
     """
-    Quick pulse digest: only material impacts (aligned with broadcast “signal”
-    labels, without market-cap side conditions).
+    Quick pulse digest: include any row already stored in ui_data (non-low-impact
+    at ingest). Exclude only immaterial / neutral-style impacts.
 
-    Includes: STRONGLY POSITIVE, BEAT, STRONGLY NEGATIVE.
-    Excludes: POSITIVE/NEGATIVE without STRONGLY, NEUTRAL, MATCHED, MISSED, N/A, etc.
+    Includes: STRONGLY POSITIVE, BEAT, STRONGLY NEGATIVE, POSITIVE, NEGATIVE,
+    MISSED, and similar directional tags.
+    Excludes: NEUTRAL, N/A, MATCHED, IMMATERIAL (and variants like LIKELY NEUTRAL).
     """
     imp = _impact_upper_from_ui_row(row)
     if not imp:
         return False
-    if "STRONGLY POSITIVE" in imp or imp == "BEAT":
-        return True
-    if "STRONGLY NEGATIVE" in imp:
-        return True
-    return False
+    if imp in ("N/A", "MATCHED", "NEUTRAL", "IMMATERIAL"):
+        return False
+    if "IMMATERIAL" in imp or "N/A" in imp or "MATCHED" in imp:
+        return False
+    # e.g. LIKELY NEUTRAL, MOSTLY NEUTRAL — but not STRONGLY NEGATIVE
+    if "NEUTRAL" in imp and "STRONGLY NEGATIVE" not in imp:
+        return False
+    return True
 
 
 def _market_cap_for_row(row: Dict[str, Any]) -> Optional[float]:
@@ -388,6 +392,12 @@ def run_daily_summary(briefing_day: date) -> None:
         w_end.isoformat(),
         UI_SUMMARY_MIN_MARKET_CAP_CR,
     )
+    if n == 0 and rows_all:
+        logger.info(
+            "ui_summary daily: digest filter excluded all %s row(s); impacts=%s",
+            len(rows_all),
+            [_impact_upper_from_ui_row(r) for r in rows_all],
+        )
     if n < UI_SUMMARY_MIN_OBSERVATIONS:
         if _insert_summary_row(
             slot,

@@ -3,6 +3,7 @@ import logging
 from typing import List, Optional
 
 from database import get_conn
+from service.subscription_service import PAID_USER_EXISTS_SQL
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -218,18 +219,26 @@ class WatchlistService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # Get all users who want all updates (instant lookup from denormalized table)
-                    cur.execute("SELECT phone FROM users_receive_all_updates")
+                    # Get all paid users who want all updates
+                    cur.execute(
+                        f"""
+                        SELECT r.phone
+                        FROM users_receive_all_updates r
+                        JOIN users u ON u.id = r.user_id
+                        WHERE {PAID_USER_EXISTS_SQL}
+                        """
+                    )
                     all_updates_phones = [row[0] for row in cur.fetchall()]
                     
                     # Get users who have this stock in their watchlist
                     cur.execute(
-                        """
+                        f"""
                         SELECT DISTINCT u.phone
                         FROM users u
                         INNER JOIN user_watchlist w ON w.user_id = u.id
                         WHERE u.is_active = TRUE
                           AND w.bse_scrip_code = %s
+                          AND {PAID_USER_EXISTS_SQL}
                         """,
                         (bse_scrip_code,),
                     )
@@ -250,17 +259,18 @@ class WatchlistService:
         announcements — these are only sent to users who explicitly
         follow the stock, NOT to receive_all_updates users.
 
-        Only active users are included.
+        Only active paid users are included.
         """
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT DISTINCT u.phone
                     FROM users u
                     INNER JOIN user_watchlist w ON w.user_id = u.id
                     WHERE u.is_active = TRUE
                       AND w.bse_scrip_code = %s
+                      AND {PAID_USER_EXISTS_SQL}
                     """,
                     (bse_scrip_code,),
                 )

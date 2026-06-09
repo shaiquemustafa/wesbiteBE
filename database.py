@@ -381,6 +381,65 @@ def _ensure_tables(conn):
             """
         )
 
+        # ── Subscriptions & payments (₹199/month manual renewal) ──
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_subscriptions (
+                user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(20) NOT NULL DEFAULT 'inactive',
+                plan_id VARCHAR(50) NOT NULL DEFAULT 'monthly_199',
+                current_period_start TIMESTAMPTZ,
+                current_period_end TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_subscriptions_period_end
+                ON user_subscriptions (current_period_end);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_transactions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                razorpay_order_id VARCHAR(100) UNIQUE,
+                razorpay_payment_id VARCHAR(100) UNIQUE,
+                amount_paise INT NOT NULL,
+                currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+                status VARCHAR(30) NOT NULL DEFAULT 'created',
+                paid_at TIMESTAMPTZ,
+                period_start TIMESTAMPTZ,
+                period_end TIMESTAMPTZ,
+                raw_payload JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_payment_transactions_user_id
+                ON payment_transactions (user_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_payment_transactions_order_id
+                ON payment_transactions (razorpay_order_id);
+            """
+        )
+        # Default every existing user to unpaid (inactive subscription row).
+        cur.execute(
+            """
+            INSERT INTO user_subscriptions (user_id, status)
+            SELECT id, 'inactive' FROM users
+            ON CONFLICT (user_id) DO NOTHING;
+            """
+        )
+
         # Lightweight table for low-impact watchlist notifications
         # (N/A, NEUTRAL, MATCHED — no Indian API enrichment, just OpenAI summary)
         cur.execute(

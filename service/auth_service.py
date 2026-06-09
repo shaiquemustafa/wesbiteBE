@@ -235,8 +235,17 @@ class AuthService:
                     )
                     new_row = cur.fetchone()
                     user_id = new_row[0]
+
+                    cur.execute(
+                        """
+                        INSERT INTO user_subscriptions (user_id, status)
+                        VALUES (%s, 'inactive')
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (user_id,),
+                    )
                     
-                    # Add to users_receive_all_updates table (new users default to receive_all_updates = TRUE)
+                    # Add to users_receive_all_updates table
                     cur.execute(
                         """
                         INSERT INTO users_receive_all_updates (phone, user_id)

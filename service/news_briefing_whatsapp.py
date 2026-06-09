@@ -20,6 +20,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from database import get_conn
+from service.subscription_service import PAID_USER_EXISTS_SQL
 from service.whatsapp_service import (
     NEWS_BRIEFING_WATCHLIST_TEMPLATE_ID,
     RITO_WEBSITE_URL,
@@ -172,12 +173,13 @@ def fetch_watchers_for_scrip(bse_scrip: int) -> List[Tuple[str, str]]:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT u.phone, u.name
                     FROM user_watchlist w
                     JOIN users u ON u.id = w.user_id
                     WHERE w.bse_scrip_code = %s
                       AND (u.is_active IS NULL OR u.is_active = TRUE)
+                      AND {PAID_USER_EXISTS_SQL}
                     """,
                     (bse_scrip,),
                 )

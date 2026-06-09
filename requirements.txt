@@ -18,3 +18,4 @@ rapidfuzz
 truststore
 trafilatura
 ftfy
+razorpay

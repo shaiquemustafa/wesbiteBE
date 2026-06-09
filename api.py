@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import json
 import logging
+import razorpay
 
 from announcements import fetch_and_filter_announcements
 from results import _process_single_announcement, _impact_map
@@ -31,6 +32,8 @@ from service.company_service import CompanyService
 from service.auth_service import AuthService
 from service.notification_service import NotificationService
 from service.watchlist_service import WatchlistService
+from service.subscription_service import SubscriptionService
+from service.payment_service import PaymentService
 from service.whatsapp_service import WhatsAppService
 from entity.ui_data import UIDataItem
 from typing import Any, Dict, List, Optional, Tuple
@@ -1582,7 +1585,8 @@ def store_ui_data(data_item: UIDataItem):
 
 
 @app.get("/ui-data/today", summary="Fetch latest UI data for the current date")
-def get_todays_ui_data():
+def get_todays_ui_data(authorization: Optional[str] = Header(None)):
+    _require_paid_user(authorization)
     target_date = _now_ist_naive()
     ui_service = UIDataService()
     try:
@@ -1964,6 +1968,89 @@ def _get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     return decoded
 
 
+def _require_paid_user(authorization: Optional[str] = Header(None)) -> dict:
+    """JWT + active subscription required for paid features."""
+    decoded = _get_current_user(authorization)
+    sub = SubscriptionService.get_subscription(decoded["user_id"])
+    if not sub["is_paid"]:
+        raise HTTPException(
+            status_code=402,
+            detail="Active subscription required. Please subscribe to continue.",
+        )
+    decoded["subscription"] = sub
+    return decoded
+
+
+class VerifyPaymentRequest(BaseModel):
+    order_id: str
+    payment_id: str
+    signature: str
+
+
+@app.get("/api/payment/config", summary="Public Razorpay checkout config")
+def get_payment_config():
+    """Returns key id and plan amount for the frontend checkout."""
+    if not PaymentService.is_configured():
+        raise HTTPException(status_code=503, detail="Payment gateway is not configured.")
+    return PaymentService.public_config()
+
+
+@app.post("/api/payment/create-order", summary="Create Razorpay order for subscription")
+def create_payment_order(authorization: Optional[str] = Header(None)):
+    decoded = _get_current_user(authorization)
+    try:
+        payment_service = PaymentService()
+        order = payment_service.create_order(decoded["user_id"])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("Failed to create Razorpay order for user %s", decoded["user_id"])
+        raise HTTPException(status_code=502, detail="Failed to create payment order.")
+    return order
+
+
+@app.post("/api/payment/verify", summary="Verify Razorpay payment and activate subscription")
+def verify_payment(body: VerifyPaymentRequest, authorization: Optional[str] = Header(None)):
+    decoded = _get_current_user(authorization)
+    try:
+        payment_service = PaymentService()
+        subscription = payment_service.verify_checkout_payment(
+            decoded["user_id"],
+            body.order_id,
+            body.payment_id,
+            body.signature,
+        )
+    except razorpay.errors.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid payment signature.")
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("Payment verification failed for user %s", decoded["user_id"])
+        raise HTTPException(status_code=502, detail="Payment verification failed.")
+    return {"success": True, "subscription": subscription}
+
+
+@app.get("/api/subscription/me", summary="Get current user's subscription status")
+def get_my_subscription(authorization: Optional[str] = Header(None)):
+    decoded = _get_current_user(authorization)
+    return SubscriptionService.get_subscription(decoded["user_id"])
+
+
+@app.post("/api/webhooks/razorpay", summary="Razorpay payment webhook")
+async def razorpay_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    payment_service = PaymentService()
+    if not payment_service.verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    result = payment_service.handle_webhook_event(payload)
+    return {"status": "ok", **result}
+
+
 @app.post("/api/auth/send-otp", summary="Send OTP to WhatsApp number")
 async def send_otp(body: SendOTPRequest):
     """
@@ -1996,6 +2083,7 @@ def verify_otp(body: VerifyOTPRequest):
         "token": result["token"],
         "is_new_user": result["is_new_user"],
         "user": result["user"],
+        "subscription": SubscriptionService.get_subscription(result["user"]["id"]),
     }
 
 
@@ -2166,7 +2254,8 @@ def get_me(authorization: Optional[str] = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    return {"user": user}
+    subscription = SubscriptionService.get_subscription(user["id"])
+    return {"user": user, "subscription": subscription}
 
 
 @app.put("/api/auth/me/name", summary="Update user display name")

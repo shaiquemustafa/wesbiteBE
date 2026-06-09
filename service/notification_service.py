@@ -7,6 +7,7 @@ from typing import List
 from psycopg2.extras import Json
 
 from database import get_conn
+from service.subscription_service import PAID_USER_EXISTS_SQL
 from service.whatsapp_service import WhatsAppService
 from service.watchlist_service import WatchlistService
 
@@ -42,9 +43,10 @@ class NotificationService:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT phone FROM users
+                    f"""
+                    SELECT phone FROM users u
                     WHERE is_active = TRUE AND receive_all_updates = TRUE
+                      AND {PAID_USER_EXISTS_SQL}
                     """
                 )
                 return [row[0] for row in cur.fetchall()]
