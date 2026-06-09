@@ -381,7 +381,7 @@ def _ensure_tables(conn):
             """
         )
 
-        # ── Subscriptions & payments (₹199/month manual renewal) ──
+        # ── Subscriptions & payments (₹19/month test price — set SUBSCRIPTION_AMOUNT_PAISE) ──
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS user_subscriptions (
@@ -439,6 +439,37 @@ def _ensure_tables(conn):
             ON CONFLICT (user_id) DO NOTHING;
             """
         )
+        # TEST ONLY: keep one user unpaid; grant active access to everyone else.
+        # Clear SUBSCRIPTION_TEST_UNPAID_USER_ID on Render when testing is done.
+        _test_unpaid_raw = (os.getenv("SUBSCRIPTION_TEST_UNPAID_USER_ID", "96") or "").strip()
+        if _test_unpaid_raw:
+            _test_unpaid_uid = int(_test_unpaid_raw)
+            cur.execute(
+                """
+                UPDATE user_subscriptions
+                SET status = 'active',
+                    current_period_start = COALESCE(current_period_start, NOW()),
+                    current_period_end = NOW() + INTERVAL '30 days',
+                    updated_at = NOW()
+                WHERE user_id != %s
+                """,
+                (_test_unpaid_uid,),
+            )
+            cur.execute(
+                """
+                UPDATE user_subscriptions
+                SET status = 'inactive',
+                    current_period_start = NULL,
+                    current_period_end = NULL,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                  AND NOT EXISTS (
+                    SELECT 1 FROM payment_transactions pt
+                    WHERE pt.user_id = %s AND pt.status = 'captured'
+                  )
+                """,
+                (_test_unpaid_uid, _test_unpaid_uid),
+            )
 
         # Lightweight table for low-impact watchlist notifications
         # (N/A, NEUTRAL, MATCHED — no Indian API enrichment, just OpenAI summary)

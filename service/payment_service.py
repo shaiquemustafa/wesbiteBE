@@ -38,7 +38,7 @@ class PaymentService:
             "amount_inr": AMOUNT_PAISE // 100,
             "amount_paise": AMOUNT_PAISE,
             "currency": "INR",
-            "plan_id": os.getenv("SUBSCRIPTION_PLAN_ID", "monthly_199"),
+            "plan_id": os.getenv("SUBSCRIPTION_PLAN_ID", "monthly_19"),
         }
 
     def create_order(self, user_id: int) -> Dict[str, Any]:
@@ -51,7 +51,7 @@ class PaymentService:
                 "amount": AMOUNT_PAISE,
                 "currency": "INR",
                 "receipt": receipt,
-                "notes": {"user_id": str(user_id), "plan": "monthly_199"},
+                "notes": {"user_id": str(user_id), "plan": "monthly_19"},
             }
         )
         order_id = order["id"]
