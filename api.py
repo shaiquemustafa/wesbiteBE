@@ -2136,7 +2136,10 @@ async def razorpay_webhook(request: Request):
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    event = payload.get("event", "")
+    logger.info("Razorpay webhook received: event=%s", event)
     result = payment_service.handle_webhook_event(payload)
+    logger.info("Razorpay webhook handled: event=%s result=%s", event, result)
     return {"status": "ok", **result}
 
 

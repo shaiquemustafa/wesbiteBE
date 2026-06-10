@@ -1,6 +1,8 @@
 # service/payment_service.py – Razorpay Orders API integration
+import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -17,6 +19,26 @@ logger = logging.getLogger("uvicorn.error")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+_AGENT_DEBUG_LOG = "/Users/shaiquemustafa/Documents/webapp/.cursor/debug-64124d.log"
+
+
+def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str = "") -> None:
+    # #region agent log
+    entry = {
+        "sessionId": "64124d",
+        "timestamp": int(time.time() * 1000),
+        "location": location,
+        "message": message,
+        "data": data,
+        "hypothesisId": hypothesis_id,
+    }
+    try:
+        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+    logger.info("agent-debug %s", json.dumps(entry))
+    # #endregion
 
 
 class PaymentService:
@@ -96,11 +118,33 @@ class PaymentService:
     def verify_webhook_signature(self, body: bytes, signature: str) -> bool:
         if not RAZORPAY_WEBHOOK_SECRET:
             logger.error("RAZORPAY_WEBHOOK_SECRET not set — rejecting webhook.")
+            _agent_debug_log(
+                "payment_service.py:verify_webhook_signature",
+                "webhook secret missing",
+                {"has_signature": bool(signature)},
+                "H1",
+            )
             return False
+        body_str = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
         try:
-            self.client.utility.verify_webhook_signature(body, signature, RAZORPAY_WEBHOOK_SECRET)
+            # Razorpay SDK expects str; bytes(body, 'utf-8') raises TypeError.
+            self.client.utility.verify_webhook_signature(
+                body_str, signature, RAZORPAY_WEBHOOK_SECRET
+            )
+            _agent_debug_log(
+                "payment_service.py:verify_webhook_signature",
+                "webhook signature ok",
+                {"body_type": type(body).__name__, "body_len": len(body_str)},
+                "H1",
+            )
             return True
         except razorpay.errors.SignatureVerificationError:
+            _agent_debug_log(
+                "payment_service.py:verify_webhook_signature",
+                "webhook signature rejected",
+                {"body_len": len(body_str), "has_signature": bool(signature)},
+                "H1",
+            )
             return False
 
     def handle_webhook_event(self, payload: dict) -> Dict[str, Any]:
@@ -163,5 +207,16 @@ class PaymentService:
             razorpay_payment_id=payment_id,
             paid_at=paid_at,
             raw_payload=raw_payload,
+        )
+        _agent_debug_log(
+            "payment_service.py:_handle_payment_captured",
+            "subscription activated via webhook",
+            {
+                "order_id": order_id,
+                "payment_id": payment_id,
+                "user_id": int(user_id),
+                "is_paid": subscription.get("is_paid"),
+            },
+            "H5",
         )
         return {"handled": True, "event": "payment.captured", "subscription": subscription}
