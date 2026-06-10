@@ -16,7 +16,10 @@ BILLING_REMINDER_JOB_NAME = "billing_reminder_daily"
 
 BILLING_REMINDER_PARAM1 = os.getenv("BILLING_REMINDER_PARAM1", "User")
 BILLING_REMINDER_PARAM2_AMOUNT = os.getenv("BILLING_REMINDER_PARAM2_AMOUNT", "199")
-BILLING_REMINDER_PARAM3_LINK = os.getenv("BILLING_REMINDER_PARAM3_LINK", "rito-billing")
+BILLING_REMINDER_PARAM3_LINK = os.getenv(
+    "BILLING_REMINDER_PARAM3_LINK",
+    "https://rito.co.in/#billing",
+)
 
 
 def _today_ist() -> date:
