@@ -10,8 +10,8 @@ from database import get_conn
 
 logger = logging.getLogger("uvicorn.error")
 
-PLAN_ID = os.getenv("SUBSCRIPTION_PLAN_ID", "monthly_19")
-AMOUNT_PAISE = int(os.getenv("SUBSCRIPTION_AMOUNT_PAISE", "1900"))
+PLAN_ID = os.getenv("SUBSCRIPTION_PLAN_ID", "monthly_199")
+AMOUNT_PAISE = int(os.getenv("SUBSCRIPTION_AMOUNT_PAISE", "19900"))
 PERIOD_DAYS = int(os.getenv("SUBSCRIPTION_PERIOD_DAYS", "30"))
 
 # SQL fragment: user u must be joined; checks paid access at query time.

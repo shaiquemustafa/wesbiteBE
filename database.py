@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import logging
 from contextlib import contextmanager
 from dotenv import load_dotenv
 import psycopg2
@@ -8,6 +9,8 @@ from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import register_default_jsonb
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -381,7 +384,7 @@ def _ensure_tables(conn):
             """
         )
 
-        # ── Subscriptions & payments (₹19/month test price — set SUBSCRIPTION_AMOUNT_PAISE) ──
+        # ── Subscriptions & payments (₹199/month — override via SUBSCRIPTION_AMOUNT_PAISE) ──
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS user_subscriptions (
@@ -472,37 +475,6 @@ def _ensure_tables(conn):
             ON CONFLICT (user_id) DO NOTHING;
             """
         )
-        # TEST ONLY: keep one user unpaid; grant active access to everyone else.
-        # Clear SUBSCRIPTION_TEST_UNPAID_USER_ID on Render when testing is done.
-        _test_unpaid_raw = (os.getenv("SUBSCRIPTION_TEST_UNPAID_USER_ID", "96") or "").strip()
-        if _test_unpaid_raw:
-            _test_unpaid_uid = int(_test_unpaid_raw)
-            cur.execute(
-                """
-                UPDATE user_subscriptions
-                SET status = 'active',
-                    current_period_start = COALESCE(current_period_start, NOW()),
-                    current_period_end = NOW() + INTERVAL '30 days',
-                    updated_at = NOW()
-                WHERE user_id != %s
-                """,
-                (_test_unpaid_uid,),
-            )
-            cur.execute(
-                """
-                UPDATE user_subscriptions
-                SET status = 'inactive',
-                    current_period_start = NULL,
-                    current_period_end = NOW() - INTERVAL '1 day',
-                    updated_at = NOW()
-                WHERE user_id = %s
-                  AND NOT EXISTS (
-                    SELECT 1 FROM payment_transactions pt
-                    WHERE pt.user_id = %s AND pt.status = 'captured'
-                  )
-                """,
-                (_test_unpaid_uid, _test_unpaid_uid),
-            )
 
         # Lightweight table for low-impact watchlist notifications
         # (N/A, NEUTRAL, MATCHED — no Indian API enrichment, just OpenAI summary)
@@ -565,6 +537,57 @@ def _ensure_tables(conn):
             );
             """
         )
+
+        # One-time production rollout: all users inactive, period ended 10 Jun 2026 IST
+        # so billing reminders start from 11 Jun. Runs once (tracked in scheduled_jobs).
+        _ROLLOUT_JOB = "subscription_production_rollout_20260610"
+        cur.execute(
+            "SELECT 1 FROM scheduled_jobs WHERE job_name = %s AND last_status = 'completed'",
+            (_ROLLOUT_JOB,),
+        )
+        if cur.fetchone() is None:
+            cur.execute(
+                """
+                UPDATE user_subscriptions
+                SET status = 'inactive',
+                    plan_id = 'monthly_199',
+                    current_period_start = NULL,
+                    current_period_end = TIMESTAMPTZ '2026-06-10 18:29:59+00',
+                    last_billing_reminder_at = NULL,
+                    updated_at = NOW()
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO user_subscriptions (
+                    user_id, status, plan_id, current_period_start, current_period_end
+                )
+                SELECT u.id, 'inactive', 'monthly_199', NULL,
+                       TIMESTAMPTZ '2026-06-10 18:29:59+00'
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM user_subscriptions s WHERE s.user_id = u.id
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO scheduled_jobs (job_name, last_run_at, last_status, last_meta)
+                VALUES (%s, NOW(), 'completed', %s::jsonb)
+                ON CONFLICT (job_name) DO UPDATE
+                SET last_run_at = EXCLUDED.last_run_at,
+                    last_status = EXCLUDED.last_status,
+                    last_meta = EXCLUDED.last_meta,
+                    updated_at = NOW()
+                """,
+                (
+                    _ROLLOUT_JOB,
+                    '{"period_end": "2026-06-10T23:59:59+05:30", "amount_inr": 199}',
+                ),
+            )
+            logger.info(
+                "Subscription production rollout applied: all users inactive, period_end=2026-06-10 IST"
+            )
 
         # WhatsApp broadcast table (filtered bulk messages for all users)
         # Stores only: STRONGLY POSITIVE (all >2,500 Cr), STRONGLY NEGATIVE (>10K Cr), FINANCIAL RESULTS. Regular NEGATIVE is excluded.
