@@ -62,6 +62,12 @@ QUICK_PULSE_DIGEST_TEMPLATE_ID = os.getenv(
     "QUICK_PULSE_DIGEST_TEMPLATE_ID",
     "7c89e101-59c3-4f96-9384-84e7b4c5b560",
 ).strip() or "7c89e101-59c3-4f96-9384-84e7b4c5b560"
+
+# Billing / subscription payment reminder (utility)
+BILLING_REMINDER_TEMPLATE_ID = os.getenv(
+    "BILLING_REMINDER_TEMPLATE_ID",
+    "8f4fdaa7-0abe-49ed-a7d3-05b56591d95d",
+).strip() or "8f4fdaa7-0abe-49ed-a7d3-05b56591d95d"
 WHATSAPP_DIGEST_PARAM2_MAX_CHARS = max(
     200, min(int(os.getenv("WHATSAPP_DIGEST_PARAM2_MAX_CHARS", "800")), 16000)
 )
@@ -719,6 +725,17 @@ class WhatsAppService:
             result["sent"], result["failed"], result["total"], elapsed,
         )
         return result
+
+    def send_billing_reminder_message(self, phone: str, template_obj: dict) -> bool:
+        """Send one billing reminder template message."""
+        return self._send_one_template(phone, template_obj, "Billing Reminder")
+
+    def send_billing_reminder_messages(
+        self, jobs: Iterable[tuple[str, dict]]
+    ) -> dict:
+        """Parallel billing reminder sends. Each job is (phone, template_obj)."""
+        fan_jobs = [(p, t, "Billing Reminder") for p, t in jobs]
+        return self._fan_out_template_sends(fan_jobs)
 
     def send_template_message(self, phone: str, template_name: str, parameters: list = None) -> bool:
         """

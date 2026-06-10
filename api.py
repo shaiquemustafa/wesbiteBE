@@ -34,6 +34,15 @@ from service.notification_service import NotificationService
 from service.watchlist_service import WatchlistService
 from service.subscription_service import SubscriptionService
 from service.payment_service import PaymentService
+from service.billing_reminder_service import (
+    BILLING_REMINDER_JOB_NAME,
+    already_ran_daily_job_today_ist,
+    evaluate_user_for_send,
+    fetch_unpaid_users,
+    run_billing_reminder_broadcast,
+    send_billing_reminder_to_user,
+    stamp_daily_job_run,
+)
 from service.whatsapp_service import WhatsAppService
 from entity.ui_data import UIDataItem
 from typing import Any, Dict, List, Optional, Tuple
@@ -200,6 +209,7 @@ logger = logging.getLogger("uvicorn.error")
 _scheduler_task: asyncio.Task | None = None
 _news_briefing_scheduler_task: asyncio.Task | None = None
 _ui_summary_scheduler_task: asyncio.Task | None = None
+_billing_reminder_scheduler_task: asyncio.Task | None = None
 _news_briefing_job_lock = asyncio.Lock()
 _ui_summary_job_lock = asyncio.Lock()
 
@@ -814,6 +824,11 @@ NEWS_BRIEFING_AUTO_SCHEDULE = os.getenv("NEWS_BRIEFING_AUTO_SCHEDULE", "true").l
 NEWS_BRIEFING_SLOT_GRACE_MIN = int(os.getenv("NEWS_BRIEFING_SLOT_GRACE_MIN", "12"))
 UI_SUMMARY_AUTO_SCHEDULE = _env_bool("UI_SUMMARY_AUTO_SCHEDULE", True)
 UI_SUMMARY_SLOT_GRACE_MIN = int(os.getenv("UI_SUMMARY_SLOT_GRACE_MIN", "5"))
+BILLING_REMINDER_AUTO_SCHEDULE = _env_bool("BILLING_REMINDER_AUTO_SCHEDULE", True)
+BILLING_REMINDER_HOUR = int(os.getenv("BILLING_REMINDER_HOUR", "9"))
+BILLING_REMINDER_MINUTE = int(os.getenv("BILLING_REMINDER_MINUTE", "15"))
+BILLING_REMINDER_GRACE_MIN = int(os.getenv("BILLING_REMINDER_GRACE_MIN", "15"))
+_billing_reminder_job_lock = asyncio.Lock()
 _NEWS_BRIEFING_IST_SLOTS: Tuple[Tuple[str, int, int], ...] = (
     ("pre_market", 8, 30),
     ("during_market", 15, 30),
@@ -982,9 +997,71 @@ async def _ui_summary_scheduler_loop():
             await asyncio.sleep(60)
 
 
+# ---------------------------------------------------------------------------
+# Billing reminder (IST) — daily 09:15 unpaid-user payment nudges
+# ---------------------------------------------------------------------------
+def _next_billing_reminder_slot_strictly_after(now_ist: datetime) -> datetime:
+    hh = max(0, min(BILLING_REMINDER_HOUR, 23))
+    mm = max(0, min(BILLING_REMINDER_MINUTE, 59))
+    d = now_ist.date()
+    slot_today = datetime.combine(d, time(hh, mm, 0))
+    if slot_today > now_ist:
+        return slot_today
+    return datetime.combine(d + timedelta(days=1), time(hh, mm, 0))
+
+
+async def _run_billing_reminder_daily_job() -> dict:
+    async with _billing_reminder_job_lock:
+        if already_ran_daily_job_today_ist():
+            return {"skipped": True, "reason": "already_ran_today"}
+        try:
+            result = await asyncio.to_thread(run_billing_reminder_broadcast)
+            stamp_daily_job_run("success", result)
+            return result
+        except Exception as e:
+            stamp_daily_job_run("failed", {"error": str(e)})
+            raise
+
+
+async def _billing_reminder_scheduler_loop():
+    grace = timedelta(minutes=max(1, BILLING_REMINDER_GRACE_MIN))
+    logger.info(
+        "Billing-reminder auto-scheduler ON (slot=%02d:%02d IST, grace=%s min).",
+        BILLING_REMINDER_HOUR,
+        BILLING_REMINDER_MINUTE,
+        grace.total_seconds() / 60,
+    )
+    await asyncio.sleep(25)
+    while True:
+        try:
+            now = _now_ist_naive()
+            hh = max(0, min(BILLING_REMINDER_HOUR, 23))
+            mm = max(0, min(BILLING_REMINDER_MINUTE, 59))
+            slot_dt = datetime.combine(now.date(), time(hh, mm, 0))
+            if slot_dt <= now <= slot_dt + grace:
+                if not already_ran_daily_job_today_ist():
+                    logger.info(
+                        "💳 Auto billing reminder: IST=%s",
+                        now.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    await _run_billing_reminder_daily_job()
+                await asyncio.sleep(2)
+                continue
+
+            next_t = _next_billing_reminder_slot_strictly_after(now)
+            delay = (next_t - now).total_seconds()
+            delay = max(5.0, min(delay, 86400 * 2))
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("billing_reminder scheduler error: %s", e)
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler_task, _news_briefing_scheduler_task, _ui_summary_scheduler_task
+    global _scheduler_task, _news_briefing_scheduler_task, _ui_summary_scheduler_task, _billing_reminder_scheduler_task
     connect_to_db()
 
     # Start the background scheduler
@@ -1004,6 +1081,12 @@ async def lifespan(app: FastAPI):
         logger.info("UI-summary auto-scheduler started (sleep-until-next-slot).")
     else:
         logger.info("UI-summary auto-scheduler OFF (UI_SUMMARY_AUTO_SCHEDULE=false).")
+
+    if BILLING_REMINDER_AUTO_SCHEDULE:
+        _billing_reminder_scheduler_task = asyncio.create_task(_billing_reminder_scheduler_loop())
+        logger.info("Billing-reminder auto-scheduler started (sleep-until-next-slot).")
+    else:
+        logger.info("Billing-reminder auto-scheduler OFF (BILLING_REMINDER_AUTO_SCHEDULE=false).")
 
     # Kick the periodic 'user_training' broadcast off immediately on boot so
     # a fresh deploy doesn't have to wait for the next scheduler tick. The
@@ -1044,6 +1127,12 @@ async def lifespan(app: FastAPI):
         _ui_summary_scheduler_task.cancel()
         try:
             await _ui_summary_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if _billing_reminder_scheduler_task:
+        _billing_reminder_scheduler_task.cancel()
+        try:
+            await _billing_reminder_scheduler_task
         except asyncio.CancelledError:
             pass
     close_db_connection()
@@ -2634,6 +2723,122 @@ def user_training_status():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read user_training status: {e}")
+
+
+@app.post(
+    "/api/admin/billing-reminder/run",
+    summary="[ADMIN] Run billing reminder job (respects cadence unless force=true)",
+)
+async def admin_run_billing_reminder(
+    dry_run: bool = Query(False, description="Preview who would receive a reminder today."),
+    force: bool = Query(False, description="Ignore cadence spacing and send to all unpaid in scope."),
+    user_id: Optional[int] = Query(None, description="Optional single user id (e.g. 96 for testing)."),
+):
+    user_ids = [user_id] if user_id is not None else None
+    try:
+        if user_id is not None and force and not dry_run:
+            result = await asyncio.to_thread(
+                send_billing_reminder_to_user, user_id, force=True
+            )
+            return {"message": "Billing reminder sent to single user.", **result}
+        result = await asyncio.to_thread(
+            run_billing_reminder_broadcast,
+            user_ids=user_ids,
+            force=force,
+            dry_run=dry_run,
+        )
+        if not dry_run and user_id is None and not force:
+            stamp_daily_job_run("success", result)
+        return {"message": "Billing reminder job complete.", **result}
+    except Exception as e:
+        logger.exception("billing reminder admin run failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/admin/billing-reminder/send-me",
+    summary="[ADMIN] Send billing reminder template to user 96 (test)",
+)
+async def admin_send_billing_reminder_to_me(
+    user_id: int = Query(96, description="Target user id (default 96)."),
+):
+    """Force-send billing reminder to one user, bypassing cadence."""
+    try:
+        result = await asyncio.to_thread(send_billing_reminder_to_user, user_id, force=True)
+        if result.get("message") and result.get("sent", 0) == 0:
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": f"Billing reminder sent to user {user_id}.", **result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("billing reminder send-me failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/billing-reminder/send-me",
+    summary="Send billing reminder to the logged-in user (test)",
+)
+def send_billing_reminder_to_current_user(authorization: Optional[str] = Header(None)):
+    """Force-send billing reminder to the authenticated user."""
+    decoded = _get_current_user(authorization)
+    result = send_billing_reminder_to_user(decoded["user_id"], force=True)
+    if result.get("message") and result.get("sent", 0) == 0:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return {"message": "Billing reminder send attempted.", **result}
+
+
+@app.get(
+    "/api/admin/billing-reminder/preview",
+    summary="[ADMIN] Preview billing reminder cadence for unpaid users",
+)
+def admin_preview_billing_reminder(
+    user_id: Optional[int] = Query(None, description="Optional single user id."),
+):
+    users = fetch_unpaid_users(user_ids=[user_id] if user_id is not None else None)
+    evaluations = [evaluate_user_for_send(u) for u in users]
+    due = [e for e in evaluations if e.get("should_send")]
+    return {
+        "total_unpaid": len(users),
+        "due_today": len(due),
+        "evaluations": evaluations,
+    }
+
+
+@app.get(
+    "/api/admin/billing-reminder/status",
+    summary="[ADMIN] Last billing reminder daily job run",
+)
+def admin_billing_reminder_status():
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT last_run_at, last_status, last_meta, updated_at
+                    FROM scheduled_jobs WHERE job_name = %s
+                    """,
+                    (BILLING_REMINDER_JOB_NAME,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return {
+                "job_name": BILLING_REMINDER_JOB_NAME,
+                "slot_ist": f"{BILLING_REMINDER_HOUR:02d}:{BILLING_REMINDER_MINUTE:02d}",
+                "last_run_at": None,
+                "last_status": None,
+            }
+        last_run_at, last_status, last_meta, updated_at = row
+        return {
+            "job_name": BILLING_REMINDER_JOB_NAME,
+            "slot_ist": f"{BILLING_REMINDER_HOUR:02d}:{BILLING_REMINDER_MINUTE:02d}",
+            "last_run_at": last_run_at.isoformat() if last_run_at else None,
+            "last_status": last_status,
+            "last_meta": last_meta,
+            "updated_at": updated_at.isoformat() if updated_at else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/admin/send-pending-broadcasts", summary="[ADMIN] Send notifications for unsent whatsapp_broadcast entries")

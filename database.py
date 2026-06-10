@@ -402,6 +402,39 @@ def _ensure_tables(conn):
         )
         cur.execute(
             """
+            ALTER TABLE user_subscriptions
+            ADD COLUMN IF NOT EXISTS last_billing_reminder_at TIMESTAMPTZ;
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_reminder_log (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                phone VARCHAR(20) NOT NULL,
+                template_id VARCHAR(100),
+                days_since_expiry INT,
+                cadence_phase VARCHAR(30),
+                status VARCHAR(20) NOT NULL DEFAULT 'sent',
+                raw_payload JSONB,
+                sent_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_billing_reminder_log_user_sent
+                ON billing_reminder_log (user_id, sent_at DESC);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_billing_reminder_log_sent_date
+                ON billing_reminder_log (sent_at);
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS payment_transactions (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -460,7 +493,7 @@ def _ensure_tables(conn):
                 UPDATE user_subscriptions
                 SET status = 'inactive',
                     current_period_start = NULL,
-                    current_period_end = NULL,
+                    current_period_end = NOW() - INTERVAL '1 day',
                     updated_at = NOW()
                 WHERE user_id = %s
                   AND NOT EXISTS (
