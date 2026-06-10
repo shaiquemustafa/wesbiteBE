@@ -1,10 +1,19 @@
-from typing import List, Dict, Any, Optional
+import os
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import ValidationError, TypeAdapter
 from datetime import datetime, timedelta
 from psycopg2.extras import execute_values, Json
 
 from database import get_conn
 from entity.ui_data import UIDataItem
+
+# Keep in sync with api.py cleanup / feed behaviour.
+UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD = max(
+    1, min(int(os.getenv("UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD", "3")), 500)
+)
+UI_DATA_MIN_OLD_CYCLE_ROWS = max(
+    0, min(int(os.getenv("UI_DATA_MIN_OLD_CYCLE_ROWS", "2")), 500)
+)
 
 
 def ui_data_cycle_start_ist(now_ist_naive: datetime) -> datetime:
@@ -134,31 +143,69 @@ class UIDataService:
             A list of dictionaries, each representing a UI data item, sorted by news_time descending.
             Returns an empty list if no items are found.
         """
-        # The query to find matching documents.
-        find_query = {}
-        params = []
-        if target_date:
-            start_of_query_window = ui_data_cycle_start_ist(target_date)
-
-            # write a query to get news for "news_time" > start_of_query_window
-            find_query = {
-                # "impact" : {"$in": ["POSITIVE", "STRONGLY POSITIVE"]}
-            }
-            #print(find_query)
-        # Find all matching documents, sort them by news_time in descending order.
-        # We don't limit to 1 anymore, as "latest" now implies a time window.
-        base_query = "SELECT id, data FROM ui_data"
-        if target_date:
-            base_query += " WHERE news_time >= %s"
-            params.append(start_of_query_window)
-        base_query += " ORDER BY news_time DESC"
-
+        start_of_query_window = (
+            ui_data_cycle_start_ist(target_date) if target_date else None
+        )
+        rows: List[Tuple[int, Any, Optional[datetime]]] = []
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(base_query, params)
-                rows = cur.fetchall()
-                items = [row[1] for row in rows]  # Extract data
-                item_ids = {i: row[0] for i, row in enumerate(rows)}  # Map index to ID
+                if target_date:
+                    cur.execute(
+                        """
+                        SELECT id, data, news_time FROM ui_data
+                        WHERE news_time >= %s
+                        ORDER BY news_time DESC NULLS LAST, id DESC
+                        """,
+                        (start_of_query_window,),
+                    )
+                    rows = cur.fetchall()
+
+                    # Mirror cleanup fallback: when the current IST cycle is empty
+                    # (e.g. after 15:30 boundary, before new BSE items arrive), show
+                    # pre-cycle rows still in the table so the UI is not blank.
+                    if not rows and UI_DATA_MIN_OLD_CYCLE_ROWS > 0:
+                        cur.execute(
+                            """
+                            SELECT id, data, news_time FROM ui_data
+                            WHERE news_time < %s OR news_time IS NULL
+                            ORDER BY news_time DESC NULLS LAST, id DESC
+                            """,
+                            (start_of_query_window,),
+                        )
+                        rows = cur.fetchall()
+                    elif (
+                        len(rows) < UI_DATA_NEW_CYCLE_RELEASE_THRESHOLD
+                        and UI_DATA_MIN_OLD_CYCLE_ROWS > 0
+                    ):
+                        cur.execute(
+                            """
+                            SELECT id, data, news_time FROM ui_data
+                            WHERE news_time < %s OR news_time IS NULL
+                            ORDER BY news_time DESC NULLS LAST, id DESC
+                            LIMIT %s
+                            """,
+                            (start_of_query_window, UI_DATA_MIN_OLD_CYCLE_ROWS),
+                        )
+                        old_rows = cur.fetchall()
+                        seen_ids = {r[0] for r in rows}
+                        for old_row in old_rows:
+                            if old_row[0] not in seen_ids:
+                                rows.append(old_row)
+                        rows.sort(
+                            key=lambda r: (r[2] is not None, r[2] or datetime.min, r[0]),
+                            reverse=True,
+                        )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, data, news_time FROM ui_data
+                        ORDER BY news_time DESC NULLS LAST, id DESC
+                        """
+                    )
+                    rows = cur.fetchall()
+
+        items = [row[1] for row in rows]
+        item_ids = {i: row[0] for i, row in enumerate(rows)}
 
         # Normalize and backfill fields for UI consumers
         items_to_update = []  # Track items that need DB update
